@@ -53,6 +53,7 @@ pub struct Device {
     pub kind: DeviceKind,
     pub source: DeviceSource,
     pub credentials: Credentials,
+    pub ssh_host_key_fingerprint: Option<String>,
     pub program_slots: [Option<PathBuf>; 10],
     pub config_slots: [Option<PathBuf>; 10],
     pub touchpanel_project: Option<PathBuf>,
@@ -80,6 +81,7 @@ impl Device {
                 username: entry.username.clone(),
                 password: String::new(),
             },
+            ssh_host_key_fingerprint: entry.ssh_host_key_fingerprint.clone(),
             program_slots: entry.program_slots.clone(),
             config_slots: entry.config_slots.clone(),
             touchpanel_project: entry.touchpanel_project.clone(),
@@ -87,7 +89,7 @@ impl Device {
             connection: ConnectionState::Disconnected,
             progress: None,
             details: None,
-            last_message: "Password is kept only for this session".into(),
+            last_message: String::new(),
         }
     }
 
@@ -105,6 +107,7 @@ impl Device {
             host: self.host.clone(),
             port: self.port,
             username: self.credentials.username.clone(),
+            ssh_host_key_fingerprint: self.ssh_host_key_fingerprint.clone(),
             kind: self.kind,
             model: self.model.clone(),
             firmware: self.firmware.clone(),
@@ -146,6 +149,8 @@ pub struct AddressEntry {
     pub port: u16,
     #[serde(default)]
     pub username: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_host_key_fingerprint: Option<String>,
     #[serde(default)]
     pub kind: DeviceKind,
     #[serde(default)]
@@ -169,6 +174,7 @@ impl Default for AddressEntry {
             host: String::new(),
             port: default_ssh_port(),
             username: String::new(),
+            ssh_host_key_fingerprint: None,
             kind: DeviceKind::Unknown,
             model: String::new(),
             firmware: String::new(),
@@ -225,5 +231,6 @@ mod tests {
         assert!(entry.program_slots.iter().all(Option::is_none));
         assert!(entry.config_slots.iter().all(Option::is_none));
         assert!(entry.touchpanel_project.is_none());
+        assert!(entry.ssh_host_key_fingerprint.is_none());
     }
 }

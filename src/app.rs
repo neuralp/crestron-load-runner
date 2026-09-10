@@ -55,6 +55,12 @@ struct AddressDraft {
     kind: DeviceKind,
 }
 
+#[derive(Clone, Default)]
+struct PreferencesDraft {
+    default_username: String,
+    default_password: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum PendingAction {
     Open(PathBuf),
@@ -72,6 +78,7 @@ pub struct LoadRunnerApp {
     discovery_events: Receiver<DiscoveryEvent>,
     discovery_sender: std::sync::mpsc::Sender<DiscoveryEvent>,
     discovering: bool,
+    discard_discovery_results: bool,
     pending_host_keys: HashMap<String, String>,
     add_device_open: bool,
     address_draft: AddressDraft,
@@ -82,6 +89,9 @@ pub struct LoadRunnerApp {
     status_message: String,
     status_is_error: bool,
     about_open: bool,
+    preferences_open: bool,
+    preferences_draft: PreferencesDraft,
+    firmware_editor: crate::firmware::FirmwareEditor,
     notice: Option<String>,
 }
 
@@ -89,7 +99,9 @@ impl LoadRunnerApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
         let (config, load_error) = AppConfig::load();
-        Self::from_config(config, load_error)
+        let mut app = Self::from_config(config, load_error);
+        app.firmware_editor = crate::firmware::FirmwareEditor::load(crate::storage::firmware_dir());
+        app
     }
 
     fn from_config(config: AppConfig, load_error: Option<String>) -> Self {
@@ -102,6 +114,10 @@ impl LoadRunnerApp {
             .collect();
         let (worker_sender, worker_events) = mpsc::channel();
         let (discovery_sender, discovery_events) = mpsc::channel();
+        let preferences_draft = PreferencesDraft {
+            default_username: config.default_username.clone(),
+            default_password: config.default_password.clone(),
+        };
         Self {
             config,
             devices,
@@ -113,6 +129,7 @@ impl LoadRunnerApp {
             discovery_events,
             discovery_sender,
             discovering: false,
+            discard_discovery_results: false,
             pending_host_keys: HashMap::new(),
             add_device_open: false,
             address_draft: AddressDraft {
@@ -126,6 +143,9 @@ impl LoadRunnerApp {
             status_message,
             status_is_error,
             about_open: false,
+            preferences_open: false,
+            preferences_draft,
+            firmware_editor: Default::default(),
             notice: None,
         }
     }
@@ -180,9 +200,14 @@ impl LoadRunnerApp {
 
         while let Ok(event) = self.discovery_events.try_recv() {
             match event {
-                DiscoveryEvent::Found(device) => self.merge_discovered(*device),
+                DiscoveryEvent::Found(device) => {
+                    if !self.discard_discovery_results {
+                        self.merge_discovered(*device);
+                    }
+                }
                 DiscoveryEvent::Finished(result) => {
                     self.discovering = false;
+                    self.discard_discovery_results = false;
                     if let Err(error) = result {
                         self.notice = Some(format!("Discovery failed: {error}"));
                     }
@@ -192,6 +217,16 @@ impl LoadRunnerApp {
     }
 
     fn merge_discovered(&mut self, mut discovered: Device) {
+        self.firmware_editor.observe_model(&discovered.model);
+        if discovered.ssh_host_key_fingerprint.is_none() {
+            let endpoint = endpoint_id(&discovered.host, discovered.port);
+            discovered.ssh_host_key_fingerprint = self
+                .config
+                .legacy_trusted_host_keys
+                .get(&discovered.id)
+                .or_else(|| self.config.legacy_trusted_host_keys.get(&endpoint))
+                .cloned();
+        }
         if let Some(index) = self.devices.iter().position(|device| {
             device.id == discovered.id
                 || endpoint_id(&device.host, device.port)
@@ -223,6 +258,9 @@ impl LoadRunnerApp {
                 existing.firmware = discovered.firmware;
                 existing.mac = discovered.mac;
                 existing.kind = discovered.kind;
+                if existing.ssh_host_key_fingerprint.is_none() {
+                    existing.ssh_host_key_fingerprint = discovered.ssh_host_key_fingerprint;
+                }
                 existing.last_message = "Rediscovered on the local network".into();
                 previous.is_some_and(|previous| previous != existing.to_address_entry())
             };
@@ -243,19 +281,78 @@ impl LoadRunnerApp {
 
     fn connection_spec(&self, id: &str) -> Option<ConnectionSpec> {
         let device = self.devices.iter().find(|device| device.id == id)?;
+        let mut credentials = device.credentials.clone();
+        if credentials.username.trim().is_empty() {
+            credentials.username = self.config.default_username.clone();
+        }
+        if credentials.password.is_empty() {
+            credentials.password = self.config.default_password.clone();
+        }
         Some(ConnectionSpec {
             id: device.id.clone(),
             host: device.host.clone(),
             port: device.port,
-            credentials: device.credentials.clone(),
-            trusted_fingerprint: self.config.trusted_host_keys.get(&device.id).cloned(),
+            credentials,
+            trusted_fingerprint: device.ssh_host_key_fingerprint.clone().or_else(|| {
+                self.config
+                    .legacy_trusted_host_keys
+                    .get(&device.id)
+                    .cloned()
+            }),
         })
     }
 
     fn start_discovery(&mut self) {
         if !self.discovering {
             self.discovering = true;
+            self.discard_discovery_results = false;
             discovery::spawn(self.discovery_sender.clone());
+        }
+    }
+
+    fn clear_devices(&mut self) {
+        let removed = self.devices.len();
+        let address_book_changed = !self.config.address_book.is_empty()
+            || self
+                .devices
+                .iter()
+                .any(|device| device.source == DeviceSource::AddressBook);
+        self.discard_discovery_results = self.discovering;
+        self.devices.clear();
+        self.selected_id = None;
+        self.pending_host_keys.clear();
+        self.config.legacy_trusted_host_keys.clear();
+        self.sync_config_from_devices();
+        self.address_book_dirty |= address_book_changed;
+        self.status_message = format!("Cleared {removed} device(s)");
+        self.status_is_error = false;
+    }
+
+    fn open_preferences(&mut self) {
+        self.preferences_draft = PreferencesDraft {
+            default_username: self.config.default_username.clone(),
+            default_password: self.config.default_password.clone(),
+        };
+        self.preferences_open = true;
+    }
+
+    fn save_preferences(&mut self) {
+        let default_username = self.preferences_draft.default_username.trim().to_owned();
+        let default_password = self.preferences_draft.default_password.clone();
+        let mut updated = self.config.clone();
+        updated.default_username = default_username.clone();
+        updated.default_password = default_password.clone();
+        match updated.save_preferences() {
+            Ok(()) => {
+                self.config.default_username = default_username;
+                self.config.default_password = default_password;
+                self.preferences_open = false;
+                self.status_message = "Preferences saved".into();
+                self.status_is_error = false;
+            }
+            Err(error) => {
+                self.notice = Some(format!("Could not save preferences: {error}"));
+            }
         }
     }
 
@@ -269,6 +366,30 @@ impl LoadRunnerApp {
         {
             self.notice = Some(error);
         }
+    }
+
+    fn trust_host_key(&mut self, id: &str, fingerprint: String) {
+        let Some(index) = self.devices.iter().position(|device| device.id == id) else {
+            return;
+        };
+        let endpoint = endpoint_id(&self.devices[index].host, self.devices[index].port);
+        let is_address_book = self.devices[index].source == DeviceSource::AddressBook;
+        self.devices[index].ssh_host_key_fingerprint = Some(fingerprint);
+        self.pending_host_keys.remove(id);
+        self.config.legacy_trusted_host_keys.remove(id);
+        self.config.legacy_trusted_host_keys.remove(&endpoint);
+
+        if is_address_book {
+            self.mark_address_book_dirty();
+            self.status_message =
+                "SSH host-key fingerprint added to the address book; save to persist it".into();
+        } else {
+            self.status_message =
+                "SSH host key trusted for this session; add the device to the address book to persist it"
+                    .into();
+            self.status_is_error = false;
+        }
+        self.refresh_device(id);
     }
 
     fn load_assigned_programs(&mut self) {
@@ -373,6 +494,50 @@ impl LoadRunnerApp {
         }
     }
 
+    fn load_assigned_firmware(&mut self) {
+        let jobs: Vec<(String, crate::firmware::FirmwareAssignment)> = self
+            .devices
+            .iter()
+            .filter(|device| device.selected && device.source == DeviceSource::AddressBook)
+            .filter_map(|device| {
+                self.firmware_editor
+                    .assignment_for_model(&device.model)
+                    .map(|assignment| (device.id.clone(), assignment))
+            })
+            .collect();
+        if jobs.is_empty() {
+            self.notice =
+                Some("Select an address-book device whose model has assigned firmware".into());
+            return;
+        }
+        if let Some((_, assignment)) = jobs
+            .iter()
+            .find(|(_, assignment)| !assignment.local_path.is_file())
+        {
+            self.notice = Some(format!(
+                "Stored firmware file is missing: {}",
+                assignment.local_path.display()
+            ));
+            return;
+        }
+
+        for (id, assignment) in jobs {
+            let Some(connection) = self.connection_spec(&id) else {
+                continue;
+            };
+            if let Err(error) = self.worker_pool.send(
+                &id,
+                WorkerCommand::UploadFirmware {
+                    connection,
+                    local_path: assignment.local_path,
+                    remote_name: assignment.original_name,
+                },
+            ) {
+                self.notice = Some(error);
+            }
+        }
+    }
+
     fn sync_config_from_devices(&mut self) {
         self.config.address_book = self
             .devices
@@ -407,12 +572,6 @@ impl LoadRunnerApp {
                 self.status_is_error = true;
                 false
             }
-        }
-    }
-
-    fn save_local_state(&mut self) {
-        if let Err(error) = self.config.save_trusted_host_keys() {
-            self.notice = Some(format!("Could not save application state: {error}"));
         }
     }
 
@@ -473,6 +632,11 @@ impl LoadRunnerApp {
     }
 
     fn request_action(&mut self, action: PendingAction, ctx: &egui::Context) {
+        if self.firmware_editor.is_busy() {
+            self.status_message = "Wait for the firmware file import to finish".into();
+            self.status_is_error = true;
+            return;
+        }
         if self.worker_pool.has_pending() {
             self.status_message = "Wait for queued device operations to finish before opening another address book or exiting".into();
             self.status_is_error = true;
@@ -501,7 +665,10 @@ impl LoadRunnerApp {
     }
 
     fn confirm_pending_action(&mut self, save: bool, ctx: &egui::Context) {
-        if self.worker_pool.has_pending() || (save && !self.save_config()) {
+        if self.firmware_editor.is_busy()
+            || self.worker_pool.has_pending()
+            || (save && !self.save_config())
+        {
             return;
         }
         if let Some(action) = self.pending_action.take() {
@@ -549,6 +716,7 @@ impl LoadRunnerApp {
                         .cloned(),
                 );
                 self.config.address_book = entries;
+                self.config.legacy_trusted_host_keys.clear();
                 self.devices = devices;
                 self.selected_id = None;
                 self.pending_host_keys.clear();
@@ -588,6 +756,7 @@ impl LoadRunnerApp {
             host: host.clone(),
             port: self.address_draft.port,
             username: self.address_draft.username.trim().to_owned(),
+            ssh_host_key_fingerprint: None,
             kind: self.address_draft.kind,
             model: String::new(),
             firmware: String::new(),
@@ -666,25 +835,35 @@ impl LoadRunnerApp {
             (other != index && endpoint_id(&device.host, device.port) == new_id)
                 .then(|| device.id.clone())
         }) {
+            let fingerprint = self.devices[index]
+                .ssh_host_key_fingerprint
+                .clone()
+                .or_else(|| self.config.legacy_trusted_host_keys.remove(&old_id))
+                .or_else(|| self.config.legacy_trusted_host_keys.remove(&new_id));
             self.devices.remove(index);
             self.pending_host_keys.remove(&old_id);
-            self.config.trusted_host_keys.remove(&old_id);
             self.selected_id = Some(existing.clone());
             if let Some(device) = self.device_mut(&existing) {
                 device.selected = true;
+                if device.ssh_host_key_fingerprint.is_none() {
+                    device.ssh_host_key_fingerprint = fingerprint;
+                }
             }
             self.mark_address_book_dirty();
             return;
+        }
+        let fingerprint = self
+            .config
+            .legacy_trusted_host_keys
+            .remove(&old_id)
+            .or_else(|| self.config.legacy_trusted_host_keys.remove(&new_id));
+        if self.devices[index].ssh_host_key_fingerprint.is_none() {
+            self.devices[index].ssh_host_key_fingerprint = fingerprint;
         }
         self.devices[index].id = new_id.clone();
         self.devices[index].source = DeviceSource::AddressBook;
         self.devices[index].selected = true;
         self.devices[index].last_message = "Added to address book".into();
-        if let Some(fingerprint) = self.config.trusted_host_keys.remove(&old_id) {
-            self.config
-                .trusted_host_keys
-                .insert(new_id.clone(), fingerprint);
-        }
         if let Some(fingerprint) = self.pending_host_keys.remove(&old_id) {
             self.pending_host_keys.insert(new_id.clone(), fingerprint);
         }
@@ -713,7 +892,7 @@ impl LoadRunnerApp {
         self.config
             .address_book
             .retain(|entry| entry.host != host || entry.port != port);
-        self.config.trusted_host_keys.remove(&id);
+        self.config.legacy_trusted_host_keys.remove(&id);
         self.pending_host_keys.remove(&id);
         self.selected_id = None;
         self.mark_address_book_dirty();
@@ -737,6 +916,15 @@ impl LoadRunnerApp {
                     }
                     if ui.button("Save address book").clicked() {
                         self.save_config();
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button("Preferences…").clicked() {
+                        self.open_preferences();
+                        ui.close();
+                    }
+                    if ui.button("Firmware Editor…").clicked() {
+                        self.firmware_editor.open = true;
                         ui.close();
                     }
                     ui.separator();
@@ -788,6 +976,9 @@ impl LoadRunnerApp {
                 if ui.button("Load Assigned Touchpanel").clicked() {
                     self.load_assigned_touchpanels();
                 }
+                if ui.button("Load Firmware").clicked() {
+                    self.load_assigned_firmware();
+                }
                 ui.separator();
                 let selected = self.devices.iter().filter(|device| device.selected).count();
                 ui.label(format!("{selected} selected"));
@@ -828,8 +1019,9 @@ impl LoadRunnerApp {
     fn devices_panel(&mut self, root: &mut egui::Ui) {
         let width = root.available_width() / 3.0;
         egui::Panel::left("devices")
-            .resizable(false)
-            .exact_size(width)
+            .resizable(true)
+            .default_size(width)
+            .min_size(300.0)
             .show(root, |ui| {
                 ui.heading("Devices");
                 ui.horizontal_wrapped(|ui| {
@@ -905,7 +1097,7 @@ impl LoadRunnerApp {
                 egui::Panel::bottom("device_discovery_action")
                     .exact_size(48.0)
                     .show(ui, |ui| {
-                        ui.vertical_centered(|ui| {
+                        ui.horizontal_centered(|ui| {
                             let label = if self.discovering {
                                 "Discovering…"
                             } else {
@@ -914,11 +1106,21 @@ impl LoadRunnerApp {
                             if ui
                                 .add_enabled(
                                     !self.discovering,
-                                    egui::Button::new(label).min_size(egui::vec2(160.0, 32.0)),
+                                    egui::Button::new(label).min_size(egui::vec2(140.0, 32.0)),
                                 )
                                 .clicked()
                             {
                                 self.start_discovery();
+                            }
+                            if ui
+                                .add(
+                                    egui::Button::new("Clear Devices")
+                                        .min_size(egui::vec2(110.0, 32.0)),
+                                )
+                                .on_hover_text("Immediately clear all devices")
+                                .clicked()
+                            {
+                                self.clear_devices();
                             }
                         });
                     });
@@ -985,39 +1187,42 @@ impl LoadRunnerApp {
                                 ui.small(format!("Firmware {}", device.firmware));
                             }
                         });
-                        if in_address_book {
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
-                                status_badge(ui, device.connection);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                            ui.vertical(|ui| {
+                                if in_address_book {
+                                    status_badge(ui, device.connection);
+                                }
+                                if in_address_book && device.kind == DeviceKind::Processor {
+                                    assignments_changed |= slot_one_assignment(
+                                        ui,
+                                        "PROGRAM · SLOT 1",
+                                        &mut device.program_slots[0],
+                                        Some("lpz"),
+                                    );
+                                    assignments_changed |= slot_one_assignment(
+                                        ui,
+                                        "CONFIG · SLOT 1",
+                                        &mut device.config_slots[0],
+                                        None,
+                                    );
+                                }
                             });
-                        }
+                        });
                     });
                     if in_address_book {
                         match device.kind {
                             DeviceKind::Processor => {
-                                for (slot, path) in device.program_slots.iter().enumerate() {
+                                for (slot, path) in device.program_slots.iter().enumerate().skip(1)
+                                {
                                     if let Some(path) = path {
                                         assigned_file_row(ui, "Program", slot + 1, path);
                                     }
                                 }
-                                for (slot, path) in device.config_slots.iter().enumerate() {
+                                for (slot, path) in device.config_slots.iter().enumerate().skip(1) {
                                     if let Some(path) = path {
                                         assigned_file_row(ui, "Config", slot + 1, path);
                                     }
                                 }
-                                ui.horizontal_wrapped(|ui| {
-                                    assignments_changed |= slot_assignment_menu(
-                                        ui,
-                                        "Assign program…",
-                                        &mut device.program_slots,
-                                        Some("lpz"),
-                                    );
-                                    assignments_changed |= slot_assignment_menu(
-                                        ui,
-                                        "Assign config…",
-                                        &mut device.config_slots,
-                                        None,
-                                    );
-                                });
                             }
                             DeviceKind::Touchpanel => {
                                 if let Some(path) = &device.touchpanel_project {
@@ -1036,7 +1241,9 @@ impl LoadRunnerApp {
                             };
                             ui.add(egui::ProgressBar::new(progress).show_percentage());
                         }
-                        ui.small(&device.last_message);
+                        if !device.last_message.is_empty() {
+                            ui.small(&device.last_message);
+                        }
                     } else {
                         ui.small("Autodiscovered · right-click to add to the address book");
                     }
@@ -1169,6 +1376,11 @@ impl LoadRunnerApp {
                             );
                         });
                         ui.small("Password is not saved to disk.");
+                        if let Some(fingerprint) = &device.ssh_host_key_fingerprint {
+                            ui.separator();
+                            ui.label("SSH host-key fingerprint");
+                            ui.monospace(fingerprint);
+                        }
                     });
                     ui.horizontal(|ui| {
                         if ui.button("Connect / refresh").clicked() {
@@ -1216,12 +1428,7 @@ impl LoadRunnerApp {
                         ui.label("Compare this fingerprint with a known-good value for the device.");
                         ui.horizontal(|ui| {
                             if ui.button("Trust this key").clicked() {
-                                self.config
-                                    .trusted_host_keys
-                                    .insert(id.clone(), fingerprint.clone());
-                                self.pending_host_keys.remove(&id);
-                                self.save_local_state();
-                                self.refresh_device(&id);
+                                self.trust_host_key(&id, fingerprint.clone());
                             }
                             if ui.button("Reject").clicked() {
                                 self.pending_host_keys.remove(&id);
@@ -1336,6 +1543,46 @@ impl LoadRunnerApp {
             self.add_device_open &= open;
         }
 
+        if self.preferences_open {
+            let mut open = self.preferences_open;
+            egui::Window::new("Preferences")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.label("Default SSH credentials");
+                    ui.small("Used when a device does not have its own username or password.");
+                    ui.add_space(8.0);
+                    egui::Grid::new("preferences_form")
+                        .num_columns(2)
+                        .spacing([12.0, 8.0])
+                        .show(ui, |ui| {
+                            ui.label("Username");
+                            ui.text_edit_singleline(&mut self.preferences_draft.default_username);
+                            ui.end_row();
+                            ui.label("Password");
+                            ui.add(
+                                egui::TextEdit::singleline(
+                                    &mut self.preferences_draft.default_password,
+                                )
+                                .password(true),
+                            );
+                            ui.end_row();
+                        });
+                    ui.small("These credentials are saved in the local application settings.");
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("Save").clicked() {
+                            self.save_preferences();
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.preferences_open = false;
+                        }
+                    });
+                });
+            self.preferences_open &= open;
+        }
+
         if self.about_open {
             egui::Window::new("About Crestron Load Runner")
                 .open(&mut self.about_open)
@@ -1346,6 +1593,8 @@ impl LoadRunnerApp {
                     ui.label("Rust + egui device deployment utility");
                 });
         }
+
+        self.firmware_editor.show(ctx);
 
         if let Some(message) = self.notice.clone() {
             let mut open = true;
@@ -1379,6 +1628,7 @@ impl eframe::App for LoadRunnerApp {
 impl LoadRunnerApp {
     fn tick(&mut self, ctx: &egui::Context) {
         self.process_events();
+        self.firmware_editor.poll(ctx);
         if ctx.input(|input| input.viewport().close_requested()) && !self.close_approved {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.request_action(PendingAction::Quit, ctx);
@@ -1445,35 +1695,58 @@ fn assigned_project_row(ui: &mut egui::Ui, kind: &str, path: &Path) {
     });
 }
 
-fn slot_assignment_menu(
+fn slot_one_assignment(
     ui: &mut egui::Ui,
     label: &str,
-    assignments: &mut [Option<PathBuf>; 10],
+    assignment: &mut Option<PathBuf>,
     extension: Option<&str>,
 ) -> bool {
     let mut changed = false;
-    ui.menu_button(label, |ui| {
-        for (slot, assignment) in assignments.iter_mut().enumerate() {
-            let current = assignment
-                .as_deref()
-                .map(file_display_name)
-                .unwrap_or_else(|| "Unassigned".into());
-            if ui
-                .button(format!("Slot {} · {current}", slot + 1))
-                .clicked()
-            {
-                let selected = match extension {
-                    Some(extension) => rfd::FileDialog::new()
-                        .add_filter(extension.to_ascii_uppercase(), &[extension])
-                        .pick_file(),
-                    None => rfd::FileDialog::new().pick_file(),
-                };
-                if let Some(path) = selected {
-                    *assignment = Some(path);
-                    changed = true;
-                }
-                ui.close();
-            }
+    let file_name = assignment
+        .as_deref()
+        .map(file_display_name)
+        .unwrap_or_else(|| "Unassigned".into());
+    let hover_text = assignment.as_deref().map_or_else(
+        || "Click to choose a file".into(),
+        |path| {
+            format!(
+                "{}\n\nClick to choose a different file. Right-click to clear.",
+                path.display()
+            )
+        },
+    );
+    let slot = egui::Frame::group(ui.style())
+        .inner_margin(egui::Margin::symmetric(8, 5))
+        .show(ui, |ui| {
+            ui.set_min_size(egui::vec2(120.0, 34.0));
+            ui.small(RichText::new(label).strong());
+            ui.small(RichText::new(&file_name).monospace());
+        });
+    let response = slot
+        .response
+        .interact(egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(hover_text);
+    if response.clicked() {
+        let selected = match extension {
+            Some(extension) => rfd::FileDialog::new()
+                .add_filter(extension.to_ascii_uppercase(), &[extension])
+                .pick_file(),
+            None => rfd::FileDialog::new().pick_file(),
+        };
+        if let Some(path) = selected {
+            *assignment = Some(path);
+            changed = true;
+        }
+    }
+    response.context_menu(|ui| {
+        if ui
+            .add_enabled(assignment.is_some(), egui::Button::new("Clear assignment"))
+            .clicked()
+        {
+            *assignment = None;
+            changed = true;
+            ui.close();
         }
     });
     changed
@@ -1521,8 +1794,34 @@ fn touchpanel_assignment(ui: &mut egui::Ui, device: &mut Device) -> bool {
     egui::CollapsingHeader::new("Touchpanel project assignment")
         .default_open(true)
         .show(ui, |ui| {
-            changed |= assignment_slot(ui, 1, &mut device.touchpanel_project, Some("vtz"));
+            changed |= project_assignment_row(ui, &mut device.touchpanel_project);
         });
+    changed
+}
+
+fn project_assignment_row(ui: &mut egui::Ui, assignment: &mut Option<PathBuf>) -> bool {
+    let mut changed = false;
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Project");
+        ui.monospace(
+            assignment
+                .as_deref()
+                .map(file_display_name)
+                .unwrap_or_else(|| "Unassigned".into()),
+        );
+        if ui.small_button("Choose…").clicked()
+            && let Some(path) = rfd::FileDialog::new()
+                .add_filter("VTZ", &["vtz"])
+                .pick_file()
+        {
+            *assignment = Some(path);
+            changed = true;
+        }
+        if assignment.is_some() && ui.small_button("Clear").clicked() {
+            *assignment = None;
+            changed = true;
+        }
+    });
     changed
 }
 

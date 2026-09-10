@@ -38,6 +38,11 @@ pub enum WorkerCommand {
         connection: ConnectionSpec,
         local_path: PathBuf,
     },
+    UploadFirmware {
+        connection: ConnectionSpec,
+        local_path: PathBuf,
+        remote_name: String,
+    },
     Stop,
 }
 
@@ -160,6 +165,11 @@ fn spawn_worker(
                         "projectload {file}".into(),
                         &events,
                     ),
+                    WorkerCommand::UploadFirmware {
+                        connection,
+                        local_path,
+                        remote_name,
+                    } => upload_firmware(&connection, &local_path, &remote_name, &events),
                     WorkerCommand::Stop => break,
                 };
                 if let Err(error) = result {
@@ -315,6 +325,57 @@ fn upload(
 ) -> WorkerResult<()> {
     let file_name = safe_remote_file_name(local_path)
         .ok_or_else(|| message(spec, "The selected file has an unsafe or missing file name"))?;
+    let command = command_template.replace("{file}", &file_name);
+    upload_to(
+        spec,
+        local_path,
+        Path::new(&file_name),
+        &file_name,
+        command,
+        events,
+    )
+}
+
+fn upload_firmware(
+    spec: &ConnectionSpec,
+    local_path: &Path,
+    remote_name: &str,
+    events: &Sender<WorkerEvent>,
+) -> WorkerResult<()> {
+    let Some((remote_path, command)) = firmware_transfer(remote_name) else {
+        return Err(message(
+            spec,
+            "The assigned firmware has an unsafe or missing file name",
+        ));
+    };
+    upload_to(spec, local_path, &remote_path, remote_name, command, events)
+}
+
+fn firmware_transfer(remote_name: &str) -> Option<(PathBuf, String)> {
+    if !is_safe_remote_file_name(remote_name) {
+        return None;
+    }
+    let remote_path = PathBuf::from("/firmware").join(remote_name);
+    let command = if Path::new(remote_name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
+    {
+        "pushupdate full".to_owned()
+    } else {
+        format!(r"puf \romdisk\user\system\{remote_name}")
+    };
+    Some((remote_path, command))
+}
+
+fn upload_to(
+    spec: &ConnectionSpec,
+    local_path: &Path,
+    remote_path: &Path,
+    display_name: &str,
+    command: String,
+    events: &Sender<WorkerEvent>,
+) -> WorkerResult<()> {
     let mut local = File::open(local_path).map_err(|error| {
         message(
             spec,
@@ -329,10 +390,13 @@ fn upload(
     let sftp = session
         .sftp()
         .map_err(|error| message(spec, format!("Could not start SFTP: {error}")))?;
-    let mut remote = sftp.create(Path::new(&file_name)).map_err(|error| {
+    let mut remote = sftp.create(remote_path).map_err(|error| {
         message(
             spec,
-            format!("Could not create remote file {file_name}: {error}"),
+            format!(
+                "Could not create remote file {}: {error}",
+                remote_path.display()
+            ),
         )
     })?;
 
@@ -359,7 +423,6 @@ fn upload(
         .close()
         .map_err(|error| message(spec, format!("Could not close remote file: {error}")))?;
 
-    let command = command_template.replace("{file}", &file_name);
     session.set_timeout(LOAD_TIMEOUT_MS);
     let output = run_command(&session, &command)
         .map_err(|error| message(spec, format!("Load command failed: {error}")))?;
@@ -367,9 +430,9 @@ fn upload(
         .send(WorkerEvent::Complete {
             id: spec.id.clone(),
             message: if output.trim().is_empty() {
-                format!("Uploaded {file_name}; command completed")
+                format!("Uploaded {display_name}; command completed")
             } else {
-                format!("Uploaded {file_name}: {}", output.trim())
+                format!("Uploaded {display_name}: {}", output.trim())
             },
         })
         .map_err(|error| message(spec, error.to_string()))?;
@@ -428,11 +491,16 @@ fn optional_section(result: Result<String, String>) -> Option<String> {
 
 fn safe_remote_file_name(path: &Path) -> Option<String> {
     let name = path.file_name()?.to_str()?;
-    (!name.is_empty()
+    is_safe_remote_file_name(name).then(|| name.to_owned())
+}
+
+fn is_safe_remote_file_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
         && name
             .chars()
-            .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character)))
-    .then(|| name.to_owned())
+            .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character))
 }
 
 fn sha256_fingerprint(host_key: &[u8]) -> String {
@@ -518,6 +586,28 @@ mod tests {
             Some("room-program_1.lpz")
         );
         assert!(safe_remote_file_name(Path::new("/tmp/room program.lpz")).is_none());
+        assert!(!is_safe_remote_file_name("."));
+        assert!(!is_safe_remote_file_name(".."));
+        assert!(!is_safe_remote_file_name("folder/device.puf"));
+    }
+
+    #[test]
+    fn builds_crestron_firmware_transfer_paths_and_commands() {
+        assert_eq!(
+            firmware_transfer("rmc4_2.8000.00001.puf"),
+            Some((
+                PathBuf::from("/firmware/rmc4_2.8000.00001.puf"),
+                r"puf \romdisk\user\system\rmc4_2.8000.00001.puf".into(),
+            ))
+        );
+        assert_eq!(
+            firmware_transfer("update.ZIP"),
+            Some((
+                PathBuf::from("/firmware/update.ZIP"),
+                "pushupdate full".into(),
+            ))
+        );
+        assert!(firmware_transfer("unsafe firmware.puf").is_none());
     }
 
     #[test]

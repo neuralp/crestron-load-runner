@@ -1,5 +1,6 @@
 mod app;
 mod discovery;
+mod firmware;
 mod model;
 mod ssh;
 mod storage;

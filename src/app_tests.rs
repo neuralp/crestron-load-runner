@@ -81,9 +81,84 @@ fn discovered(host: &str) -> Device {
 }
 
 #[test]
+fn firmware_models_come_from_discovery_and_survive_clearing_devices() {
+    let dir = TestDir::new();
+    let root = dir.path().join("firmware");
+    let mut app = app();
+    app.firmware_editor = crate::firmware::FirmwareEditor::load(Some(root.clone()));
+    app.merge_discovered(discovered("192.0.2.1"));
+    app.merge_discovered(discovered("192.0.2.2"));
+    app.clear_devices();
+    let ctx = egui::Context::default();
+    let _ = ctx.run_logic(&input(), |ctx| app.tick(ctx));
+    let catalog: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("catalog.json")).unwrap()).unwrap();
+    assert_eq!(catalog["models"], serde_json::json!({"RMC3": null}));
+    assert!(app.devices.is_empty());
+    assert!(!app.address_book_dirty);
+}
+
+#[test]
+fn assigned_firmware_is_queued_for_selected_matching_models() {
+    let dir = TestDir::new();
+    let root = dir.path().join("firmware");
+    std::fs::create_dir_all(&root).unwrap();
+    let checksum = "c3bf47ea1f4a4a605470313cacb3a44f4a461f68c6faeab07e737610cb5ac835";
+    let stored_file = format!("{checksum}.firmware");
+    std::fs::write(root.join(&stored_file), b"firmware").unwrap();
+    std::fs::write(
+        root.join("catalog.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "models": {
+                "RMC3": {
+                    "original_name": "rmc3_firmware.puf",
+                    "stored_file": stored_file,
+                    "bytes": 8,
+                    "sha256": checksum
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let mut app = app();
+    app.firmware_editor = crate::firmware::FirmwareEditor::load(Some(root));
+    let mut entry = AddressEntry {
+        host: "192.0.2.1".into(),
+        model: "rmc3".into(),
+        ..Default::default()
+    };
+    let mut device = Device::from_address(&entry);
+    device.selected = true;
+    let id = device.id.clone();
+    app.devices.push(device);
+    app.load_assigned_firmware();
+
+    assert!(app.notice.is_none());
+    assert!(app.worker_pool.is_busy(&id));
+
+    entry.model = "unassigned".into();
+    let mut unassigned = Device::from_address(&entry);
+    unassigned.id = endpoint_id("192.0.2.2", 22);
+    unassigned.host = "192.0.2.2".into();
+    unassigned.selected = true;
+    app.devices[0].selected = false;
+    app.devices.push(unassigned);
+    app.load_assigned_firmware();
+    assert!(
+        app.notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("assigned firmware"))
+    );
+}
+
+#[test]
 fn manual_add_promotes_discovered_endpoint_instead_of_duplicating_it() {
     let mut app = app();
     app.merge_discovered(discovered("192.0.2.1"));
+    app.devices[0].ssh_host_key_fingerprint = Some("SHA256:discovered-host-key".into());
     app.address_draft.host = "192.0.2.1".into();
     app.address_draft.name = "My room".into();
     app.address_draft.username = "admin".into();
@@ -95,6 +170,12 @@ fn manual_add_promotes_discovered_endpoint_instead_of_duplicating_it() {
     assert_eq!(app.devices[0].model, "RMC3");
     assert_eq!(app.devices[0].credentials.username, "admin");
     assert_eq!(app.config.address_book.len(), 1);
+    assert_eq!(
+        app.config.address_book[0]
+            .ssh_host_key_fingerprint
+            .as_deref(),
+        Some("SHA256:discovered-host-key")
+    );
     assert!(app.address_book_dirty);
     app.address_draft.host = "192.0.2.1".into();
     app.add_address();
@@ -148,6 +229,115 @@ fn different_ssh_ports_are_distinct_endpoints() {
     assert_eq!(app.devices.len(), 2);
     assert!(app.devices.iter().any(|device| device.port == 22));
     assert!(app.devices.iter().any(|device| device.port == 2222));
+}
+
+#[test]
+fn connection_uses_defaults_only_for_missing_credentials() {
+    let mut config = AppConfig {
+        default_username: "default-user".into(),
+        default_password: "default-password".into(),
+        ..Default::default()
+    };
+    config.address_book.push(AddressEntry {
+        host: "192.0.2.1".into(),
+        ssh_host_key_fingerprint: Some("SHA256:address-book-host-key".into()),
+        ..Default::default()
+    });
+    let mut app = LoadRunnerApp::from_config(config, None);
+    let id = app.devices[0].id.clone();
+    let connection = app.connection_spec(&id).unwrap();
+    assert_eq!(
+        connection.trusted_fingerprint.as_deref(),
+        Some("SHA256:address-book-host-key")
+    );
+    let defaults = connection.credentials;
+    assert_eq!(defaults.username, "default-user");
+    assert_eq!(defaults.password, "default-password");
+
+    app.devices[0].credentials.username = "device-user".into();
+    let mixed = app.connection_spec(&id).unwrap().credentials;
+    assert_eq!(mixed.username, "device-user");
+    assert_eq!(mixed.password, "default-password");
+}
+
+#[test]
+fn trusting_host_key_updates_the_device_address_book_entry() {
+    let config = AppConfig {
+        address_book: vec![AddressEntry {
+            host: "192.0.2.1".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let mut app = LoadRunnerApp::from_config(config, None);
+    let id = app.devices[0].id.clone();
+    app.pending_host_keys
+        .insert(id.clone(), "SHA256:new-host-key".into());
+
+    app.trust_host_key(&id, "SHA256:new-host-key".into());
+
+    assert_eq!(
+        app.devices[0].ssh_host_key_fingerprint.as_deref(),
+        Some("SHA256:new-host-key")
+    );
+    assert_eq!(
+        app.config.address_book[0]
+            .ssh_host_key_fingerprint
+            .as_deref(),
+        Some("SHA256:new-host-key")
+    );
+    assert_eq!(
+        app.connection_spec(&id)
+            .unwrap()
+            .trusted_fingerprint
+            .as_deref(),
+        Some("SHA256:new-host-key")
+    );
+    assert!(!app.pending_host_keys.contains_key(&id));
+    assert!(app.address_book_dirty);
+}
+
+#[test]
+fn clearing_devices_immediately_removes_every_source() {
+    let mut app = app();
+    app.address_draft.host = "room.example".into();
+    app.add_address();
+    app.address_book_dirty = false;
+    app.merge_discovered(discovered("192.0.2.1"));
+    let address_id = app
+        .devices
+        .iter()
+        .find(|device| device.source == DeviceSource::AddressBook)
+        .unwrap()
+        .id
+        .clone();
+    app.refresh_device(&address_id);
+
+    app.clear_devices();
+
+    assert!(app.devices.is_empty());
+    assert!(app.config.address_book.is_empty());
+    assert!(app.selected_id.is_none());
+    assert!(app.address_book_dirty);
+    assert!(app.worker_pool.has_pending());
+
+    app.discovering = true;
+    app.clear_devices();
+    app.discovery_sender
+        .send(DiscoveryEvent::Found(Box::new(discovered("192.0.2.2"))))
+        .unwrap();
+    app.process_events();
+    assert!(app.devices.is_empty());
+}
+
+#[test]
+fn clearing_an_empty_list_does_not_create_an_unsaved_change() {
+    let mut app = app();
+
+    app.clear_devices();
+
+    assert!(app.devices.is_empty());
+    assert!(!app.address_book_dirty);
 }
 
 #[test]

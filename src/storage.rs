@@ -14,8 +14,14 @@ use crate::model::{AddressEntry, endpoint_id};
 pub struct AppConfig {
     #[serde(default)]
     pub address_book: Vec<AddressEntry>,
+    /// Read-only compatibility with settings written before fingerprints were
+    /// stored on each address-book entry.
+    #[serde(default, rename = "trusted_host_keys", skip_serializing)]
+    pub(crate) legacy_trusted_host_keys: HashMap<String, String>,
     #[serde(default)]
-    pub trusted_host_keys: HashMap<String, String>,
+    pub default_username: String,
+    #[serde(default)]
+    pub default_password: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -31,7 +37,11 @@ struct AddressBookDocument {
 enum AddressBookImport {
     Document(AddressBookDocument),
     Entries(Vec<AddressEntry>),
-    LegacyConfig { address_book: Vec<AddressEntry> },
+    LegacyConfig {
+        address_book: Vec<AddressEntry>,
+        #[serde(default)]
+        trusted_host_keys: HashMap<String, String>,
+    },
 }
 
 impl AppConfig {
@@ -60,35 +70,45 @@ impl AppConfig {
     }
 
     fn load_from(path: &Path) -> io::Result<Self> {
-        let config: Self =
+        let mut config: Self =
             serde_json::from_str(&fs::read_to_string(path)?).map_err(io::Error::other)?;
+        migrate_trusted_host_keys(
+            &mut config.address_book,
+            &mut config.legacy_trusted_host_keys,
+        );
         validate_entries(&config.address_book)?;
         Ok(config)
     }
 
     fn save_to(&self, path: &Path) -> io::Result<()> {
-        validate_entries(&self.address_book)?;
+        let mut config = self.clone();
+        migrate_trusted_host_keys(
+            &mut config.address_book,
+            &mut config.legacy_trusted_host_keys,
+        );
+        validate_entries(&config.address_book)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let data = serde_json::to_vec_pretty(self).map_err(io::Error::other)?;
+        let data = serde_json::to_vec_pretty(&config).map_err(io::Error::other)?;
         let temporary = path.with_extension("json.tmp");
         fs::write(&temporary, data)?;
         fs::rename(temporary, path)
     }
 
-    pub fn save_trusted_host_keys(&self) -> io::Result<()> {
+    pub fn save_preferences(&self) -> io::Result<()> {
         let path = config_path().ok_or_else(|| io::Error::other("no configuration directory"))?;
-        self.save_trusted_host_keys_to(&path)
+        self.save_preferences_to(&path)
     }
 
-    fn save_trusted_host_keys_to(&self, path: &Path) -> io::Result<()> {
+    fn save_preferences_to(&self, path: &Path) -> io::Result<()> {
         let mut saved = match Self::load_from(path) {
             Ok(saved) => saved,
             Err(error) if error.kind() == io::ErrorKind::NotFound => Self::default(),
             Err(error) => return Err(error),
         };
-        saved.trusted_host_keys = self.trusted_host_keys.clone();
+        saved.default_username = self.default_username.clone();
+        saved.default_password = self.default_password.clone();
         saved.save_to(path)
     }
 }
@@ -117,7 +137,13 @@ pub fn load_address_book(path: &Path) -> io::Result<Vec<AddressEntry>> {
             document.devices
         }
         AddressBookImport::Entries(entries) => entries,
-        AddressBookImport::LegacyConfig { address_book } => address_book,
+        AddressBookImport::LegacyConfig {
+            mut address_book,
+            mut trusted_host_keys,
+        } => {
+            migrate_trusted_host_keys(&mut address_book, &mut trusted_host_keys);
+            address_book
+        }
     };
     validate_entries(&entries)?;
     Ok(entries)
@@ -139,9 +165,29 @@ fn validate_entries(entries: &[AddressEntry]) -> io::Result<()> {
     Ok(())
 }
 
+fn migrate_trusted_host_keys(
+    entries: &mut [AddressEntry],
+    trusted_host_keys: &mut HashMap<String, String>,
+) {
+    for entry in entries {
+        let id = endpoint_id(&entry.host, entry.port);
+        let legacy_fingerprint = trusted_host_keys.remove(&id);
+        if entry.ssh_host_key_fingerprint.is_none() {
+            entry.ssh_host_key_fingerprint = legacy_fingerprint;
+        }
+    }
+}
+
 pub fn validate_portable_path(path: &Path) -> io::Result<()> {
     let internal = config_path().ok_or_else(|| io::Error::other("no configuration directory"))?;
-    ensure_separate_path(path, &internal)
+    ensure_separate_path(path, &internal)?;
+    let firmware = firmware_dir().ok_or_else(|| io::Error::other("no configuration directory"))?;
+    if resolved_path(path)?.starts_with(resolved_path(&firmware)?) {
+        return Err(io::Error::other(
+            "choose a JSON file outside the firmware storage directory",
+        ));
+    }
+    Ok(())
 }
 
 fn ensure_separate_path(path: &Path, internal: &Path) -> io::Result<()> {
@@ -173,8 +219,12 @@ const fn address_book_version() -> u32 {
 }
 
 pub fn config_path() -> Option<PathBuf> {
-    ProjectDirs::from("com", "NousResearch", "CrestronLoadRunner")
+    ProjectDirs::from("com", "WorldDomination", "CrestronLoadRunner")
         .map(|dirs| dirs.config_dir().join("address-book.json"))
+}
+
+pub fn firmware_dir() -> Option<PathBuf> {
+    config_path().and_then(|path| path.parent().map(|parent| parent.join("firmware")))
 }
 
 #[cfg(test)]
@@ -189,6 +239,18 @@ mod tests {
         let path = dir.path().join("config.json");
         fs::write(&path, r#"{"version":1,"devices":[]}"#).unwrap();
         assert!(AppConfig::load_from(&path).is_err());
+    }
+
+    #[test]
+    fn loads_settings_created_before_default_credentials_were_added() {
+        let dir = TestDir::new();
+        let path = dir.path().join("config.json");
+        fs::write(&path, r#"{"address_book":[],"trusted_host_keys":{}}"#).unwrap();
+
+        let config = AppConfig::load_from(&path).unwrap();
+
+        assert!(config.default_username.is_empty());
+        assert!(config.default_password.is_empty());
     }
 
     #[test]
@@ -210,7 +272,37 @@ mod tests {
     }
 
     #[test]
-    fn trusting_keys_preserves_saved_book_and_does_not_persist_edits() {
+    fn migrates_legacy_host_keys_into_address_book_entries() {
+        let dir = TestDir::new();
+        let path = dir.path().join("config.json");
+        fs::write(
+            &path,
+            r#"{
+                "address_book": [{"name": "Room", "host": "192.0.2.1"}],
+                "trusted_host_keys": {"192.0.2.1:22": "SHA256:legacy"}
+            }"#,
+        )
+        .unwrap();
+
+        let config = AppConfig::load_from(&path).unwrap();
+        assert_eq!(
+            config.address_book[0].ssh_host_key_fingerprint.as_deref(),
+            Some("SHA256:legacy")
+        );
+        assert!(config.legacy_trusted_host_keys.is_empty());
+
+        config.save_to(&path).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(saved.get("trusted_host_keys").is_none());
+        assert_eq!(
+            saved["address_book"][0]["ssh_host_key_fingerprint"],
+            "SHA256:legacy"
+        );
+    }
+
+    #[test]
+    fn saving_preferences_preserves_the_saved_address_book() {
         let dir = TestDir::new();
         let path = dir.path().join("config.json");
         let mut config = AppConfig {
@@ -222,27 +314,16 @@ mod tests {
         };
         config.save_to(&path).unwrap();
         let saved_book = config.address_book.clone();
-        config.address_book[0].name = "Not saved".into();
-        config
-            .trusted_host_keys
-            .insert("192.0.2.1:22".into(), "test-fingerprint".into());
-        config.save_trusted_host_keys_to(&path).unwrap();
+        config.address_book[0].name = "Unsaved edit".into();
+        config.default_username = "admin".into();
+        config.default_password = "secret".into();
+
+        config.save_preferences_to(&path).unwrap();
+
         let reloaded = AppConfig::load_from(&path).unwrap();
         assert_eq!(reloaded.address_book, saved_book);
-        assert_eq!(reloaded.trusted_host_keys, config.trusted_host_keys);
-
-        let missing = dir.path().join("new-config.json");
-        config.save_trusted_host_keys_to(&missing).unwrap();
-        assert!(
-            AppConfig::load_from(&missing)
-                .unwrap()
-                .address_book
-                .is_empty()
-        );
-
-        fs::write(&path, "invalid config").unwrap();
-        assert!(config.save_trusted_host_keys_to(&path).is_err());
-        assert_eq!(fs::read_to_string(&path).unwrap(), "invalid config");
+        assert_eq!(reloaded.default_username, "admin");
+        assert_eq!(reloaded.default_password, "secret");
     }
 
     #[test]
@@ -277,21 +358,30 @@ mod tests {
 
     #[test]
     fn imports_legacy_address_book_shape() {
-        let data = r#"{"address_book":[{"name":"Room","host":"192.0.2.1","username":"admin","kind":"Processor"}]}"#;
-        let imported: AddressBookImport = serde_json::from_str(data).unwrap();
-        let AddressBookImport::LegacyConfig { address_book } = imported else {
-            panic!("legacy address book was not recognized");
-        };
+        let dir = TestDir::new();
+        let path = dir.path().join("legacy.json");
+        let data = r#"{
+            "address_book":[{"name":"Room","host":"192.0.2.1","username":"admin","kind":"Processor"}],
+            "trusted_host_keys":{"192.0.2.1:22":"SHA256:legacy-portable"}
+        }"#;
+        fs::write(&path, data).unwrap();
+
+        let address_book = load_address_book(&path).unwrap();
         assert_eq!(address_book.len(), 1);
         assert_eq!(address_book[0].host, "192.0.2.1");
+        assert_eq!(
+            address_book[0].ssh_host_key_fingerprint.as_deref(),
+            Some("SHA256:legacy-portable")
+        );
     }
 
     #[test]
-    fn json_file_round_trip_preserves_slot_assignments() {
+    fn json_file_round_trip_preserves_assignments_and_host_key() {
         let mut entry = AddressEntry {
             name: "Control Room".into(),
             host: "192.0.2.2".into(),
             username: "admin".into(),
+            ssh_host_key_fingerprint: Some("SHA256:known-host-key".into()),
             kind: DeviceKind::Processor,
             ..Default::default()
         };
@@ -314,6 +404,10 @@ mod tests {
         assert_eq!(
             loaded[0].config_slots[4].as_deref(),
             Some(Path::new("config/control-room.json"))
+        );
+        assert_eq!(
+            loaded[0].ssh_host_key_fingerprint.as_deref(),
+            Some("SHA256:known-host-key")
         );
     }
 }

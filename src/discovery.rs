@@ -198,6 +198,7 @@ pub(crate) fn parse_response(data: &[u8], host: String) -> Option<Device> {
         kind: classify_model(&model),
         source: DeviceSource::Discovered,
         credentials: Credentials::default(),
+        ssh_host_key_fingerprint: None,
         program_slots: Default::default(),
         config_slots: Default::default(),
         touchpanel_project: None,
