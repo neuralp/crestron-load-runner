@@ -45,6 +45,60 @@ enum DeviceView {
     AddressBook,
 }
 
+/// Free-text device filter matched against the fields shown on a device card.
+#[derive(Clone, Debug, Default)]
+struct SearchQuery {
+    /// Trimmed, lowercased query. An empty query matches every device.
+    needle: String,
+    /// Separator-stripped query, set only when it could be part of a MAC address.
+    mac_needle: Option<String>,
+}
+
+impl SearchQuery {
+    fn new(raw: &str) -> Self {
+        let needle = raw.trim().to_ascii_lowercase();
+        let stripped: String = needle
+            .chars()
+            .filter(|character| !matches!(character, ':' | '-' | '.') && !character.is_whitespace())
+            .collect();
+        let mac_needle = (stripped.len() >= 2
+            && stripped
+                .chars()
+                .all(|character| character.is_ascii_hexdigit()))
+        .then_some(stripped);
+        Self { needle, mac_needle }
+    }
+
+    fn matches(&self, device: &Device) -> bool {
+        if self.needle.is_empty() {
+            return true;
+        }
+        let fields = [
+            &device.model,
+            &device.name,
+            &device.host,
+            &device.mac,
+            &device.firmware,
+        ];
+        if fields
+            .iter()
+            .any(|field| field.to_ascii_lowercase().contains(&self.needle))
+        {
+            return true;
+        }
+        // A pasted MAC may omit the separators used by the stored form.
+        self.mac_needle.as_ref().is_some_and(|mac_needle| {
+            device
+                .mac
+                .chars()
+                .filter(|character| *character != ':')
+                .collect::<String>()
+                .to_ascii_lowercase()
+                .contains(mac_needle)
+        })
+    }
+}
+
 #[derive(Default)]
 struct AddressDraft {
     name: String,
@@ -73,6 +127,7 @@ pub struct LoadRunnerApp {
     selected_id: Option<String>,
     filter: DeviceFilter,
     view: DeviceView,
+    search: String,
     worker_pool: WorkerPool,
     worker_events: Receiver<WorkerEvent>,
     discovery_events: Receiver<DiscoveryEvent>,
@@ -124,6 +179,7 @@ impl LoadRunnerApp {
             selected_id: None,
             filter: DeviceFilter::All,
             view: DeviceView::All,
+            search: String::new(),
             worker_pool: WorkerPool::new(worker_sender),
             worker_events,
             discovery_events,
@@ -1028,6 +1084,25 @@ impl LoadRunnerApp {
                     ui.selectable_value(&mut self.view, DeviceView::All, "All sources");
                     ui.selectable_value(&mut self.view, DeviceView::Discovered, "Discovered");
                     ui.selectable_value(&mut self.view, DeviceView::AddressBook, "Address book");
+                    let search_box = ui.add(
+                        egui::TextEdit::singleline(&mut self.search)
+                            .hint_text("Search devices")
+                            .desired_width(200.0),
+                    );
+                    if !self.search.is_empty() {
+                        let clear_rect = egui::Rect::from_min_max(
+                            egui::pos2(search_box.rect.right() - 20.0, search_box.rect.top()),
+                            search_box.rect.right_bottom(),
+                        )
+                        .shrink(2.0);
+                        if ui
+                            .put(clear_rect, egui::Button::new("✕").small().frame(false))
+                            .on_hover_text("Clear search")
+                            .clicked()
+                        {
+                            self.search.clear();
+                        }
+                    }
                 });
                 ui.horizontal(|ui| {
                     egui::ComboBox::from_id_salt("filter")
@@ -1052,6 +1127,7 @@ impl LoadRunnerApp {
                 });
                 ui.separator();
 
+                let query = SearchQuery::new(&self.search);
                 let visible_ids: Vec<String> = self
                     .devices
                     .iter()
@@ -1061,6 +1137,7 @@ impl LoadRunnerApp {
                         DeviceView::Discovered => device.source == DeviceSource::Discovered,
                         DeviceView::AddressBook => device.source == DeviceSource::AddressBook,
                     })
+                    .filter(|device| query.matches(device))
                     .map(|device| device.id.clone())
                     .collect();
 
@@ -1130,7 +1207,7 @@ impl LoadRunnerApp {
                         ui.vertical_centered(|ui| {
                             ui.add_space(48.0);
                             ui.label(RichText::new("No matching devices").size(18.0));
-                            ui.label("Run discovery, add an address, or clear the filter.");
+                            ui.label("Run discovery, add an address, or clear the filters.");
                         });
                     }
                     for id in visible_ids {

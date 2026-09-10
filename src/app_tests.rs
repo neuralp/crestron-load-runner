@@ -434,3 +434,174 @@ fn queued_jobs_block_remove_open_quit_and_promotion_until_drained() {
     app.merge_discovered(discovered("192.0.2.3"));
     assert_eq!(app.devices[0].host, "192.0.2.2");
 }
+
+fn searchable(host: &str, name: &str, model: &str, firmware: &str, mac: &str) -> Device {
+    let mut device = discovered(host);
+    device.id = format!("E-{}", mac.replace(':', "").to_ascii_lowercase());
+    device.name = name.into();
+    device.model = model.into();
+    device.firmware = firmware.into();
+    device.mac = mac.into();
+    device
+}
+
+fn rendered_texts(app: &mut LoadRunnerApp) -> Vec<String> {
+    let ctx = egui::Context::default();
+    // The first frame measures and positions the panels.
+    ctx.run_ui(input(), |ui| app.show(ui))
+        .drop_without_applying_deltas();
+    let output = ctx.run_ui(input(), |ui| app.show(ui));
+    let texts = output
+        .shapes
+        .iter()
+        .filter_map(|clipped| match &clipped.shape {
+            egui::Shape::Text(text) => Some(text.galley.text().to_owned()),
+            _ => None,
+        })
+        .collect();
+    output.drop_without_applying_deltas();
+    texts
+}
+
+#[test]
+fn search_matches_every_card_field_case_insensitively() {
+    let device = searchable(
+        "192.0.2.40",
+        "LOBBY-TSW",
+        "TSW-1070",
+        "3.002.1063",
+        "00:10:7F:11:22:33",
+    );
+
+    for query in ["", "   "] {
+        assert!(
+            SearchQuery::new(query).matches(&device),
+            "an empty query must match everything, got a miss for {query:?}"
+        );
+    }
+    for query in [
+        "tsw",          // model
+        "TSW-10",       // model, as typed
+        "lobby",        // hostname
+        "192.0.2",      // ip address
+        "00:10:7f",     // mac as stored
+        "00107f112233", // mac without separators
+        "00-10-7F",     // mac with other separators
+        "3.002",        // firmware
+    ] {
+        assert!(SearchQuery::new(query).matches(&device), "missed {query:?}");
+    }
+    for query in ["192.0.3", "ffffff", "lobbyy"] {
+        assert!(
+            !SearchQuery::new(query).matches(&device),
+            "unexpected hit for {query:?}"
+        );
+    }
+}
+
+#[test]
+fn a_query_containing_non_hex_characters_is_not_treated_as_a_mac() {
+    let device = searchable(
+        "192.0.2.40",
+        "LOBBY",
+        "TSW-1070",
+        "3.0",
+        "0C:03:00:00:00:00",
+    );
+    // "cp3" holds a non-hex character, so it must never reach the MAC comparison
+    // even though the separator-stripped MAC would otherwise be a tempting target.
+    assert!(!SearchQuery::new("cp3").matches(&device));
+    // An all-hex query does reach it, and matches across the stored separators.
+    assert!(SearchQuery::new("c030").matches(&device));
+}
+
+#[test]
+fn search_narrows_the_visible_device_list() {
+    let mut app = app();
+    app.merge_discovered(searchable(
+        "192.0.2.41",
+        "LOBBY-TSW",
+        "TSW-1070",
+        "3.002.1063",
+        "00:10:7F:11:22:33",
+    ));
+    app.merge_discovered(searchable(
+        "192.0.2.42",
+        "RACK-RMC",
+        "RMC4",
+        "2.001.0010",
+        "00:10:7F:44:55:66",
+    ));
+
+    let texts = rendered_texts(&mut app);
+    assert!(texts.iter().any(|text| text == "TSW-1070"));
+    assert!(texts.iter().any(|text| text == "RMC4"));
+
+    app.search = "rmc".into();
+    let texts = rendered_texts(&mut app);
+    assert!(texts.iter().any(|text| text == "RMC4"));
+    assert!(!texts.iter().any(|text| text == "TSW-1070"));
+
+    app.search = "192.0.2.41".into();
+    let texts = rendered_texts(&mut app);
+    assert!(texts.iter().any(|text| text == "TSW-1070"));
+    assert!(!texts.iter().any(|text| text == "RMC4"));
+
+    app.search = "no-such-device".into();
+    let texts = rendered_texts(&mut app);
+    assert!(texts.iter().any(|text| text == "No matching devices"));
+}
+
+#[test]
+fn clicking_the_clear_glyph_inside_the_search_box_resets_the_filter() {
+    let mut app = app();
+    app.merge_discovered(searchable(
+        "192.0.2.41",
+        "LOBBY-TSW",
+        "TSW-1070",
+        "3.002.1063",
+        "00:10:7F:11:22:33",
+    ));
+    app.search = "rmc".into();
+
+    let ctx = egui::Context::default();
+    // The first frame measures and positions the panels.
+    ctx.run_ui(input(), |ui| app.show(ui))
+        .drop_without_applying_deltas();
+    let output = ctx.run_ui(input(), |ui| app.show(ui));
+    let clear = output
+        .shapes
+        .iter()
+        .find_map(|clipped| {
+            if let egui::Shape::Text(text) = &clipped.shape
+                && text.galley.text() == "✕"
+            {
+                Some(text.pos + text.galley.size() * 0.5)
+            } else {
+                None
+            }
+        })
+        .expect("the clear glyph was not rendered while the search box held text");
+    output.drop_without_applying_deltas();
+
+    for pressed in [true, false] {
+        let mut raw = input();
+        raw.events.push(egui::Event::PointerMoved(clear));
+        raw.events.push(egui::Event::PointerButton {
+            pos: clear,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+        ctx.run_ui(raw, |ui| app.show(ui))
+            .drop_without_applying_deltas();
+    }
+
+    assert!(
+        app.search.is_empty(),
+        "clicking the glyph must clear the search"
+    );
+    let texts = rendered_texts(&mut app);
+    assert!(texts.iter().any(|text| text == "TSW-1070"));
+    assert!(!texts.iter().any(|text| text == "✕"));
+}

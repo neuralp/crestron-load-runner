@@ -6,6 +6,7 @@ A native Rust/egui utility for discovering Crestron devices, keeping an address 
 
 - Crestron UDP autodiscovery on port 41794
 - Manual and autodiscovery-to-address-book workflows with processor/touchpanel classification
+- Device-list text search across model, hostname, IP address, MAC address, and firmware
 - Address-book import and export as portable JSON files
 - Dedicated background worker thread per SSH device
 - App-specific trust-on-first-use SSH host-key verification
