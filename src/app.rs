@@ -12,7 +12,7 @@ use crate::{
         AddressEntry, ConnectionState, Device, DeviceKind, DeviceSource, Outcome, endpoint_id,
     },
     ssh::{ConnectionSpec, WorkerCommand, WorkerEvent, WorkerPool},
-    storage::AppConfig,
+    storage::{Preferences, StartupBook},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,16 +115,24 @@ struct AddressDraft {
 struct PreferencesDraft {
     default_username: String,
     default_password: String,
+    startup: StartupBook,
+    default_address_book: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum PendingAction {
+    New,
     Open(PathBuf),
     Quit,
 }
 
 pub struct LoadRunnerApp {
-    config: AppConfig,
+    preferences: Preferences,
+    /// Where the preferences are written. The configuration directory is a
+    /// process-global set once at startup, so this is what lets a test keep its
+    /// preference writes out of the real one.
+    preferences_path: Option<PathBuf>,
+    address_book: Vec<AddressEntry>,
     devices: Vec<Device>,
     selected_id: Option<String>,
     filter: DeviceFilter,
@@ -158,28 +166,42 @@ pub struct LoadRunnerApp {
 impl LoadRunnerApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
-        let (config, load_error) = AppConfig::load();
-        let mut app = Self::from_config(config, load_error);
+        let (preferences, load_error) = Preferences::load();
+        let (startup_book, startup_error) = crate::storage::startup_address_book(&preferences);
+        let mut app = Self::from_parts(
+            preferences,
+            crate::storage::preferences_path(),
+            Vec::new(),
+            load_error.or(startup_error),
+        );
         app.firmware_editor = crate::firmware::FirmwareEditor::load(crate::storage::firmware_dir());
+        if let Some(path) = startup_book {
+            app.open_address_book(&path);
+        }
         app
     }
 
-    fn from_config(config: AppConfig, load_error: Option<String>) -> Self {
+    fn from_parts(
+        preferences: Preferences,
+        preferences_path: Option<PathBuf>,
+        address_book: Vec<AddressEntry>,
+        load_error: Option<String>,
+    ) -> Self {
         let status_is_error = load_error.is_some();
         let status_message = load_error.unwrap_or_else(|| "Ready".into());
-        let devices = config
-            .address_book
-            .iter()
-            .map(Device::from_address)
-            .collect();
+        let devices = address_book.iter().map(Device::from_address).collect();
         let (worker_sender, worker_events) = mpsc::channel();
         let (discovery_sender, discovery_events) = mpsc::channel();
         let preferences_draft = PreferencesDraft {
-            default_username: config.default_username.clone(),
-            default_password: config.default_password.clone(),
+            default_username: preferences.default_username.clone(),
+            default_password: preferences.default_password.clone(),
+            startup: preferences.startup,
+            default_address_book: preferences.default_address_book.clone(),
         };
         Self {
-            config,
+            preferences,
+            preferences_path,
+            address_book,
             devices,
             selected_id: None,
             filter: DeviceFilter::All,
@@ -297,15 +319,6 @@ impl LoadRunnerApp {
 
     fn merge_discovered(&mut self, mut discovered: Device) {
         self.firmware_editor.observe_model(&discovered.model);
-        if discovered.ssh_host_key_fingerprint.is_none() {
-            let endpoint = endpoint_id(&discovered.host, discovered.port);
-            discovered.ssh_host_key_fingerprint = self
-                .config
-                .legacy_trusted_host_keys
-                .get(&discovered.id)
-                .or_else(|| self.config.legacy_trusted_host_keys.get(&endpoint))
-                .cloned();
-        }
         if let Some(index) = self.devices.iter().position(|device| {
             device.id == discovered.id
                 || endpoint_id(&device.host, device.port)
@@ -362,22 +375,17 @@ impl LoadRunnerApp {
         let device = self.devices.iter().find(|device| device.id == id)?;
         let mut credentials = device.credentials.clone();
         if credentials.username.trim().is_empty() {
-            credentials.username = self.config.default_username.clone();
+            credentials.username = self.preferences.default_username.clone();
         }
         if credentials.password.is_empty() {
-            credentials.password = self.config.default_password.clone();
+            credentials.password = self.preferences.default_password.clone();
         }
         Some(ConnectionSpec {
             id: device.id.clone(),
             host: device.host.clone(),
             port: device.port,
             credentials,
-            trusted_fingerprint: device.ssh_host_key_fingerprint.clone().or_else(|| {
-                self.config
-                    .legacy_trusted_host_keys
-                    .get(&device.id)
-                    .cloned()
-            }),
+            trusted_fingerprint: device.ssh_host_key_fingerprint.clone(),
         })
     }
 
@@ -391,7 +399,7 @@ impl LoadRunnerApp {
 
     fn clear_devices(&mut self) {
         let removed = self.devices.len();
-        let address_book_changed = !self.config.address_book.is_empty()
+        let address_book_changed = !self.address_book.is_empty()
             || self
                 .devices
                 .iter()
@@ -400,8 +408,7 @@ impl LoadRunnerApp {
         self.devices.clear();
         self.selected_id = None;
         self.pending_host_keys.clear();
-        self.config.legacy_trusted_host_keys.clear();
-        self.sync_config_from_devices();
+        self.sync_address_book_from_devices();
         self.address_book_dirty |= address_book_changed;
         self.status_message = format!("Cleared {removed} device(s)");
         self.status_is_error = false;
@@ -409,22 +416,38 @@ impl LoadRunnerApp {
 
     fn open_preferences(&mut self) {
         self.preferences_draft = PreferencesDraft {
-            default_username: self.config.default_username.clone(),
-            default_password: self.config.default_password.clone(),
+            default_username: self.preferences.default_username.clone(),
+            default_password: self.preferences.default_password.clone(),
+            startup: self.preferences.startup,
+            default_address_book: self.preferences.default_address_book.clone(),
         };
         self.preferences_open = true;
     }
 
     fn save_preferences(&mut self) {
-        let default_username = self.preferences_draft.default_username.trim().to_owned();
-        let default_password = self.preferences_draft.default_password.clone();
-        let mut updated = self.config.clone();
-        updated.default_username = default_username.clone();
-        updated.default_password = default_password.clone();
-        match updated.save_preferences() {
+        let draft = self.preferences_draft.clone();
+        if draft.startup == StartupBook::Specific {
+            let Some(path) = draft.default_address_book.as_deref() else {
+                self.notice = Some("Choose the address book to open at startup".into());
+                return;
+            };
+            if let Err(error) = crate::storage::validate_portable_path(path) {
+                self.notice = Some(format!("Cannot open that file at startup: {error}"));
+                return;
+            }
+            if !path.is_file() {
+                self.notice = Some(format!("No such address book: {}", path.display()));
+                return;
+            }
+        }
+        // Assigned field by field: the recent list lives on the same struct and
+        // is not part of the draft.
+        self.preferences.default_username = draft.default_username.trim().to_owned();
+        self.preferences.default_password = draft.default_password;
+        self.preferences.startup = draft.startup;
+        self.preferences.default_address_book = draft.default_address_book;
+        match self.store_preferences() {
             Ok(()) => {
-                self.config.default_username = default_username;
-                self.config.default_password = default_password;
                 self.preferences_open = false;
                 self.status_message = "Preferences saved".into();
                 self.status_is_error = false;
@@ -432,6 +455,36 @@ impl LoadRunnerApp {
             Err(error) => {
                 self.notice = Some(format!("Could not save preferences: {error}"));
             }
+        }
+    }
+
+    fn store_preferences(&self) -> std::io::Result<()> {
+        let path = self
+            .preferences_path
+            .as_deref()
+            .ok_or_else(|| std::io::Error::other("no configuration directory"))?;
+        self.preferences.save_to(path)
+    }
+
+    /// Records the file in the recent list. Best effort: a document that was
+    /// written or read successfully is not undone by a preferences failure, so
+    /// the trouble is appended to the status message instead.
+    fn remember_recent(&mut self, path: &Path) {
+        if !crate::storage::remember_recent(&mut self.preferences.recent_address_books, path) {
+            return;
+        }
+        if let Err(error) = self.store_preferences() {
+            self.status_message = format!(
+                "{}, but could not update preferences: {error}",
+                self.status_message
+            );
+            self.status_is_error = true;
+        }
+    }
+
+    fn forget_recent(&mut self, path: &Path) {
+        if crate::storage::forget_recent(&mut self.preferences.recent_address_books, path) {
+            let _ = self.store_preferences();
         }
     }
 
@@ -455,20 +508,13 @@ impl LoadRunnerApp {
         let Some(index) = self.devices.iter().position(|device| device.id == id) else {
             return;
         };
-        let endpoint = endpoint_id(&self.devices[index].host, self.devices[index].port);
         let had_key = self.devices[index]
             .ssh_host_key_fingerprint
             .take()
             .is_some();
         let is_address_book = self.devices[index].source == DeviceSource::AddressBook;
         self.pending_host_keys.remove(id);
-        let had_legacy = self.config.legacy_trusted_host_keys.remove(id).is_some()
-            | self
-                .config
-                .legacy_trusted_host_keys
-                .remove(&endpoint)
-                .is_some();
-        if !had_key && !had_legacy {
+        if !had_key {
             self.status_message = "This device has no trusted SSH host key".into();
             self.status_is_error = false;
             return;
@@ -489,12 +535,9 @@ impl LoadRunnerApp {
         let Some(index) = self.devices.iter().position(|device| device.id == id) else {
             return;
         };
-        let endpoint = endpoint_id(&self.devices[index].host, self.devices[index].port);
         let is_address_book = self.devices[index].source == DeviceSource::AddressBook;
         self.devices[index].ssh_host_key_fingerprint = Some(fingerprint);
         self.pending_host_keys.remove(id);
-        self.config.legacy_trusted_host_keys.remove(id);
-        self.config.legacy_trusted_host_keys.remove(&endpoint);
 
         if is_address_book {
             self.mark_address_book_dirty();
@@ -716,8 +759,8 @@ impl LoadRunnerApp {
         }
     }
 
-    fn sync_config_from_devices(&mut self) {
-        self.config.address_book = self
+    fn sync_address_book_from_devices(&mut self) {
+        self.address_book = self
             .devices
             .iter()
             .filter(|device| device.source == DeviceSource::AddressBook)
@@ -726,22 +769,59 @@ impl LoadRunnerApp {
     }
 
     fn mark_address_book_dirty(&mut self) {
-        self.sync_config_from_devices();
+        self.sync_address_book_from_devices();
         self.address_book_dirty = true;
         self.status_message = "Address book modified".into();
         self.status_is_error = false;
     }
 
-    fn save_config(&mut self) -> bool {
-        self.sync_config_from_devices();
-        match self.write_current_address_book() {
+    fn save_address_book(&mut self) -> bool {
+        match self.current_address_book.clone() {
+            Some(path) => self.write_address_book_to(&path),
+            None => self.save_address_book_as(),
+        }
+    }
+
+    fn save_address_book_as(&mut self) -> bool {
+        let name = self
+            .current_address_book
+            .as_deref()
+            .map_or_else(|| "address-book.json".into(), file_display_name);
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("JSON", &["json"])
+            .set_file_name(name)
+            .save_file()
+        else {
+            // The unsaved-changes prompt only shows the status line when it is
+            // an error, so a cancelled dialog has to say something there.
+            self.status_message = "Choose a file to save the address book".into();
+            self.status_is_error = true;
+            return false;
+        };
+        self.write_address_book_to(&path)
+    }
+
+    /// The one place the address book is written. The file is read back and
+    /// compared because it is now the only copy of the data.
+    fn write_address_book_to(&mut self, path: &Path) -> bool {
+        self.sync_address_book_from_devices();
+        let result = crate::storage::save_address_book(path, &self.address_book).and_then(|()| {
+            let saved = crate::storage::load_address_book(path)?;
+            if saved == self.address_book {
+                Ok(())
+            } else {
+                Err(std::io::Error::other(
+                    "saved address book did not match the in-memory data",
+                ))
+            }
+        });
+        match result {
             Ok(()) => {
+                self.current_address_book = Some(path.to_owned());
                 self.address_book_dirty = false;
-                self.status_message = match &self.current_address_book {
-                    Some(path) => format!("Saved {}", path.display()),
-                    None => "Saved local address book".into(),
-                };
+                self.status_message = format!("Saved {}", path.display());
                 self.status_is_error = false;
+                self.remember_recent(path);
                 true
             }
             Err(error) => {
@@ -753,60 +833,23 @@ impl LoadRunnerApp {
         }
     }
 
-    fn write_current_address_book(&self) -> std::io::Result<()> {
-        if let Some(path) = &self.current_address_book {
-            crate::storage::save_address_book(path, &self.config.address_book)?;
-            let saved = crate::storage::load_address_book(path)?;
-            if saved != self.config.address_book {
-                return Err(std::io::Error::other(
-                    "saved address book did not match the in-memory data",
-                ));
-            }
-        }
-        self.config.save()?;
-        Ok(())
-    }
-
-    fn export_address_book(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("JSON", &["json"])
-            .set_file_name("crestron-address-book.json")
-            .save_file()
-        else {
+    /// Discovered devices describe the network rather than the document, so
+    /// they survive a new address book just as they survive opening one.
+    fn new_address_book(&mut self) {
+        if let Err(error) = self.worker_pool.retire_all() {
+            self.status_message = error;
+            self.status_is_error = true;
             return;
-        };
-        self.sync_config_from_devices();
-        let result =
-            crate::storage::save_address_book(&path, &self.config.address_book).and_then(|_| {
-                let saved = crate::storage::load_address_book(&path)?;
-                if saved == self.config.address_book {
-                    Ok(())
-                } else {
-                    Err(std::io::Error::other(
-                        "saved address book did not match the in-memory data",
-                    ))
-                }
-            });
-        match result {
-            Ok(()) => {
-                self.current_address_book = Some(path.clone());
-                self.address_book_dirty = false;
-                self.status_message = format!("Saved {}", path.display());
-                self.status_is_error = false;
-                if let Err(error) = self.config.save() {
-                    self.status_message = format!(
-                        "Saved {}, but could not update the local address book: {error}",
-                        path.display()
-                    );
-                    self.status_is_error = true;
-                }
-            }
-            Err(error) => {
-                self.address_book_dirty = true;
-                self.status_message = format!("Could not save address book: {error}");
-                self.status_is_error = true;
-            }
         }
+        self.devices
+            .retain(|device| device.source == DeviceSource::Discovered);
+        self.address_book.clear();
+        self.pending_host_keys.clear();
+        self.selected_id = None;
+        self.current_address_book = None;
+        self.address_book_dirty = false;
+        self.status_message = "New address book".into();
+        self.status_is_error = false;
     }
 
     fn request_action(&mut self, action: PendingAction, ctx: &egui::Context) {
@@ -816,7 +859,7 @@ impl LoadRunnerApp {
             return;
         }
         if self.worker_pool.has_pending() {
-            self.status_message = "Wait for queued device operations to finish before opening another address book or exiting".into();
+            self.status_message = "Wait for queued device operations to finish before switching address books or exiting".into();
             self.status_is_error = true;
             return;
         }
@@ -834,6 +877,7 @@ impl LoadRunnerApp {
             return;
         }
         match action {
+            PendingAction::New => self.new_address_book(),
             PendingAction::Open(path) => self.open_address_book(&path),
             PendingAction::Quit => {
                 self.close_approved = true;
@@ -845,7 +889,7 @@ impl LoadRunnerApp {
     fn confirm_pending_action(&mut self, save: bool, ctx: &egui::Context) {
         if self.firmware_editor.is_busy()
             || self.worker_pool.has_pending()
-            || (save && !self.save_config())
+            || (save && !self.save_address_book())
         {
             return;
         }
@@ -854,7 +898,7 @@ impl LoadRunnerApp {
         }
     }
 
-    fn import_address_book(&mut self, ctx: &egui::Context) {
+    fn open_address_book_dialog(&mut self, ctx: &egui::Context) {
         if self.worker_pool.has_pending() {
             self.status_message =
                 "Wait for queued device operations before opening another address book".into();
@@ -893,32 +937,25 @@ impl LoadRunnerApp {
                         })
                         .cloned(),
                 );
-                self.config.address_book = entries;
-                self.config.legacy_trusted_host_keys.clear();
+                self.address_book = entries;
                 self.devices = devices;
                 self.selected_id = None;
                 self.pending_host_keys.clear();
-                match self.config.save() {
-                    Ok(()) => {
-                        self.current_address_book = Some(path.to_owned());
-                        self.address_book_dirty = false;
-                        self.status_message = format!("Loaded {}", path.display());
-                        self.status_is_error = false;
-                    }
-                    Err(error) => {
-                        self.current_address_book = Some(path.to_owned());
-                        self.address_book_dirty = false;
-                        self.status_message = format!(
-                            "Loaded {}, but could not update the local address book: {error}",
-                            path.display()
-                        );
-                        self.status_is_error = true;
-                    }
-                }
+                self.current_address_book = Some(path.to_owned());
+                self.address_book_dirty = false;
+                self.status_message = format!("Loaded {}", path.display());
+                self.status_is_error = false;
+                self.remember_recent(path);
             }
             Err(error) => {
+                let missing = error.kind() == std::io::ErrorKind::NotFound;
                 self.status_message = format!("Could not load address book: {error}");
                 self.status_is_error = true;
+                // A file that is merely malformed stays listed so it can be
+                // fixed; one that is gone will never open again.
+                if missing {
+                    self.forget_recent(path);
+                }
             }
         }
     }
@@ -978,7 +1015,7 @@ impl LoadRunnerApp {
         }
         let mut device = Device::from_address(&entry);
         device.credentials.password = self.address_draft.password.clone();
-        self.config.address_book.push(entry);
+        self.address_book.push(entry);
         self.devices.push(device);
         self.selected_id = Some(id);
         self.add_device_open = false;
@@ -1013,11 +1050,7 @@ impl LoadRunnerApp {
             (other != index && endpoint_id(&device.host, device.port) == new_id)
                 .then(|| device.id.clone())
         }) {
-            let fingerprint = self.devices[index]
-                .ssh_host_key_fingerprint
-                .clone()
-                .or_else(|| self.config.legacy_trusted_host_keys.remove(&old_id))
-                .or_else(|| self.config.legacy_trusted_host_keys.remove(&new_id));
+            let fingerprint = self.devices[index].ssh_host_key_fingerprint.clone();
             self.devices.remove(index);
             self.pending_host_keys.remove(&old_id);
             self.selected_id = Some(existing.clone());
@@ -1029,14 +1062,6 @@ impl LoadRunnerApp {
             }
             self.mark_address_book_dirty();
             return;
-        }
-        let fingerprint = self
-            .config
-            .legacy_trusted_host_keys
-            .remove(&old_id)
-            .or_else(|| self.config.legacy_trusted_host_keys.remove(&new_id));
-        if self.devices[index].ssh_host_key_fingerprint.is_none() {
-            self.devices[index].ssh_host_key_fingerprint = fingerprint;
         }
         self.devices[index].id = new_id.clone();
         self.devices[index].source = DeviceSource::AddressBook;
@@ -1067,10 +1092,8 @@ impl LoadRunnerApp {
             return;
         }
         self.devices.retain(|device| device.id != id);
-        self.config
-            .address_book
+        self.address_book
             .retain(|entry| entry.host != host || entry.port != port);
-        self.config.legacy_trusted_host_keys.remove(&id);
         self.pending_host_keys.remove(&id);
         self.selected_id = None;
         self.mark_address_book_dirty();
@@ -1080,20 +1103,26 @@ impl LoadRunnerApp {
         egui::Panel::top("menu").show(root, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
+                    if ui.button("New address book").clicked() {
+                        self.request_action(PendingAction::New, ui.ctx());
+                        ui.close();
+                    }
+                    if ui.button("Open address book…").clicked() {
+                        self.open_address_book_dialog(ui.ctx());
+                        ui.close();
+                    }
+                    ui.menu_button("Open Recent", |ui| self.recent_menu(ui));
+                    if ui.button("Save address book").clicked() {
+                        self.save_address_book();
+                        ui.close();
+                    }
+                    if ui.button("Save address book as…").clicked() {
+                        self.save_address_book_as();
+                        ui.close();
+                    }
+                    ui.separator();
                     if ui.button("Add device…").clicked() {
                         self.add_device_open = true;
-                        ui.close();
-                    }
-                    if ui.button("Open address book JSON…").clicked() {
-                        self.import_address_book(ui.ctx());
-                        ui.close();
-                    }
-                    if ui.button("Save address book as JSON…").clicked() {
-                        self.export_address_book();
-                        ui.close();
-                    }
-                    if ui.button("Save address book").clicked() {
-                        self.save_config();
                         ui.close();
                     }
                     ui.separator();
@@ -1141,6 +1170,35 @@ impl LoadRunnerApp {
         });
     }
 
+    fn recent_menu(&mut self, ui: &mut egui::Ui) {
+        // Cloned because acting on an entry borrows self mutably.
+        let recent = self.preferences.recent_address_books.clone();
+        if recent.is_empty() {
+            ui.add_enabled(false, egui::Button::new("No recent address books"));
+            return;
+        }
+        for path in &recent {
+            // Five absolute paths would be unreadable, so the full one is hover
+            // text and disambiguates two files sharing a name.
+            if ui
+                .button(file_display_name(path))
+                .on_hover_text(path.display().to_string())
+                .clicked()
+            {
+                self.request_action(PendingAction::Open(path.clone()), ui.ctx());
+                ui.close();
+            }
+        }
+        ui.separator();
+        if ui.button("Clear recent list").clicked() {
+            self.preferences.recent_address_books.clear();
+            if let Err(error) = self.store_preferences() {
+                self.notice = Some(format!("Could not save preferences: {error}"));
+            }
+            ui.close();
+        }
+    }
+
     fn action_bar(&mut self, root: &mut egui::Ui) {
         egui::Panel::top("actions").show(root, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -1171,21 +1229,12 @@ impl LoadRunnerApp {
         egui::Panel::bottom("status").show(root, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Address book:").strong());
-                let path = self
-                    .current_address_book
-                    .clone()
-                    .or_else(crate::storage::config_path);
-                if let Some(path) = path {
-                    ui.monospace(address_book_status_path(&path, self.address_book_dirty));
-                } else {
-                    ui.label(if self.address_book_dirty {
-                        "Unavailable *"
-                    } else {
-                        "Unavailable"
-                    });
-                }
+                ui.monospace(address_book_status_path(
+                    self.current_address_book.as_deref(),
+                    self.address_book_dirty,
+                ));
                 ui.separator();
-                ui.label(format!("{} device(s)", self.config.address_book.len()));
+                ui.label(format!("{} device(s)", self.address_book.len()));
                 ui.separator();
                 let status = RichText::new(&self.status_message);
                 ui.label(if self.status_is_error {
@@ -1896,6 +1945,58 @@ impl LoadRunnerApp {
                             ui.end_row();
                         });
                     ui.small("These credentials are saved in the local application settings.");
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.label("At startup");
+                    ui.radio_value(
+                        &mut self.preferences_draft.startup,
+                        StartupBook::Empty,
+                        "Start with an empty address book",
+                    );
+                    ui.radio_value(
+                        &mut self.preferences_draft.startup,
+                        StartupBook::MostRecent,
+                        "Reopen the most recent address book",
+                    );
+                    ui.radio_value(
+                        &mut self.preferences_draft.startup,
+                        StartupBook::Specific,
+                        "Always open a specific address book",
+                    );
+                    let specific = self.preferences_draft.startup == StartupBook::Specific;
+                    let current = self.current_address_book.clone();
+                    ui.add_enabled_ui(specific, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            let chosen = &mut self.preferences_draft.default_address_book;
+                            let label = chosen
+                                .as_deref()
+                                .map_or_else(|| "None".to_owned(), file_display_name);
+                            let path = ui.monospace(label);
+                            if let Some(chosen) = chosen.as_deref() {
+                                path.on_hover_text(chosen.display().to_string());
+                            }
+                            if ui.small_button("Choose…").clicked()
+                                && let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("JSON", &["json"])
+                                    .pick_file()
+                            {
+                                *chosen = Some(path);
+                            }
+                            if ui
+                                .add_enabled(
+                                    current.is_some(),
+                                    egui::Button::new("Use current").small(),
+                                )
+                                .clicked()
+                            {
+                                *chosen = current;
+                            }
+                            if chosen.is_some() && ui.small_button("Clear").clicked() {
+                                *chosen = None;
+                            }
+                        });
+                    });
+                    ui.small("Opened at startup while the file still exists.");
                     ui.separator();
                     ui.horizontal(|ui| {
                         if ui.button("Save").clicked() {
@@ -2012,8 +2113,9 @@ fn file_display_name(path: &Path) -> String {
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
-fn address_book_status_path(path: &Path, dirty: bool) -> String {
-    format!("{}{}", path.display(), if dirty { " *" } else { "" })
+fn address_book_status_path(path: Option<&Path>, dirty: bool) -> String {
+    let name = path.map_or_else(|| "Untitled".to_owned(), |path| path.display().to_string());
+    format!("{name}{}", if dirty { " *" } else { "" })
 }
 
 fn assigned_file_row(ui: &mut egui::Ui, kind: &str, slot: usize, path: &Path) {
@@ -2250,7 +2352,15 @@ mod tests {
     #[test]
     fn marks_unsaved_address_book_paths() {
         let path = Path::new("address-book.json");
-        assert_eq!(address_book_status_path(path, false), "address-book.json");
-        assert_eq!(address_book_status_path(path, true), "address-book.json *");
+        assert_eq!(
+            address_book_status_path(Some(path), false),
+            "address-book.json"
+        );
+        assert_eq!(
+            address_book_status_path(Some(path), true),
+            "address-book.json *"
+        );
+        assert_eq!(address_book_status_path(None, false), "Untitled");
+        assert_eq!(address_book_status_path(None, true), "Untitled *");
     }
 }

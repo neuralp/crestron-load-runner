@@ -6,10 +6,11 @@ Crestron Load Runner
 Usage: crestron-load-runner [OPTIONS]
 
 Options:
-      --config-dir <DIR>  Keep settings, the address book, and the firmware
-                          library in DIR instead of the user configuration
-                          directory. Useful for a throwaway profile that
-                          leaves the real address book untouched.
+      --config-dir <DIR>  Keep the preferences and the firmware library in DIR
+                          instead of the user configuration directory. Useful
+                          for a throwaway profile that leaves the real
+                          preferences untouched. Address books are files you
+                          choose and are not stored here.
   -h, --help              Print this message and exit
 ";
 

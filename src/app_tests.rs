@@ -1,8 +1,20 @@
 use super::*;
+use crate::storage::Preferences;
 use crate::test_support::TestDir;
 
 fn app() -> LoadRunnerApp {
-    LoadRunnerApp::from_config(AppConfig::default(), None)
+    LoadRunnerApp::from_parts(Preferences::default(), None, Vec::new(), None)
+}
+
+/// An app whose preference writes land in `dir` instead of the real
+/// configuration directory, which no test can relocate.
+fn app_in(dir: &TestDir) -> LoadRunnerApp {
+    LoadRunnerApp::from_parts(
+        Preferences::default(),
+        Some(dir.path().join("preferences.json")),
+        Vec::new(),
+        None,
+    )
 }
 
 fn input() -> egui::RawInput {
@@ -388,11 +400,9 @@ fn manual_add_promotes_discovered_endpoint_instead_of_duplicating_it() {
     assert_eq!(app.devices[0].name, "My room");
     assert_eq!(app.devices[0].model, "RMC3");
     assert_eq!(app.devices[0].credentials.username, "admin");
-    assert_eq!(app.config.address_book.len(), 1);
+    assert_eq!(app.address_book.len(), 1);
     assert_eq!(
-        app.config.address_book[0]
-            .ssh_host_key_fingerprint
-            .as_deref(),
+        app.address_book[0].ssh_host_key_fingerprint.as_deref(),
         Some("SHA256:discovered-host-key")
     );
     assert!(app.address_book_dirty);
@@ -452,17 +462,17 @@ fn different_ssh_ports_are_distinct_endpoints() {
 
 #[test]
 fn connection_uses_defaults_only_for_missing_credentials() {
-    let mut config = AppConfig {
+    let preferences = Preferences {
         default_username: "default-user".into(),
         default_password: "default-password".into(),
         ..Default::default()
     };
-    config.address_book.push(AddressEntry {
+    let address_book = vec![AddressEntry {
         host: "192.0.2.1".into(),
         ssh_host_key_fingerprint: Some("SHA256:address-book-host-key".into()),
         ..Default::default()
-    });
-    let mut app = LoadRunnerApp::from_config(config, None);
+    }];
+    let mut app = LoadRunnerApp::from_parts(preferences, None, address_book, None);
     let id = app.devices[0].id.clone();
     let connection = app.connection_spec(&id).unwrap();
     assert_eq!(
@@ -481,14 +491,11 @@ fn connection_uses_defaults_only_for_missing_credentials() {
 
 #[test]
 fn trusting_host_key_updates_the_device_address_book_entry() {
-    let config = AppConfig {
-        address_book: vec![AddressEntry {
-            host: "192.0.2.1".into(),
-            ..Default::default()
-        }],
+    let address_book = vec![AddressEntry {
+        host: "192.0.2.1".into(),
         ..Default::default()
-    };
-    let mut app = LoadRunnerApp::from_config(config, None);
+    }];
+    let mut app = LoadRunnerApp::from_parts(Preferences::default(), None, address_book, None);
     let id = app.devices[0].id.clone();
     app.pending_host_keys
         .insert(id.clone(), "SHA256:new-host-key".into());
@@ -500,9 +507,7 @@ fn trusting_host_key_updates_the_device_address_book_entry() {
         Some("SHA256:new-host-key")
     );
     assert_eq!(
-        app.config.address_book[0]
-            .ssh_host_key_fingerprint
-            .as_deref(),
+        app.address_book[0].ssh_host_key_fingerprint.as_deref(),
         Some("SHA256:new-host-key")
     );
     assert_eq!(
@@ -535,7 +540,7 @@ fn clearing_devices_immediately_removes_every_source() {
     app.clear_devices();
 
     assert!(app.devices.is_empty());
-    assert!(app.config.address_book.is_empty());
+    assert!(app.address_book.is_empty());
     assert!(app.selected_id.is_none());
     assert!(app.address_book_dirty);
     assert!(app.worker_pool.has_pending());
@@ -849,4 +854,279 @@ fn clicking_the_clear_glyph_inside_the_search_box_resets_the_filter() {
     let texts = rendered_texts(&mut app);
     assert!(texts.iter().any(|text| text == "TSW-1070"));
     assert!(!texts.iter().any(|text| text == "✕"));
+}
+
+fn recent_menu_texts(app: &mut LoadRunnerApp) -> Vec<String> {
+    let ctx = egui::Context::default();
+    // The first frame measures and positions the items.
+    ctx.run_ui(input(), |ui| app.recent_menu(ui))
+        .drop_without_applying_deltas();
+    let output = ctx.run_ui(input(), |ui| app.recent_menu(ui));
+    let texts = output
+        .shapes
+        .iter()
+        .filter_map(|clipped| match &clipped.shape {
+            egui::Shape::Text(text) => Some(text.galley.text().to_owned()),
+            _ => None,
+        })
+        .collect();
+    output.drop_without_applying_deltas();
+    texts
+}
+
+fn saved_book(app: &mut LoadRunnerApp, path: &Path, host: &str) {
+    app.address_draft.host = host.into();
+    app.add_address();
+    assert!(app.write_address_book_to(path), "{}", app.status_message);
+}
+
+#[test]
+fn saving_writes_the_chosen_file_and_adopts_it_as_the_current_one() {
+    let dir = TestDir::new();
+    let path = dir.path().join("book.json");
+    let mut app = app_in(&dir);
+    app.address_draft.host = "192.0.2.1".into();
+    app.address_draft.name = "Control room".into();
+    app.add_address();
+    assert!(app.address_book_dirty);
+
+    assert!(app.write_address_book_to(&path));
+
+    assert_eq!(app.current_address_book.as_deref(), Some(path.as_path()));
+    assert!(!app.address_book_dirty);
+    assert!(!app.status_is_error);
+    let saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(saved["version"], 1);
+    assert_eq!(saved["devices"][0]["name"], "Control room");
+
+    // With a file open, Save writes in place instead of asking for one.
+    app.devices[0].credentials.username = "admin".into();
+    app.mark_address_book_dirty();
+    assert!(app.save_address_book());
+    assert_eq!(app.current_address_book.as_deref(), Some(path.as_path()));
+    assert_eq!(
+        crate::storage::load_address_book(&path).unwrap()[0].username,
+        "admin"
+    );
+}
+
+#[test]
+fn a_failed_save_leaves_the_current_address_book_unchanged() {
+    let dir = TestDir::new();
+    let book = dir.path().join("book.json");
+    let mut app = app_in(&dir);
+    saved_book(&mut app, &book, "192.0.2.1");
+
+    app.address_draft.host = "192.0.2.2".into();
+    app.add_address();
+    assert!(!app.write_address_book_to(&dir.path().join("missing/book.json")));
+
+    assert_eq!(app.current_address_book.as_deref(), Some(book.as_path()));
+    assert!(app.address_book_dirty);
+    assert!(app.status_is_error);
+    assert_eq!(crate::storage::load_address_book(&book).unwrap().len(), 1);
+}
+
+#[test]
+fn an_untitled_address_book_shows_as_untitled_until_it_is_saved() {
+    let dir = TestDir::new();
+    let mut app = app_in(&dir);
+    assert!(
+        rendered_texts(&mut app)
+            .iter()
+            .any(|text| text == "Untitled")
+    );
+
+    app.address_draft.host = "192.0.2.1".into();
+    app.add_address();
+    assert!(
+        rendered_texts(&mut app)
+            .iter()
+            .any(|text| text == "Untitled *")
+    );
+
+    assert!(app.write_address_book_to(&dir.path().join("book.json")));
+    assert!(
+        !rendered_texts(&mut app)
+            .iter()
+            .any(|text| text.starts_with("Untitled"))
+    );
+}
+
+#[test]
+fn a_new_address_book_keeps_discovered_devices_and_forgets_the_file() {
+    let dir = TestDir::new();
+    let path = dir.path().join("book.json");
+    let mut app = app_in(&dir);
+    saved_book(&mut app, &path, "192.0.2.1");
+    app.merge_discovered(discovered("192.0.2.9"));
+
+    app.new_address_book();
+
+    assert_eq!(app.devices.len(), 1);
+    assert_eq!(app.devices[0].source, DeviceSource::Discovered);
+    assert!(app.address_book.is_empty());
+    assert!(app.current_address_book.is_none());
+    assert!(!app.address_book_dirty);
+    // Starting a new book does not touch the one on disk.
+    assert_eq!(crate::storage::load_address_book(&path).unwrap().len(), 1);
+}
+
+#[test]
+fn starting_a_new_address_book_with_unsaved_changes_asks_first() {
+    let mut app = app();
+    app.address_draft.host = "192.0.2.1".into();
+    app.add_address();
+    let ctx = egui::Context::default();
+
+    app.request_action(PendingAction::New, &ctx);
+
+    assert_eq!(app.pending_action, Some(PendingAction::New));
+    assert_eq!(app.devices.len(), 1);
+    app.confirm_pending_action(false, &ctx);
+    assert!(app.pending_action.is_none());
+    assert!(app.devices.is_empty());
+    assert!(app.current_address_book.is_none());
+}
+
+#[test]
+fn saving_and_opening_record_the_file_in_the_recent_list() {
+    let dir = TestDir::new();
+    let first = dir.path().join("first.json");
+    let second = dir.path().join("second.json");
+    let mut app = app_in(&dir);
+    saved_book(&mut app, &first, "192.0.2.1");
+    assert!(app.write_address_book_to(&second));
+    assert_eq!(
+        app.preferences.recent_address_books,
+        vec![second.clone(), first.clone()]
+    );
+
+    app.open_address_book(&first);
+
+    assert_eq!(app.current_address_book.as_deref(), Some(first.as_path()));
+    assert_eq!(
+        app.preferences.recent_address_books,
+        vec![first, second.clone()]
+    );
+    let stored = Preferences::load_from(&dir.path().join("preferences.json")).unwrap();
+    assert_eq!(
+        stored.recent_address_books,
+        app.preferences.recent_address_books
+    );
+    assert!(stored.default_address_book.is_none());
+}
+
+#[test]
+fn a_recent_address_book_that_has_been_deleted_is_reported_and_dropped_from_the_list() {
+    let dir = TestDir::new();
+    let path = dir.path().join("book.json");
+    let mut app = app_in(&dir);
+    saved_book(&mut app, &path, "192.0.2.1");
+    std::fs::remove_file(&path).unwrap();
+
+    app.open_address_book(&path);
+
+    assert!(app.status_is_error);
+    assert!(app.status_message.contains("Could not load"));
+    assert!(app.preferences.recent_address_books.is_empty());
+    let stored = Preferences::load_from(&dir.path().join("preferences.json")).unwrap();
+    assert!(stored.recent_address_books.is_empty());
+}
+
+#[test]
+fn a_malformed_recent_address_book_is_reported_but_stays_in_the_list() {
+    let dir = TestDir::new();
+    let path = dir.path().join("book.json");
+    let mut app = app_in(&dir);
+    saved_book(&mut app, &path, "192.0.2.1");
+    std::fs::write(&path, "not json").unwrap();
+
+    app.open_address_book(&path);
+
+    assert!(app.status_is_error);
+    // It can still be repaired, so it stays one click away.
+    assert_eq!(app.preferences.recent_address_books, vec![path]);
+    assert_eq!(app.devices.len(), 1);
+}
+
+#[test]
+fn the_recent_menu_lists_the_five_most_recent_files_most_recent_first() {
+    let dir = TestDir::new();
+    let mut app = app_in(&dir);
+    for index in 0..6 {
+        crate::storage::remember_recent(
+            &mut app.preferences.recent_address_books,
+            &dir.path().join(format!("book{index}.json")),
+        );
+    }
+
+    let texts = recent_menu_texts(&mut app);
+    let listed: Vec<&String> = texts
+        .iter()
+        .filter(|text| text.starts_with("book"))
+        .collect();
+    assert_eq!(listed.len(), crate::storage::RECENT_ADDRESS_BOOKS);
+    assert_eq!(listed[0], "book5.json");
+    assert_eq!(listed[4], "book1.json");
+    assert!(texts.iter().any(|text| text == "Clear recent list"));
+
+    app.preferences.recent_address_books.clear();
+    assert!(
+        recent_menu_texts(&mut app)
+            .iter()
+            .any(|text| text == "No recent address books")
+    );
+}
+
+#[test]
+fn a_missing_default_address_book_is_reported_in_the_status_bar() {
+    let dir = TestDir::new();
+    let preferences = Preferences {
+        startup: StartupBook::Specific,
+        default_address_book: Some(dir.path().join("gone.json")),
+        ..Default::default()
+    };
+    let (opened, error) = crate::storage::startup_address_book(&preferences);
+    assert!(opened.is_none());
+
+    let mut app = LoadRunnerApp::from_parts(preferences, None, Vec::new(), error);
+
+    assert!(app.status_is_error);
+    assert!(app.address_book.is_empty());
+    let texts = rendered_texts(&mut app);
+    assert!(texts.iter().any(|text| text.contains("gone.json")));
+    assert!(texts.iter().any(|text| text == "Untitled"));
+}
+
+#[test]
+fn choosing_a_default_address_book_does_not_lose_the_recent_list() {
+    let dir = TestDir::new();
+    let book = dir.path().join("book.json");
+    let mut app = app_in(&dir);
+    saved_book(&mut app, &book, "192.0.2.1");
+    assert_eq!(app.preferences.recent_address_books, vec![book.clone()]);
+
+    app.open_preferences();
+    app.preferences_draft.startup = StartupBook::Specific;
+    app.preferences_draft.default_address_book = Some(book.clone());
+    app.preferences_draft.default_username = "admin".into();
+    app.save_preferences();
+
+    assert!(app.notice.is_none());
+    assert!(!app.preferences_open);
+    let stored = Preferences::load_from(&dir.path().join("preferences.json")).unwrap();
+    assert_eq!(stored.recent_address_books, vec![book.clone()]);
+    assert_eq!(stored.default_address_book, Some(book));
+    assert_eq!(stored.default_username, "admin");
+    assert_eq!(stored.startup, StartupBook::Specific);
+
+    // A file that is not there cannot be the one opened at startup.
+    app.open_preferences();
+    app.preferences_draft.startup = StartupBook::Specific;
+    app.preferences_draft.default_address_book = Some(dir.path().join("gone.json"));
+    app.save_preferences();
+    assert!(app.notice.is_some());
+    assert!(app.preferences_open);
 }

@@ -7,10 +7,10 @@ A native Rust/egui utility for discovering Crestron devices, keeping an address 
 - Crestron UDP autodiscovery on port 41794
 - Manual and autodiscovery-to-address-book workflows with processor/touchpanel classification
 - Device-list text search across model, hostname, IP address, MAC address, and firmware
-- Address-book import and export as portable JSON files
+- The address book is an ordinary JSON file you name and own: **New**, **Open**, **Save**, **Save as…**, and an **Open Recent** list of the five most recent books
 - Dedicated background worker thread per SSH device, each driving an asynchronous `russh` session
 - App-specific trust-on-first-use SSH host-key verification, with **Forget SSH host key** on a device's right-click menu to ask again
-- `--config-dir` for an isolated settings, address-book, and firmware profile
+- `--config-dir` for an isolated preferences and firmware profile
 - Persistent `.lpz` processor assignments for program slots 1–10
 - Program signatures uploaded automatically: a `.sig` file beside the assigned `.lpz` is sent to the same slot directory as `.zig`
 - Persistent processor configuration-file assignments for slots 1–10
@@ -20,7 +20,7 @@ A native Rust/egui utility for discovering Crestron devices, keeping an address 
 - In-memory device log of every line sent to and received from devices, opened with **Device log…** on the details panel
 - Multi-device loading from the top action bar: **Load Assigned Program**, **Load Assigned Config**, **Load Assigned Touchpanel**, and **Load Firmware**
 - Resizable device/details split with a one-third initial device-list width
-- Saved default SSH credentials, with per-device credentials taking precedence
+- Saved default SSH credentials, with per-device credentials taking precedence, and a choice of what to open at startup
 - Firmware editor with a persistent per-model catalog and managed local firmware copies
 
 ## Build and run
@@ -31,17 +31,29 @@ cargo run --release
 
 ### Command-line options
 
-- `--config-dir <DIR>`: keep settings, the address book, and the firmware library in `DIR` instead of the platform user configuration directory. Use it for a throwaway profile — screenshots, demos, or trying an address book — without touching the real one. The directory is created on first save.
+- `--config-dir <DIR>`: keep the preferences and the firmware library in `DIR` instead of the platform user configuration directory. Use it for a throwaway profile — screenshots, demos, or trying an address book — without touching the real preferences. The directory is created on first save.
 - `-h`, `--help`: print usage and exit.
 
-The current address book is stored in the platform user configuration directory, or in `--config-dir` when that is given. Each device's trusted SSH host-key fingerprint is stored on that device's address-book entry, so it is included in portable address-book JSON files alongside assigned program, configuration, and touchpanel file paths. Address-book changes remain in memory until saved; the status bar appends `*` to the current file while it has unsaved changes and reports load/save results without opening a notice dialog. Per-device passwords are held in memory only. A default username and password can be saved in **File → Preferences** and are used when the corresponding per-device credential is blank.
+## The address book
+
+The address book is a JSON file you choose. Nothing about it is kept in the configuration directory: **File → New address book**, **Open address book…**, **Save address book**, and **Save address book as…** behave as they do in any editor, and saving a book that has never been written asks where to put it. **File → Open Recent** lists the five most recently opened or saved books, newest first; an entry that no longer exists is reported and dropped from the list, while one that is merely malformed stays so it can be repaired.
+
+Each device's trusted SSH host-key fingerprint is stored on that device's entry, so it travels with the file alongside assigned program, configuration, and touchpanel file paths. Changes stay in memory until saved; the status bar names the current file, shows `Untitled` before there is one, appends `*` while there are unsaved changes, and reports load/save results without opening a notice dialog. Per-device passwords are held in memory only.
+
+**File → Preferences** holds a default username and password, used when the corresponding per-device credential is blank, and a choice of what to open at startup: start with an empty address book, reopen the most recent one, or always open a specific file. A specific file that has gone missing is reported in the status bar and left set as the preference, because it may be on a share that is offline rather than deleted.
+
+Preferences live in `preferences.json` in the platform user configuration directory, or in `--config-dir` when that is given.
+
+> **Upgrading from a build before 2026.9.10.** Earlier versions kept the address book inside the configuration directory, in `address-book.json` beside the settings. This build cannot read that file, and leaves it in place. To recover its devices, copy it, rename the `"address_book"` key to `"devices"`, add `"version": 1` alongside it, and open the result. The default username and password are not carried across and need entering once in **Preferences**.
 
 ## Saving and operation safety
 
-- Opening another address book or exiting (including the window close button) prompts **Save / Discard / Cancel** when there are unsaved changes. Failed saves leave the confirmation open.
+- Starting a new address book, opening another, or exiting (including the window close button) prompts **Save / Discard / Cancel** when there are unsaved changes. Failed saves leave the confirmation open, and so does cancelling the dialog that asks where an untitled book should go.
 - Device removal, address-book switching, and exit are blocked while device operations are queued or running. Wait for them to finish; there is no force-cancel during an upload.
-- Manual additions reuse matching discovered endpoints. Imports reject duplicate host/port pairs. Rediscovery updates changed IP addresses on discovered-only cards without rewriting manually configured hosts.
-- Portable JSON files cannot overwrite the internal configuration file, including through symlink aliases. Trusting a key on an address-book device marks the address book as changed; save it to persist the fingerprint. A discovered-only device's key remains trusted for the session and is persisted if the device is subsequently added to the address book and saved.
+- Autodiscovered devices are not part of the document, so they stay on screen across **New** and **Open**.
+- Every save is read back and compared with what is in memory before it is called a success — the file is the only copy of the data.
+- Manual additions reuse matching discovered endpoints. Loading a book rejects duplicate host/port pairs. Rediscovery updates changed IP addresses on discovered-only cards without rewriting manually configured hosts.
+- An address book cannot overwrite the preferences file or anything in the firmware storage directory, including through symlink aliases. Trusting a key on an address-book device marks the address book as changed; save it to persist the fingerprint. A discovered-only device's key remains trusted for the session and is persisted if the device is subsequently added to the address book and saved.
 - SSH handshake, authentication, and SFTP calls have a 20-second blocking-call timeout. Load-command calls allow up to five minutes. A timeout does not prove a device-side load stopped; check the device before retrying.
 
 ## Firmware library
@@ -52,7 +64,7 @@ Files are copied and SHA-256 verified in a background worker. The catalog is sav
 
 Select address-book targets and choose **Load Firmware** to upload the firmware assigned to each target's model. PUF files are uploaded to the device firmware directory and applied with the Crestron `puf` command; ZIP updates use `pushupdate full`. Firmware installation can restart or temporarily disconnect a device, so verify the model assignment before loading.
 
-Storage is a `firmware` subdirectory beside the local `address-book.json` settings file, so `--config-dir` moves it too:
+Storage is a `firmware` subdirectory beside the `preferences.json` file, so `--config-dir` moves it too:
 
 - Linux: `~/.config/crestronloadrunner/firmware/` (or `$XDG_CONFIG_HOME/crestronloadrunner/firmware/`)
 - Windows: `%APPDATA%\WorldDomination\CrestronLoadRunner\config\firmware\`
@@ -88,4 +100,4 @@ Because the negotiated host key depends on which algorithms the client supports,
 
 ## Security
 
-The first connection presents the device's SHA-256 host-key fingerprint. Trust it only after comparing it with a known-good fingerprint. A changed key is rejected. Per-device passwords are never written to portable address-book files; the optional default password is stored in the local application settings as plain text.
+The first connection presents the device's SHA-256 host-key fingerprint. Trust it only after comparing it with a known-good fingerprint. A changed key is rejected. Per-device passwords are never written to an address-book file; the optional default password is stored in `preferences.json` as plain text.
