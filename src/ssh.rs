@@ -1,21 +1,33 @@
 use std::{
     collections::HashMap,
-    fs::File,
-    io::{Read, Write},
     net::{TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver, Sender},
+    sync::{
+        Arc, Mutex,
+        mpsc::{self, Receiver, Sender},
+    },
     thread,
     time::Duration,
 };
 
+use russh::{
+    ChannelMsg, Disconnect,
+    client::{self, Handle},
+    keys::{PublicKey, PublicKeyOrCertificate},
+};
+use russh_sftp::client::SftpSession;
 use sha2::{Digest, Sha256};
-use ssh2::Session;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::model::{Credentials, DeviceDetails};
+use crate::{
+    device_log::Direction,
+    model::{Credentials, DeviceDetails},
+};
 
-const SSH_TIMEOUT_MS: u32 = 20_000;
-const LOAD_TIMEOUT_MS: u32 = 300_000;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(6);
+const SSH_TIMEOUT: Duration = Duration::from_secs(20);
+const LOAD_TIMEOUT: Duration = Duration::from_secs(300);
+const CHUNK: usize = 64 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct ConnectionSpec {
@@ -32,9 +44,16 @@ pub enum WorkerCommand {
     UploadProgram {
         connection: ConnectionSpec,
         local_path: PathBuf,
+        /// The program's `.sig` file, when one sits beside it. Uploaded with
+        /// the program before the load command runs.
+        signature: Option<PathBuf>,
         slot: u8,
     },
     UploadTouchpanel {
+        connection: ConnectionSpec,
+        local_path: PathBuf,
+    },
+    UploadConfig {
         connection: ConnectionSpec,
         local_path: PathBuf,
     },
@@ -48,13 +67,38 @@ pub enum WorkerCommand {
 
 #[derive(Debug)]
 pub enum WorkerEvent {
-    Connecting { id: String },
-    HostKeyUnknown { id: String, fingerprint: String },
-    Details { id: String, details: DeviceDetails },
-    Progress { id: String, sent: u64, total: u64 },
-    Complete { id: String, message: String },
-    Error { id: String, message: String },
-    JobFinished { id: String },
+    Connecting {
+        id: String,
+    },
+    HostKeyUnknown {
+        id: String,
+        fingerprint: String,
+    },
+    Details {
+        id: String,
+        details: DeviceDetails,
+    },
+    Progress {
+        id: String,
+        sent: u64,
+        total: u64,
+    },
+    Complete {
+        id: String,
+        message: String,
+    },
+    Error {
+        id: String,
+        message: String,
+    },
+    Log {
+        id: String,
+        direction: Direction,
+        text: String,
+    },
+    JobFinished {
+        id: String,
+    },
 }
 
 pub struct WorkerPool {
@@ -132,11 +176,18 @@ impl Drop for WorkerPool {
     }
 }
 
+/// Each device keeps its own thread, and each thread its own single-threaded
+/// runtime: the command queue stays blocking and per-device, while the SSH
+/// session that thread drives is asynchronous.
 fn spawn_worker(
     id: String,
     receiver: Receiver<WorkerCommand>,
     events: Sender<WorkerEvent>,
 ) -> Result<(), String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("Could not start the SSH runtime: {error}"))?;
     thread::Builder::new()
         .name(format!("ssh-{id}"))
         .spawn(move || {
@@ -144,40 +195,14 @@ fn spawn_worker(
                 if matches!(command, WorkerCommand::Stop) {
                     break;
                 }
-                let result = match command {
-                    WorkerCommand::Refresh(connection) => refresh(&connection, &events),
-                    WorkerCommand::UploadProgram {
-                        connection,
-                        local_path,
-                        slot,
-                    } => upload(
-                        &connection,
-                        &local_path,
-                        format!("progload -p:{slot} {{file}}"),
-                        &events,
-                    ),
-                    WorkerCommand::UploadTouchpanel {
-                        connection,
-                        local_path,
-                    } => upload(
-                        &connection,
-                        &local_path,
-                        "projectload {file}".into(),
-                        &events,
-                    ),
-                    WorkerCommand::UploadFirmware {
-                        connection,
-                        local_path,
-                        remote_name,
-                    } => upload_firmware(&connection, &local_path, &remote_name, &events),
-                    WorkerCommand::Stop => break,
-                };
-                if let Err(error) = result {
+                if let Err(error) = runtime.block_on(dispatch(command, &events)) {
                     match error {
                         ConnectError::UnknownHostKey { id, fingerprint } => {
+                            log(&events, &id, Direction::Note, "Host key is not trusted");
                             let _ = events.send(WorkerEvent::HostKeyUnknown { id, fingerprint });
                         }
                         ConnectError::Message { id, message } => {
+                            log(&events, &id, Direction::Note, &message);
                             let _ = events.send(WorkerEvent::Error { id, message });
                         }
                     }
@@ -189,6 +214,32 @@ fn spawn_worker(
         .map_err(|error| error.to_string())
 }
 
+async fn dispatch(command: WorkerCommand, events: &Sender<WorkerEvent>) -> WorkerResult<()> {
+    match command {
+        WorkerCommand::Refresh(connection) => refresh(&connection, events).await,
+        WorkerCommand::UploadProgram {
+            connection,
+            local_path,
+            signature,
+            slot,
+        } => upload_program(&connection, &local_path, signature.as_deref(), slot, events).await,
+        WorkerCommand::UploadTouchpanel {
+            connection,
+            local_path,
+        } => upload_staged(&connection, &local_path, touchpanel_transfer, events).await,
+        WorkerCommand::UploadConfig {
+            connection,
+            local_path,
+        } => upload_staged(&connection, &local_path, config_transfer, events).await,
+        WorkerCommand::UploadFirmware {
+            connection,
+            local_path,
+            remote_name,
+        } => upload_firmware(&connection, &local_path, &remote_name, events).await,
+        WorkerCommand::Stop => Ok(()),
+    }
+}
+
 #[derive(Debug)]
 enum ConnectError {
     UnknownHostKey { id: String, fingerprint: String },
@@ -197,6 +248,14 @@ enum ConnectError {
 
 type WorkerResult<T> = Result<T, ConnectError>;
 
+fn log(events: &Sender<WorkerEvent>, id: &str, direction: Direction, text: &str) {
+    let _ = events.send(WorkerEvent::Log {
+        id: id.to_owned(),
+        direction,
+        text: text.to_owned(),
+    });
+}
+
 fn message(spec: &ConnectionSpec, message: impl Into<String>) -> ConnectError {
     ConnectError::Message {
         id: spec.id.clone(),
@@ -204,7 +263,58 @@ fn message(spec: &ConnectionSpec, message: impl Into<String>) -> ConnectError {
     }
 }
 
-fn connect(spec: &ConnectionSpec, events: &Sender<WorkerEvent>) -> WorkerResult<Session> {
+/// The host key is judged inside the handshake, so the fingerprint has to come
+/// back out to the caller that decides what to report about it.
+#[derive(Clone, Default)]
+struct SeenFingerprint(Arc<Mutex<Option<String>>>);
+
+impl SeenFingerprint {
+    fn set(&self, fingerprint: Option<String>) {
+        if let Ok(mut seen) = self.0.lock() {
+            *seen = fingerprint;
+        }
+    }
+
+    fn get(&self) -> Option<String> {
+        self.0.lock().ok().and_then(|seen| seen.clone())
+    }
+}
+
+struct TrustOnFirstUse {
+    trusted: Option<String>,
+    seen: SeenFingerprint,
+}
+
+impl client::Handler for TrustOnFirstUse {
+    type Error = russh::Error;
+
+    async fn check_server_key(
+        &mut self,
+        server_public_key: &PublicKeyOrCertificate,
+    ) -> Result<bool, Self::Error> {
+        // Host certificates are not part of this app's trust model.
+        let fingerprint = match server_public_key {
+            PublicKeyOrCertificate::PublicKey { key, .. } => host_fingerprint(key),
+            PublicKeyOrCertificate::Certificate(_) => None,
+        };
+        self.seen.set(fingerprint.clone());
+        Ok(match (self.trusted.as_deref(), fingerprint.as_deref()) {
+            (Some(trusted), Some(offered)) => trusted == offered,
+            _ => false,
+        })
+    }
+}
+
+fn host_fingerprint(key: &PublicKey) -> Option<String> {
+    key.to_bytes()
+        .ok()
+        .map(|blob| sha256_fingerprint(blob.as_ref()))
+}
+
+async fn connect(
+    spec: &ConnectionSpec,
+    events: &Sender<WorkerEvent>,
+) -> WorkerResult<Handle<TrustOnFirstUse>> {
     let _ = events.send(WorkerEvent::Connecting {
         id: spec.id.clone(),
     });
@@ -215,13 +325,28 @@ fn connect(spec: &ConnectionSpec, events: &Sender<WorkerEvent>) -> WorkerResult<
         return Err(message(spec, "Enter the SSH password for this session"));
     }
 
+    log(
+        events,
+        &spec.id,
+        Direction::Note,
+        &format!("Connecting to {}:{}", spec.host, spec.port),
+    );
+    let stream = tcp_connect(spec)?;
+    let seen = SeenFingerprint::default();
+    let session = open_session(spec, stream, SSH_TIMEOUT, &seen).await?;
+    authenticate(spec, session).await
+}
+
+/// Connected synchronously so an unreachable device fails in seconds rather
+/// than waiting out the platform's own connect timeout.
+fn tcp_connect(spec: &ConnectionSpec) -> WorkerResult<tokio::net::TcpStream> {
     let addresses = (spec.host.as_str(), spec.port)
         .to_socket_addrs()
         .map_err(|error| message(spec, format!("Could not resolve {}: {error}", spec.host)))?;
     let mut last_error = None;
     let mut stream = None;
     for address in addresses {
-        match TcpStream::connect_timeout(&address, Duration::from_secs(6)) {
+        match TcpStream::connect_timeout(&address, CONNECT_TIMEOUT) {
             Ok(value) => {
                 stream = Some(value);
                 break;
@@ -243,71 +368,96 @@ fn connect(spec: &ConnectionSpec, events: &Sender<WorkerEvent>) -> WorkerResult<
         )
     })?;
     stream
-        .set_read_timeout(Some(Duration::from_secs(20)))
+        .set_nonblocking(true)
         .map_err(|error| message(spec, error.to_string()))?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(20)))
-        .map_err(|error| message(spec, error.to_string()))?;
-
-    let mut session =
-        timed_session(stream, SSH_TIMEOUT_MS).map_err(|error| message(spec, error.to_string()))?;
-    session
-        .handshake()
-        .map_err(|error| message(spec, format!("SSH handshake failed: {error}")))?;
-    let host_key = session
-        .host_key()
-        .ok_or_else(|| message(spec, "The device did not provide an SSH host key"))?
-        .0;
-    let fingerprint = sha256_fingerprint(host_key);
-    match spec.trusted_fingerprint.as_deref() {
-        None => {
-            return Err(ConnectError::UnknownHostKey {
-                id: spec.id.clone(),
-                fingerprint,
-            });
-        }
-        Some(expected) if expected != fingerprint => {
-            return Err(message(
-                spec,
-                format!(
-                    "SSH host key changed. Expected {expected}, received {fingerprint}. Connection refused"
-                ),
-            ));
-        }
-        Some(_) => {}
-    }
-
-    session
-        .userauth_password(spec.credentials.username.trim(), &spec.credentials.password)
-        .map_err(|error| message(spec, format!("SSH authentication failed: {error}")))?;
-    if !session.authenticated() {
-        return Err(message(spec, "SSH authentication was not accepted"));
-    }
-    Ok(session)
+    tokio::net::TcpStream::from_std(stream).map_err(|error| message(spec, error.to_string()))
 }
 
-fn timed_session(stream: TcpStream, timeout_ms: u32) -> Result<Session, ssh2::Error> {
-    let mut session = Session::new()?;
-    session.set_timeout(timeout_ms);
-    session.set_tcp_stream(stream);
-    Ok(session)
+async fn open_session(
+    spec: &ConnectionSpec,
+    stream: tokio::net::TcpStream,
+    timeout: Duration,
+    seen: &SeenFingerprint,
+) -> WorkerResult<Handle<TrustOnFirstUse>> {
+    let config = Arc::new(client::Config {
+        inactivity_timeout: Some(timeout),
+        ..Default::default()
+    });
+    let handler = TrustOnFirstUse {
+        trusted: spec.trusted_fingerprint.clone(),
+        seen: seen.clone(),
+    };
+    match tokio::time::timeout(timeout, client::connect_stream(config, stream, handler)).await {
+        Ok(Ok(session)) => Ok(session),
+        Ok(Err(error)) => Err(host_key_error(spec, seen, error)),
+        Err(_) => Err(message(
+            spec,
+            format!("Timed out completing the SSH handshake with {}", spec.host),
+        )),
+    }
 }
 
-fn refresh(spec: &ConnectionSpec, events: &Sender<WorkerEvent>) -> WorkerResult<()> {
-    let session = connect(spec, events)?;
-    let hostname = run_command(&session, "hostname");
-    let version = run_command(&session, "ver");
+/// A refused host key surfaces as a generic handshake failure, so the
+/// fingerprint recorded during the handshake is what separates a key we have
+/// never seen from one that has changed.
+fn host_key_error(
+    spec: &ConnectionSpec,
+    seen: &SeenFingerprint,
+    error: russh::Error,
+) -> ConnectError {
+    match (spec.trusted_fingerprint.as_deref(), seen.get()) {
+        (None, Some(fingerprint)) => ConnectError::UnknownHostKey {
+            id: spec.id.clone(),
+            fingerprint,
+        },
+        (Some(trusted), Some(offered)) if trusted != offered => message(
+            spec,
+            format!(
+                "SSH host key changed. Expected {trusted}, received {offered}. Connection refused"
+            ),
+        ),
+        _ => message(spec, format!("SSH handshake failed: {error}")),
+    }
+}
+
+async fn authenticate(
+    spec: &ConnectionSpec,
+    mut session: Handle<TrustOnFirstUse>,
+) -> WorkerResult<Handle<TrustOnFirstUse>> {
+    let attempt = session.authenticate_password(
+        spec.credentials.username.trim(),
+        spec.credentials.password.clone(),
+    );
+    match tokio::time::timeout(SSH_TIMEOUT, attempt).await {
+        Ok(Ok(result)) if result.success() => Ok(session),
+        Ok(Ok(_)) => Err(message(spec, "SSH authentication was not accepted")),
+        Ok(Err(error)) => Err(message(spec, format!("SSH authentication failed: {error}"))),
+        Err(_) => Err(message(spec, "Timed out authenticating over SSH")),
+    }
+}
+
+async fn disconnect(session: Handle<TrustOnFirstUse>) {
+    let _ = session
+        .disconnect(Disconnect::ByApplication, "", "English")
+        .await;
+}
+
+async fn refresh(spec: &ConnectionSpec, events: &Sender<WorkerEvent>) -> WorkerResult<()> {
+    let session = connect(spec, events).await?;
     let details = DeviceDetails {
         identity: format!(
             "{}\n\n{}",
-            section_result(hostname),
-            section_result(version)
+            section_result(run_command(spec, &session, "hostname", SSH_TIMEOUT, events).await),
+            section_result(run_command(spec, &session, "ver", SSH_TIMEOUT, events).await)
         ),
-        network: section_result(run_command(&session, "ipconfig")),
-        programs: section_result(run_command(&session, "proginf")),
-        ip_table: section_result(run_command(&session, "ipt -t")),
-        cresnet: optional_section(run_command(&session, "REPORTCRESNET")),
+        network: section_result(run_command(spec, &session, "ipconfig", SSH_TIMEOUT, events).await),
+        programs: section_result(run_command(spec, &session, "proginf", SSH_TIMEOUT, events).await),
+        ip_table: section_result(run_command(spec, &session, "ipt -t", SSH_TIMEOUT, events).await),
+        cresnet: optional_section(
+            run_command(spec, &session, "REPORTCRESNET", SSH_TIMEOUT, events).await,
+        ),
     };
+    disconnect(session).await;
     events
         .send(WorkerEvent::Details {
             id: spec.id.clone(),
@@ -317,144 +467,51 @@ fn refresh(spec: &ConnectionSpec, events: &Sender<WorkerEvent>) -> WorkerResult<
     Ok(())
 }
 
-fn upload(
+async fn run_command(
     spec: &ConnectionSpec,
-    local_path: &Path,
-    command_template: String,
+    session: &Handle<TrustOnFirstUse>,
+    command: &str,
+    timeout: Duration,
     events: &Sender<WorkerEvent>,
-) -> WorkerResult<()> {
-    let file_name = safe_remote_file_name(local_path)
-        .ok_or_else(|| message(spec, "The selected file has an unsafe or missing file name"))?;
-    let command = command_template.replace("{file}", &file_name);
-    upload_to(
-        spec,
-        local_path,
-        Path::new(&file_name),
-        &file_name,
-        command,
-        events,
-    )
-}
-
-fn upload_firmware(
-    spec: &ConnectionSpec,
-    local_path: &Path,
-    remote_name: &str,
-    events: &Sender<WorkerEvent>,
-) -> WorkerResult<()> {
-    let Some((remote_path, command)) = firmware_transfer(remote_name) else {
-        return Err(message(
-            spec,
-            "The assigned firmware has an unsafe or missing file name",
-        ));
+) -> Result<String, String> {
+    log(events, &spec.id, Direction::Sent, command);
+    let result = match tokio::time::timeout(timeout, exec(session, command)).await {
+        Ok(result) => result,
+        Err(_) => Err(format!("{command} did not finish within {timeout:?}")),
     };
-    upload_to(spec, local_path, &remote_path, remote_name, command, events)
-}
-
-fn firmware_transfer(remote_name: &str) -> Option<(PathBuf, String)> {
-    if !is_safe_remote_file_name(remote_name) {
-        return None;
+    match &result {
+        Ok(output) => log(events, &spec.id, Direction::Received, output),
+        Err(error) => log(events, &spec.id, Direction::Received, error),
     }
-    let remote_path = PathBuf::from("/firmware").join(remote_name);
-    let command = if Path::new(remote_name)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
-    {
-        "pushupdate full".to_owned()
-    } else {
-        format!(r"puf \romdisk\user\system\{remote_name}")
-    };
-    Some((remote_path, command))
+    result
 }
 
-fn upload_to(
-    spec: &ConnectionSpec,
-    local_path: &Path,
-    remote_path: &Path,
-    display_name: &str,
-    command: String,
-    events: &Sender<WorkerEvent>,
-) -> WorkerResult<()> {
-    let mut local = File::open(local_path).map_err(|error| {
-        message(
-            spec,
-            format!("Could not open {}: {error}", local_path.display()),
-        )
-    })?;
-    let total = local
-        .metadata()
-        .map_err(|error| message(spec, error.to_string()))?
-        .len();
-    let session = connect(spec, events)?;
-    let sftp = session
-        .sftp()
-        .map_err(|error| message(spec, format!("Could not start SFTP: {error}")))?;
-    let mut remote = sftp.create(remote_path).map_err(|error| {
-        message(
-            spec,
-            format!(
-                "Could not create remote file {}: {error}",
-                remote_path.display()
-            ),
-        )
-    })?;
-
-    let mut buffer = [0_u8; 64 * 1024];
-    let mut sent = 0_u64;
-    loop {
-        let length = local
-            .read(&mut buffer)
-            .map_err(|error| message(spec, format!("Could not read local file: {error}")))?;
-        if length == 0 {
-            break;
-        }
-        remote
-            .write_all(&buffer[..length])
-            .map_err(|error| message(spec, format!("SFTP upload failed: {error}")))?;
-        sent += length as u64;
-        let _ = events.send(WorkerEvent::Progress {
-            id: spec.id.clone(),
-            sent,
-            total,
-        });
-    }
-    remote
-        .close()
-        .map_err(|error| message(spec, format!("Could not close remote file: {error}")))?;
-
-    session.set_timeout(LOAD_TIMEOUT_MS);
-    let output = run_command(&session, &command)
-        .map_err(|error| message(spec, format!("Load command failed: {error}")))?;
-    events
-        .send(WorkerEvent::Complete {
-            id: spec.id.clone(),
-            message: if output.trim().is_empty() {
-                format!("Uploaded {display_name}; command completed")
-            } else {
-                format!("Uploaded {display_name}: {}", output.trim())
-            },
-        })
-        .map_err(|error| message(spec, error.to_string()))?;
-    Ok(())
-}
-
-fn run_command(session: &Session, command: &str) -> Result<String, String> {
+async fn exec(session: &Handle<TrustOnFirstUse>, command: &str) -> Result<String, String> {
     let mut channel = session
-        .channel_session()
+        .channel_open_session()
+        .await
         .map_err(|error| error.to_string())?;
-    channel.exec(command).map_err(|error| error.to_string())?;
-    let mut stdout = String::new();
     channel
-        .read_to_string(&mut stdout)
+        .exec(true, command)
+        .await
         .map_err(|error| error.to_string())?;
-    let mut stderr = String::new();
-    channel
-        .stderr()
-        .read_to_string(&mut stderr)
-        .map_err(|error| error.to_string())?;
-    channel.wait_close().map_err(|error| error.to_string())?;
-    let status = channel.exit_status().map_err(|error| error.to_string())?;
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut status = None;
+    while let Some(message) = channel.wait().await {
+        match message {
+            ChannelMsg::Data { data } => stdout.extend_from_slice(&data),
+            ChannelMsg::ExtendedData { data, .. } => stderr.extend_from_slice(&data),
+            ChannelMsg::ExitStatus { exit_status } => status = Some(exit_status),
+            _ => {}
+        }
+    }
+
+    let stdout = String::from_utf8_lossy(&stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&stderr).into_owned();
+    // Crestron consoles do not always report an exit status; silence means success.
+    let status = status.unwrap_or(0);
     if status != 0 {
         let detail = if stderr.trim().is_empty() {
             stdout
@@ -470,6 +527,259 @@ fn run_command(session: &Session, command: &str) -> Result<String, String> {
     } else {
         Ok(format!("{stdout}\n{stderr}"))
     }
+}
+
+/// One file to stage: where it comes from, where it lands, and the name to
+/// show for it.
+#[derive(Clone, Debug)]
+struct Transfer {
+    local: PathBuf,
+    remote: String,
+    display: String,
+}
+
+impl Transfer {
+    fn new(local: impl Into<PathBuf>, remote: String, display: String) -> Self {
+        Self {
+            local: local.into(),
+            remote,
+            display,
+        }
+    }
+}
+
+/// Loads are addressed by directory: a file left in the SFTP login directory is
+/// not where the console command looks for it, so each kind names its own
+/// destination and `transfer` pairs that directory with the command to run.
+async fn upload_staged(
+    spec: &ConnectionSpec,
+    local_path: &Path,
+    transfer: impl FnOnce(&str) -> (String, Option<String>),
+    events: &Sender<WorkerEvent>,
+) -> WorkerResult<()> {
+    let file_name = safe_remote_file_name(local_path)
+        .ok_or_else(|| message(spec, "The selected file has an unsafe or missing file name"))?;
+    let (remote_path, command) = transfer(&file_name);
+    let transfer = Transfer::new(local_path, remote_path, file_name);
+    upload_files(spec, vec![transfer], command, events).await
+}
+
+/// A program is staged with its signature: the processor reads the signature
+/// from the same directory, under the program's name with a `.zig` extension.
+async fn upload_program(
+    spec: &ConnectionSpec,
+    local_path: &Path,
+    signature: Option<&Path>,
+    slot: u8,
+    events: &Sender<WorkerEvent>,
+) -> WorkerResult<()> {
+    let file_name = safe_remote_file_name(local_path)
+        .ok_or_else(|| message(spec, "The selected file has an unsafe or missing file name"))?;
+    let directory = program_directory(slot);
+    let mut transfers = vec![Transfer::new(
+        local_path,
+        format!("{directory}/{file_name}"),
+        file_name.clone(),
+    )];
+    if let Some(signature) = signature {
+        let remote_name = signature_remote_name(&file_name).ok_or_else(|| {
+            message(
+                spec,
+                "The program's signature has an unsafe or missing file name",
+            )
+        })?;
+        transfers.push(Transfer::new(
+            signature,
+            format!("{directory}/{remote_name}"),
+            remote_name,
+        ));
+    }
+    upload_files(spec, transfers, Some(format!("progload -p:{slot}")), events).await
+}
+
+/// Slot N runs the program staged in its own directory. Note that the SFTP
+/// namespace is not the one the SSH console shows: the console's
+/// `\SIMPL\app01` is reached over SFTP as `/program01`.
+fn program_directory(slot: u8) -> String {
+    format!("/program{slot:02}")
+}
+
+/// The signature is uploaded under the program's stem with a `.zig` extension,
+/// whatever the local `.sig` file happens to be called.
+fn signature_remote_name(program_name: &str) -> Option<String> {
+    let stem = Path::new(program_name).file_stem()?.to_str()?;
+    let name = format!("{stem}.zig");
+    is_safe_remote_file_name(&name).then_some(name)
+}
+
+/// `projectload` installs whichever project is sitting in the display directory.
+fn touchpanel_transfer(remote_name: &str) -> (String, Option<String>) {
+    (
+        format!("/display/{remote_name}"),
+        Some("projectload".to_owned()),
+    )
+}
+
+/// Configuration files are read from the user directory by the running program;
+/// staging one is the whole operation, so there is no load command to issue.
+fn config_transfer(remote_name: &str) -> (String, Option<String>) {
+    (format!("/user/{remote_name}"), None)
+}
+
+async fn upload_firmware(
+    spec: &ConnectionSpec,
+    local_path: &Path,
+    remote_name: &str,
+    events: &Sender<WorkerEvent>,
+) -> WorkerResult<()> {
+    let Some((remote_path, command)) = firmware_transfer(remote_name) else {
+        return Err(message(
+            spec,
+            "The assigned firmware has an unsafe or missing file name",
+        ));
+    };
+    let transfer = Transfer::new(local_path, remote_path, remote_name.to_owned());
+    upload_files(spec, vec![transfer], Some(command), events).await
+}
+
+fn firmware_transfer(remote_name: &str) -> Option<(String, String)> {
+    if !is_safe_command_file_name(remote_name) {
+        return None;
+    }
+    let remote_path = format!("/firmware/{remote_name}");
+    let command = if Path::new(remote_name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
+    {
+        "pushupdate full".to_owned()
+    } else {
+        format!(r"puf \romdisk\user\system\{remote_name}")
+    };
+    Some((remote_path, command))
+}
+
+/// Stages every file over one connection and one SFTP session, then runs the
+/// load command once, so a multi-file load is a single conversation with the
+/// device and reports a single progress bar.
+async fn upload_files(
+    spec: &ConnectionSpec,
+    transfers: Vec<Transfer>,
+    command: Option<String>,
+    events: &Sender<WorkerEvent>,
+) -> WorkerResult<()> {
+    // Opened before connecting so a missing file fails without touching the device.
+    let mut sources = Vec::with_capacity(transfers.len());
+    let mut total = 0_u64;
+    for transfer in transfers {
+        let file = tokio::fs::File::open(&transfer.local)
+            .await
+            .map_err(|error| {
+                message(
+                    spec,
+                    format!("Could not open {}: {error}", transfer.local.display()),
+                )
+            })?;
+        let length = file
+            .metadata()
+            .await
+            .map_err(|error| message(spec, error.to_string()))?
+            .len();
+        total += length;
+        sources.push((transfer, file, length));
+    }
+    let display_name = sources
+        .iter()
+        .map(|(transfer, _, _)| transfer.display.as_str())
+        .collect::<Vec<_>>()
+        .join(" + ");
+
+    let session = connect(spec, events).await?;
+    let channel = session
+        .channel_open_session()
+        .await
+        .map_err(|error| message(spec, format!("Could not open an SSH channel: {error}")))?;
+    channel
+        .request_subsystem(true, "sftp")
+        .await
+        .map_err(|error| message(spec, format!("Could not start SFTP: {error}")))?;
+    let sftp = SftpSession::new(channel.into_stream())
+        .await
+        .map_err(|error| message(spec, format!("Could not start SFTP: {error}")))?;
+
+    let mut buffer = vec![0_u8; CHUNK];
+    let mut sent = 0_u64;
+    for (transfer, mut local, length) in sources {
+        log(
+            events,
+            &spec.id,
+            Direction::Note,
+            &format!("SFTP create {} ({length} bytes)", transfer.remote),
+        );
+        let mut remote = sftp.create(&transfer.remote).await.map_err(|error| {
+            message(
+                spec,
+                format!("Could not create remote file {}: {error}", transfer.remote),
+            )
+        })?;
+        loop {
+            let read = local
+                .read(&mut buffer)
+                .await
+                .map_err(|error| message(spec, format!("Could not read local file: {error}")))?;
+            if read == 0 {
+                break;
+            }
+            remote
+                .write_all(&buffer[..read])
+                .await
+                .map_err(|error| message(spec, format!("SFTP upload failed: {error}")))?;
+            sent += read as u64;
+            let _ = events.send(WorkerEvent::Progress {
+                id: spec.id.clone(),
+                sent,
+                total,
+            });
+        }
+        remote
+            .close()
+            .await
+            .map_err(|error| message(spec, format!("Could not close remote file: {error}")))?;
+        log(
+            events,
+            &spec.id,
+            Direction::Note,
+            &format!("Uploaded {} to {}", transfer.display, transfer.remote),
+        );
+    }
+    let _ = sftp.close().await;
+
+    let Some(command) = command else {
+        disconnect(session).await;
+        events
+            .send(WorkerEvent::Complete {
+                id: spec.id.clone(),
+                message: format!("Uploaded {display_name}"),
+            })
+            .map_err(|error| message(spec, error.to_string()))?;
+        return Ok(());
+    };
+
+    let output = run_command(spec, &session, &command, LOAD_TIMEOUT, events)
+        .await
+        .map_err(|error| message(spec, format!("Load command failed: {error}")))?;
+    disconnect(session).await;
+    events
+        .send(WorkerEvent::Complete {
+            id: spec.id.clone(),
+            message: if output.trim().is_empty() {
+                format!("Uploaded {display_name}; command completed")
+            } else {
+                format!("Uploaded {display_name}: {}", output.trim())
+            },
+        })
+        .map_err(|error| message(spec, error.to_string()))?;
+    Ok(())
 }
 
 fn section_result(result: Result<String, String>) -> String {
@@ -494,7 +804,22 @@ fn safe_remote_file_name(path: &Path) -> Option<String> {
     is_safe_remote_file_name(name).then(|| name.to_owned())
 }
 
+/// Staged names reach the device only as the last component of an SFTP path, so
+/// the requirement is that they cannot escape the destination directory.
+/// Ordinary filename characters, spaces included, are fine.
 fn is_safe_remote_file_name(name: &str) -> bool {
+    !name.trim().is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains(['/', '\\', ':'])
+        && !name.chars().any(char::is_control)
+}
+
+/// A name interpolated into a console command has to survive that command's
+/// argument splitting, so it keeps the far narrower allowlist: a space would
+/// split the argument and a metacharacter could append another command. Any
+/// new command that names its file must validate with this, not the above.
+fn is_safe_command_file_name(name: &str) -> bool {
     !name.is_empty()
         && name != "."
         && name != ".."
@@ -532,19 +857,69 @@ fn base64_without_dependency(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    fn spec() -> ConnectionSpec {
+        ConnectionSpec {
+            id: "test:22".into(),
+            host: "127.0.0.1".into(),
+            port: 22,
+            credentials: Credentials {
+                username: "admin".into(),
+                password: "secret".into(),
+            },
+            trusted_fingerprint: None,
+        }
+    }
+
     #[test]
     fn stalled_ssh_handshake_times_out() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let stream = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (_silent_peer, _) = listener.accept().unwrap();
-        let (sender, receiver) = mpsc::channel();
-        let worker = thread::spawn(move || {
-            let mut session = timed_session(stream, 100).unwrap();
-            assert_eq!(session.timeout(), 100);
-            sender.send(session.handshake().is_err()).unwrap();
+        stream.set_nonblocking(true).unwrap();
+        let runtime = runtime();
+
+        let error = runtime.block_on(async {
+            let stream = tokio::net::TcpStream::from_std(stream).unwrap();
+            match open_session(
+                &spec(),
+                stream,
+                Duration::from_millis(300),
+                &SeenFingerprint::default(),
+            )
+            .await
+            {
+                Ok(_) => panic!("a silent peer cannot complete a handshake"),
+                Err(error) => error,
+            }
         });
-        assert!(receiver.recv_timeout(Duration::from_secs(3)).unwrap());
-        worker.join().unwrap();
+        let ConnectError::Message { message, .. } = error else {
+            panic!("expected a plain error, not an unknown host key");
+        };
+        assert!(message.contains("Timed out"), "{message}");
+    }
+
+    #[test]
+    fn missing_credentials_are_reported_before_connecting() {
+        let (events, _receiver) = mpsc::channel();
+        let mut blank = spec();
+        blank.credentials.password.clear();
+        let error = runtime().block_on(async {
+            match connect(&blank, &events).await {
+                Ok(_) => panic!("a blank password cannot connect"),
+                Err(error) => error,
+            }
+        });
+        let ConnectError::Message { message, .. } = error else {
+            panic!("expected a plain error");
+        };
+        assert!(message.contains("password"), "{message}");
     }
 
     #[test]
@@ -567,7 +942,7 @@ mod tests {
         let mut finished = 0;
         while finished < 2 {
             if let WorkerEvent::JobFinished { id } =
-                receiver.recv_timeout(Duration::from_secs(2)).unwrap()
+                receiver.recv_timeout(Duration::from_secs(5)).unwrap()
             {
                 pool.job_finished(&id);
                 finished += 1;
@@ -580,15 +955,71 @@ mod tests {
     }
 
     #[test]
-    fn validates_remote_file_names() {
+    fn staged_names_allow_spaces_but_never_escape_the_directory() {
         assert_eq!(
             safe_remote_file_name(Path::new("/tmp/room-program_1.lpz")).as_deref(),
             Some("room-program_1.lpz")
         );
-        assert!(safe_remote_file_name(Path::new("/tmp/room program.lpz")).is_none());
+        // Ordinary Windows project names reach the device unchanged.
+        assert_eq!(
+            safe_remote_file_name(Path::new(r"C:\Working Directory\W classrooms.lpz")).as_deref(),
+            Some("W classrooms.lpz")
+        );
+        assert!(!is_safe_remote_file_name(""));
+        assert!(!is_safe_remote_file_name("   "));
         assert!(!is_safe_remote_file_name("."));
         assert!(!is_safe_remote_file_name(".."));
         assert!(!is_safe_remote_file_name("folder/device.puf"));
+        assert!(!is_safe_remote_file_name(r"folder\device.puf"));
+        assert!(!is_safe_remote_file_name("stream:name"));
+        assert!(!is_safe_remote_file_name("bell\u{7}.lpz"));
+    }
+
+    #[test]
+    fn command_interpolated_names_keep_the_narrow_allowlist() {
+        assert!(is_safe_command_file_name("rmc4_2.8000.00001.puf"));
+        assert!(!is_safe_command_file_name("unsafe firmware.puf"));
+        assert!(!is_safe_command_file_name("device.puf; reboot"));
+        assert!(!is_safe_command_file_name("."));
+        assert!(!is_safe_command_file_name(".."));
+        assert!(!is_safe_command_file_name("folder/device.puf"));
+    }
+
+    #[test]
+    fn remote_paths_stay_posix_regardless_of_the_local_platform() {
+        // Built as strings on purpose: joining with PathBuf emits a backslash
+        // on Windows, which SFTP reads as part of the file name.
+        assert_eq!(program_directory(1), "/program01");
+        assert_eq!(program_directory(10), "/program10");
+        assert_eq!(
+            touchpanel_transfer("lobby-panel.vtz"),
+            (
+                "/display/lobby-panel.vtz".to_owned(),
+                Some("projectload".to_owned()),
+            )
+        );
+        assert_eq!(
+            config_transfer("control-room.json"),
+            ("/user/control-room.json".to_owned(), None)
+        );
+    }
+
+    #[test]
+    fn signatures_take_the_program_stem_with_a_zig_extension() {
+        assert_eq!(
+            signature_remote_name("W classrooms.lpz").as_deref(),
+            Some("W classrooms.zig")
+        );
+        assert_eq!(
+            signature_remote_name("room-program_1.lpz").as_deref(),
+            Some("room-program_1.zig")
+        );
+        // Extensions other than .lpz keep their stem too.
+        assert_eq!(
+            signature_remote_name("archive.tar.lpz").as_deref(),
+            Some("archive.tar.zig")
+        );
+        assert!(signature_remote_name("..").is_none());
     }
 
     #[test]
@@ -596,15 +1027,15 @@ mod tests {
         assert_eq!(
             firmware_transfer("rmc4_2.8000.00001.puf"),
             Some((
-                PathBuf::from("/firmware/rmc4_2.8000.00001.puf"),
-                r"puf \romdisk\user\system\rmc4_2.8000.00001.puf".into(),
+                "/firmware/rmc4_2.8000.00001.puf".to_owned(),
+                r"puf \romdisk\user\system\rmc4_2.8000.00001.puf".to_owned(),
             ))
         );
         assert_eq!(
             firmware_transfer("update.ZIP"),
             Some((
-                PathBuf::from("/firmware/update.ZIP"),
-                "pushupdate full".into(),
+                "/firmware/update.ZIP".to_owned(),
+                "pushupdate full".to_owned(),
             ))
         );
         assert!(firmware_transfer("unsafe firmware.puf").is_none());

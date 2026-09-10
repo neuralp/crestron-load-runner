@@ -8,7 +8,9 @@ use eframe::egui::{self, Color32, RichText};
 
 use crate::{
     discovery::{self, DiscoveryEvent},
-    model::{AddressEntry, ConnectionState, Device, DeviceKind, DeviceSource, endpoint_id},
+    model::{
+        AddressEntry, ConnectionState, Device, DeviceKind, DeviceSource, Outcome, endpoint_id,
+    },
     ssh::{ConnectionSpec, WorkerCommand, WorkerEvent, WorkerPool},
     storage::AppConfig,
 };
@@ -135,6 +137,9 @@ pub struct LoadRunnerApp {
     discovering: bool,
     discard_discovery_results: bool,
     pending_host_keys: HashMap<String, String>,
+    device_log: crate::device_log::DeviceLog,
+    log_view_open: bool,
+    log_only_selected: bool,
     add_device_open: bool,
     address_draft: AddressDraft,
     current_address_book: Option<PathBuf>,
@@ -187,6 +192,9 @@ impl LoadRunnerApp {
             discovering: false,
             discard_discovery_results: false,
             pending_host_keys: HashMap::new(),
+            device_log: crate::device_log::DeviceLog::default(),
+            log_view_open: false,
+            log_only_selected: true,
             add_device_open: false,
             address_draft: AddressDraft {
                 port: 22,
@@ -206,52 +214,67 @@ impl LoadRunnerApp {
         }
     }
 
-    fn process_events(&mut self) {
-        while let Ok(event) = self.worker_events.try_recv() {
-            match event {
-                WorkerEvent::JobFinished { id } => self.worker_pool.job_finished(&id),
-                WorkerEvent::Connecting { id } => {
-                    if let Some(device) = self.device_mut(&id) {
-                        device.connection = ConnectionState::Connecting;
-                        device.last_message = "Opening SSH connection".into();
-                    }
-                }
-                WorkerEvent::HostKeyUnknown { id, fingerprint } => {
-                    if let Some(device) = self.device_mut(&id) {
-                        device.connection = ConnectionState::Disconnected;
-                        device.last_message = "Verify the SSH host key before reconnecting".into();
-                    }
-                    self.pending_host_keys.insert(id, fingerprint);
-                }
-                WorkerEvent::Details { id, details } => {
-                    if let Some(device) = self.device_mut(&id) {
-                        device.connection = ConnectionState::Connected;
-                        device.details = Some(details);
-                        device.last_message = "Device information refreshed".into();
-                    }
-                }
-                WorkerEvent::Progress { id, sent, total } => {
-                    if let Some(device) = self.device_mut(&id) {
-                        device.connection = ConnectionState::Busy;
-                        device.progress = Some((sent, total));
-                        device.last_message = format!("Uploading {sent} of {total} bytes");
-                    }
-                }
-                WorkerEvent::Complete { id, message } => {
-                    if let Some(device) = self.device_mut(&id) {
-                        device.connection = ConnectionState::Connected;
-                        device.progress = None;
-                        device.last_message = message;
-                    }
-                }
-                WorkerEvent::Error { id, message } => {
-                    if let Some(device) = self.device_mut(&id) {
-                        device.connection = ConnectionState::Error;
-                        device.progress = None;
-                        device.last_message = message;
-                    }
+    fn apply_worker_event(&mut self, event: WorkerEvent) {
+        match event {
+            WorkerEvent::JobFinished { id } => self.worker_pool.job_finished(&id),
+            WorkerEvent::Log {
+                id,
+                direction,
+                text,
+            } => self.device_log.push(id, direction, &text),
+            WorkerEvent::Connecting { id } => {
+                if let Some(device) = self.device_mut(&id) {
+                    device.connection = ConnectionState::Connecting;
+                    device.last_message = "Opening SSH connection".into();
+                    device.last_outcome = None;
                 }
             }
+            WorkerEvent::HostKeyUnknown { id, fingerprint } => {
+                if let Some(device) = self.device_mut(&id) {
+                    device.connection = ConnectionState::Disconnected;
+                    device.last_message = "Verify the SSH host key before reconnecting".into();
+                    device.last_outcome = Some(Outcome::Failed);
+                }
+                self.pending_host_keys.insert(id, fingerprint);
+            }
+            WorkerEvent::Details { id, details } => {
+                if let Some(device) = self.device_mut(&id) {
+                    device.connection = ConnectionState::Connected;
+                    device.details = Some(details);
+                    device.last_message = "Device information refreshed".into();
+                    device.last_outcome = Some(Outcome::Succeeded);
+                }
+            }
+            WorkerEvent::Progress { id, sent, total } => {
+                if let Some(device) = self.device_mut(&id) {
+                    device.connection = ConnectionState::Busy;
+                    device.progress = Some((sent, total));
+                    device.last_message = format!("Uploading {sent} of {total} bytes");
+                    device.last_outcome = None;
+                }
+            }
+            WorkerEvent::Complete { id, message } => {
+                if let Some(device) = self.device_mut(&id) {
+                    device.connection = ConnectionState::Connected;
+                    device.progress = None;
+                    device.last_message = message;
+                    device.last_outcome = Some(Outcome::Succeeded);
+                }
+            }
+            WorkerEvent::Error { id, message } => {
+                if let Some(device) = self.device_mut(&id) {
+                    device.connection = ConnectionState::Error;
+                    device.progress = None;
+                    device.last_message = message;
+                    device.last_outcome = Some(Outcome::Failed);
+                }
+            }
+        }
+    }
+
+    fn process_events(&mut self) {
+        while let Ok(event) = self.worker_events.try_recv() {
+            self.apply_worker_event(event);
         }
 
         while let Ok(event) = self.discovery_events.try_recv() {
@@ -424,6 +447,44 @@ impl LoadRunnerApp {
         }
     }
 
+    /// Drops a stored fingerprint so the next connection asks again. A device
+    /// can offer several host keys, and which one is negotiated depends on the
+    /// algorithms the client supports, so a stored key can stop matching
+    /// without the device having changed.
+    fn forget_host_key(&mut self, id: &str) {
+        let Some(index) = self.devices.iter().position(|device| device.id == id) else {
+            return;
+        };
+        let endpoint = endpoint_id(&self.devices[index].host, self.devices[index].port);
+        let had_key = self.devices[index]
+            .ssh_host_key_fingerprint
+            .take()
+            .is_some();
+        let is_address_book = self.devices[index].source == DeviceSource::AddressBook;
+        self.pending_host_keys.remove(id);
+        let had_legacy = self.config.legacy_trusted_host_keys.remove(id).is_some()
+            | self
+                .config
+                .legacy_trusted_host_keys
+                .remove(&endpoint)
+                .is_some();
+        if !had_key && !had_legacy {
+            self.status_message = "This device has no trusted SSH host key".into();
+            self.status_is_error = false;
+            return;
+        }
+        if is_address_book {
+            self.mark_address_book_dirty();
+            self.status_message =
+                "SSH host key forgotten; the next connection will ask you to trust it again. Save to persist"
+                    .into();
+        } else {
+            self.status_message =
+                "SSH host key forgotten; the next connection will ask you to trust it again".into();
+        }
+        self.status_is_error = false;
+    }
+
     fn trust_host_key(&mut self, id: &str, fingerprint: String) {
         let Some(index) = self.devices.iter().position(|device| device.id == id) else {
             return;
@@ -489,12 +550,73 @@ impl LoadRunnerApp {
             let Some(connection) = self.connection_spec(&id) else {
                 continue;
             };
+            let signature = signature_beside(&path);
+            if signature.is_none() {
+                self.device_log.push(
+                    id.clone(),
+                    crate::device_log::Direction::Note,
+                    &format!(
+                        "No signature file beside {}; uploading the program only",
+                        file_display_name(&path)
+                    ),
+                );
+            }
             if let Err(error) = self.worker_pool.send(
                 &id,
                 WorkerCommand::UploadProgram {
                     connection,
                     local_path: path,
+                    signature,
                     slot,
+                },
+            ) {
+                self.notice = Some(error);
+            }
+        }
+    }
+
+    fn load_assigned_configs(&mut self) {
+        let jobs: Vec<(String, PathBuf)> = self
+            .devices
+            .iter()
+            .filter(|device| {
+                device.selected
+                    && device.source == DeviceSource::AddressBook
+                    && device.kind == DeviceKind::Processor
+            })
+            .flat_map(|device| {
+                device
+                    .config_slots
+                    .iter()
+                    .filter_map(|path| path.clone().map(|path| (device.id.clone(), path)))
+            })
+            .collect();
+        if jobs.is_empty() {
+            self.notice = Some(
+                "Select an address-book processor that has at least one assigned configuration file"
+                    .into(),
+            );
+            return;
+        }
+        // Configuration slots accept any file type, so a missing file is the
+        // only thing that can be checked before connecting.
+        if let Some((_, path)) = jobs.iter().find(|(_, path)| !path.is_file()) {
+            self.notice = Some(format!(
+                "Assigned configuration file is missing: {}",
+                path.display()
+            ));
+            return;
+        }
+
+        for (id, path) in jobs {
+            let Some(connection) = self.connection_spec(&id) else {
+                continue;
+            };
+            if let Err(error) = self.worker_pool.send(
+                &id,
+                WorkerCommand::UploadConfig {
+                    connection,
+                    local_path: path,
                 },
             ) {
                 self.notice = Some(error);
@@ -1029,6 +1151,9 @@ impl LoadRunnerApp {
                 if ui.button("Load Assigned Program").clicked() {
                     self.load_assigned_programs();
                 }
+                if ui.button("Load Assigned Config").clicked() {
+                    self.load_assigned_configs();
+                }
                 if ui.button("Load Assigned Touchpanel").clicked() {
                     self.load_assigned_touchpanels();
                 }
@@ -1269,46 +1394,50 @@ impl LoadRunnerApp {
                                 if in_address_book {
                                     status_badge(ui, device.connection);
                                 }
-                                if in_address_book && device.kind == DeviceKind::Processor {
-                                    assignments_changed |= slot_one_assignment(
-                                        ui,
-                                        "PROGRAM · SLOT 1",
-                                        &mut device.program_slots[0],
-                                        Some("lpz"),
-                                    );
-                                    assignments_changed |= slot_one_assignment(
-                                        ui,
-                                        "CONFIG · SLOT 1",
-                                        &mut device.config_slots[0],
-                                        None,
-                                    );
+                                if in_address_book {
+                                    match device.kind {
+                                        DeviceKind::Processor => {
+                                            assignments_changed |= slot_one_assignment(
+                                                ui,
+                                                "PROGRAM · SLOT 1",
+                                                &mut device.program_slots[0],
+                                                Some("lpz"),
+                                            );
+                                            assignments_changed |= slot_one_assignment(
+                                                ui,
+                                                "CONFIG · SLOT 1",
+                                                &mut device.config_slots[0],
+                                                None,
+                                            );
+                                        }
+                                        DeviceKind::Touchpanel => {
+                                            assignments_changed |= slot_one_assignment(
+                                                ui,
+                                                "PROJECT",
+                                                &mut device.touchpanel_project,
+                                                Some("vtz"),
+                                            );
+                                        }
+                                        DeviceKind::Unknown => {}
+                                    }
                                 }
                             });
                         });
                     });
                     if in_address_book {
-                        match device.kind {
-                            DeviceKind::Processor => {
-                                for (slot, path) in device.program_slots.iter().enumerate().skip(1)
-                                {
-                                    if let Some(path) = path {
-                                        assigned_file_row(ui, "Program", slot + 1, path);
-                                    }
-                                }
-                                for (slot, path) in device.config_slots.iter().enumerate().skip(1) {
-                                    if let Some(path) = path {
-                                        assigned_file_row(ui, "Config", slot + 1, path);
-                                    }
+                        // Slot 1 of each kind is shown in the card's slot column;
+                        // the rest are listed here.
+                        if device.kind == DeviceKind::Processor {
+                            for (slot, path) in device.program_slots.iter().enumerate().skip(1) {
+                                if let Some(path) = path {
+                                    assigned_file_row(ui, "Program", slot + 1, path);
                                 }
                             }
-                            DeviceKind::Touchpanel => {
-                                if let Some(path) = &device.touchpanel_project {
-                                    assigned_project_row(ui, "Touchpanel", path);
+                            for (slot, path) in device.config_slots.iter().enumerate().skip(1) {
+                                if let Some(path) = path {
+                                    assigned_file_row(ui, "Config", slot + 1, path);
                                 }
-                                assignments_changed |=
-                                    project_assignment_button(ui, &mut device.touchpanel_project);
                             }
-                            DeviceKind::Unknown => {}
                         }
                         if let Some((sent, total)) = device.progress {
                             let progress = if total == 0 {
@@ -1318,8 +1447,8 @@ impl LoadRunnerApp {
                             };
                             ui.add(egui::ProgressBar::new(progress).show_percentage());
                         }
-                        if !device.last_message.is_empty() {
-                            ui.small(&device.last_message);
+                        if let Some(outcome) = device.last_outcome {
+                            outcome_indicator(ui, outcome, &device.last_message);
                         }
                     } else {
                         ui.small("Autodiscovered · right-click to add to the address book");
@@ -1335,7 +1464,9 @@ impl LoadRunnerApp {
             && self.devices[index].name != host)
             .then(|| self.devices[index].name.clone());
         let is_discovered = self.devices[index].source == DeviceSource::Discovered;
+        let has_host_key = self.devices[index].ssh_host_key_fingerprint.is_some();
         let mut add_to_address_book = false;
+        let mut forget_host_key = false;
         response.context_menu(|ui| {
             if is_discovered {
                 if ui.button("Add to address book").clicked() {
@@ -1364,6 +1495,15 @@ impl LoadRunnerApp {
                 ui.ctx().copy_text(mac.clone());
                 ui.close();
             }
+            ui.separator();
+            if ui
+                .add_enabled(has_host_key, egui::Button::new("Forget SSH host key"))
+                .on_hover_text("Ask again the next time this device is contacted")
+                .clicked()
+            {
+                forget_host_key = true;
+                ui.close();
+            }
         });
         if response.clicked() || response.secondary_clicked() {
             self.selected_id = Some(id.to_owned());
@@ -1373,6 +1513,9 @@ impl LoadRunnerApp {
         }
         if add_to_address_book {
             self.add_discovered_to_address_book(id);
+        }
+        if forget_host_key {
+            self.forget_host_key(id);
         }
     }
 
@@ -1394,6 +1537,7 @@ impl LoadRunnerApp {
 
                 let mut refresh = false;
                 let mut remove = false;
+                let mut open_log = false;
                 let mut address_changed = false;
                 {
                     let device = &mut self.devices[index];
@@ -1463,6 +1607,13 @@ impl LoadRunnerApp {
                         if ui.button("Connect / refresh").clicked() {
                             refresh = true;
                         }
+                        if ui
+                            .button("Device log…")
+                            .on_hover_text("Every line sent to and received from devices")
+                            .clicked()
+                        {
+                            open_log = true;
+                        }
                         if device.source == DeviceSource::AddressBook
                             && ui.button("Remove").clicked()
                         {
@@ -1489,6 +1640,9 @@ impl LoadRunnerApp {
                     self.mark_address_book_dirty();
                 }
 
+                if open_log {
+                    self.log_view_open = true;
+                }
                 if refresh {
                     self.refresh_device(&id);
                 }
@@ -1529,6 +1683,101 @@ impl LoadRunnerApp {
                 }
             });
         });
+    }
+
+    fn log_window(&mut self, ctx: &egui::Context) {
+        if !self.log_view_open {
+            return;
+        }
+        let selected = self.selected_id.clone();
+        let mut open = true;
+        egui::Window::new("Device log")
+            .open(&mut open)
+            .default_size([820.0, 460.0])
+            .show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.add_enabled(
+                        selected.is_some(),
+                        egui::Checkbox::new(
+                            &mut self.log_only_selected,
+                            "Only the selected device",
+                        ),
+                    );
+                    if ui.button("Copy all").clicked() {
+                        let transcript = self.device_log.to_transcript(|id| self.device_name(id));
+                        ui.ctx().copy_text(transcript);
+                    }
+                    if ui.button("Clear").clicked() {
+                        self.device_log.clear();
+                    }
+                });
+                let filter = self
+                    .log_only_selected
+                    .then_some(selected.as_deref())
+                    .flatten();
+                ui.small(match self.device_log.dropped() {
+                    0 => format!("{} entries", self.device_log.len()),
+                    dropped => format!(
+                        "{} entries · {dropped} older entries dropped (limit {})",
+                        self.device_log.len(),
+                        crate::device_log::DeviceLog::CAPACITY
+                    ),
+                });
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .id_salt("device_log_scroll")
+                    .stick_to_bottom(true)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let mut shown = 0;
+                        for entry in self.device_log.entries() {
+                            if filter.is_some_and(|id| id != entry.device) {
+                                continue;
+                            }
+                            shown += 1;
+                            let color = match entry.direction {
+                                crate::device_log::Direction::Sent => {
+                                    Color32::from_rgb(120, 170, 255)
+                                }
+                                crate::device_log::Direction::Received => {
+                                    ui.visuals().strong_text_color()
+                                }
+                                crate::device_log::Direction::Note => {
+                                    ui.visuals().weak_text_color()
+                                }
+                            };
+                            ui.horizontal_top(|ui| {
+                                ui.monospace(
+                                    RichText::new(format!(
+                                        "{}  {:<18} {}",
+                                        entry.clock(),
+                                        self.device_name(&entry.device),
+                                        entry.direction.arrow()
+                                    ))
+                                    .weak(),
+                                );
+                                ui.monospace(RichText::new(&entry.text).color(color));
+                            });
+                        }
+                        if shown == 0 {
+                            ui.label(if self.device_log.is_empty() {
+                                "Nothing has been sent to a device yet."
+                            } else {
+                                "No entries for the selected device."
+                            });
+                        }
+                    });
+            });
+        self.log_view_open = open;
+    }
+
+    /// Log entries outlive the devices they name, so an unknown endpoint falls
+    /// back to the id it was recorded against.
+    fn device_name(&self, id: &str) -> String {
+        self.devices
+            .iter()
+            .find(|device| device.id == id)
+            .map_or_else(|| id.to_owned(), |device| device.display_name().to_owned())
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
@@ -1726,6 +1975,7 @@ impl LoadRunnerApp {
         self.status_bar(ui);
         self.devices_panel(ui);
         self.details_panel(ui);
+        self.log_window(&ctx);
         self.dialogs(&ctx);
         if self.discovering
             || self.worker_pool.has_pending()
@@ -1747,6 +1997,14 @@ fn file_has_extension(path: &Path, expected: &str) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case(expected))
 }
 
+/// A program is loaded with its signature: the `.sig` file sitting beside it
+/// under the same name. Absent is not an error — an unsigned program still
+/// loads — so a missing signature is recorded in the device log instead.
+fn signature_beside(program: &Path) -> Option<PathBuf> {
+    let signature = program.with_extension("sig");
+    signature.is_file().then_some(signature)
+}
+
 fn file_display_name(path: &Path) -> String {
     path.file_name()
         .and_then(|name| name.to_str())
@@ -1761,13 +2019,6 @@ fn address_book_status_path(path: &Path, dirty: bool) -> String {
 fn assigned_file_row(ui: &mut egui::Ui, kind: &str, slot: usize, path: &Path) {
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new(format!("{kind} {slot}")).strong());
-        ui.monospace(file_display_name(path));
-    });
-}
-
-fn assigned_project_row(ui: &mut egui::Ui, kind: &str, path: &Path) {
-    ui.horizontal_wrapped(|ui| {
-        ui.label(RichText::new(kind).strong());
         ui.monospace(file_display_name(path));
     });
 }
@@ -1827,23 +2078,6 @@ fn slot_one_assignment(
         }
     });
     changed
-}
-
-fn project_assignment_button(ui: &mut egui::Ui, assignment: &mut Option<PathBuf>) -> bool {
-    let label = if assignment.is_some() {
-        "Replace touchpanel project…"
-    } else {
-        "Assign touchpanel project…"
-    };
-    if ui.button(label).clicked()
-        && let Some(path) = rfd::FileDialog::new()
-            .add_filter("VTZ", &["vtz"])
-            .pick_file()
-    {
-        *assignment = Some(path);
-        return true;
-    }
-    false
 }
 
 fn processor_assignments(ui: &mut egui::Ui, device: &mut Device) -> bool {
@@ -1935,6 +2169,24 @@ fn assignment_slot(
         }
     });
     changed
+}
+
+/// The result of the last operation, standing in for its output text. The
+/// text itself is in the device log; the message is kept as hover text so the
+/// detail is one gesture away.
+fn outcome_indicator(ui: &mut egui::Ui, outcome: Outcome, message: &str) {
+    let (glyph, label, color) = match outcome {
+        Outcome::Succeeded => ("\u{2714}", "Succeeded", Color32::from_rgb(68, 180, 110)),
+        Outcome::Failed => ("\u{2716}", "Failed", Color32::from_rgb(226, 96, 96)),
+    };
+    let response = ui.label(
+        RichText::new(format!("{glyph} {label}"))
+            .strong()
+            .color(color),
+    );
+    if !message.is_empty() {
+        response.on_hover_text(message);
+    }
 }
 
 fn status_badge(ui: &mut egui::Ui, state: ConnectionState) {

@@ -155,6 +155,225 @@ fn assigned_firmware_is_queued_for_selected_matching_models() {
 }
 
 #[test]
+fn assigned_config_files_are_queued_and_missing_ones_are_reported() {
+    let dir = TestDir::new();
+    let config = dir.path().join("control-room.json");
+    std::fs::write(&config, b"{}").unwrap();
+
+    let mut app = app();
+    let mut entry = AddressEntry {
+        host: "192.0.2.1".into(),
+        model: "RMC3".into(),
+        kind: DeviceKind::Processor,
+        ..Default::default()
+    };
+    let mut device = Device::from_address(&entry);
+    device.selected = true;
+    let id = device.id.clone();
+    app.devices.push(device);
+
+    // Nothing assigned yet.
+    app.load_assigned_configs();
+    assert!(
+        app.notice
+            .take()
+            .is_some_and(|notice| notice.contains("assigned configuration file"))
+    );
+    assert!(!app.worker_pool.is_busy(&id));
+
+    app.devices[0].config_slots[3] = Some(config);
+    app.load_assigned_configs();
+    assert!(app.notice.is_none());
+    assert!(app.worker_pool.is_busy(&id));
+
+    entry.host = "192.0.2.2".into();
+    let mut missing = Device::from_address(&entry);
+    missing.id = endpoint_id("192.0.2.2", 22);
+    missing.config_slots[0] = Some(dir.path().join("deleted.json"));
+    missing.selected = true;
+    app.devices[0].selected = false;
+    app.devices.push(missing);
+    app.load_assigned_configs();
+    assert!(
+        app.notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("configuration file is missing"))
+    );
+}
+
+#[test]
+fn forgetting_a_host_key_clears_it_and_restores_trust_on_first_use() {
+    let mut app = app();
+    let entry = AddressEntry {
+        host: "192.0.2.1".into(),
+        ssh_host_key_fingerprint: Some("SHA256:stored-rsa-key".into()),
+        ..Default::default()
+    };
+    app.devices.push(Device::from_address(&entry));
+    let id = app.devices[0].id.clone();
+    assert_eq!(
+        app.connection_spec(&id)
+            .unwrap()
+            .trusted_fingerprint
+            .as_deref(),
+        Some("SHA256:stored-rsa-key")
+    );
+
+    app.forget_host_key(&id);
+    assert!(app.devices[0].ssh_host_key_fingerprint.is_none());
+    assert!(
+        app.connection_spec(&id)
+            .unwrap()
+            .trusted_fingerprint
+            .is_none()
+    );
+    assert!(app.address_book_dirty);
+    assert!(app.status_message.contains("forgotten"));
+    assert!(!app.status_is_error);
+
+    // A second call reports rather than pretending something changed.
+    app.address_book_dirty = false;
+    app.forget_host_key(&id);
+    assert!(!app.address_book_dirty);
+    assert!(app.status_message.contains("no trusted SSH host key"));
+
+    // An unknown key is then trusted again through the normal flow.
+    app.trust_host_key(&id, "SHA256:new-ecdsa-key".into());
+    assert_eq!(
+        app.devices[0].ssh_host_key_fingerprint.as_deref(),
+        Some("SHA256:new-ecdsa-key")
+    );
+}
+
+#[test]
+fn load_results_become_an_indicator_and_the_text_goes_to_the_log() {
+    let mut app = app();
+    let entry = AddressEntry {
+        host: "192.0.2.1".into(),
+        name: "W223-CP".into(),
+        model: "RMC4".into(),
+        kind: DeviceKind::Processor,
+        ..Default::default()
+    };
+    app.devices.push(Device::from_address(&entry));
+    let id = app.devices[0].id.clone();
+    app.selected_id = Some(id.clone());
+
+    // What the worker threads would report for one successful load.
+    let events = [
+        WorkerEvent::Log {
+            id: id.clone(),
+            direction: crate::device_log::Direction::Sent,
+            text: "progload -p:1".into(),
+        },
+        WorkerEvent::Log {
+            id: id.clone(),
+            direction: crate::device_log::Direction::Received,
+            text: "Program load complete".into(),
+        },
+        WorkerEvent::Complete {
+            id: id.clone(),
+            message: "Uploaded W classrooms.lpz: Program load complete".into(),
+        },
+    ];
+    for event in events {
+        app.apply_worker_event(event);
+    }
+
+    assert_eq!(app.devices[0].last_outcome, Some(Outcome::Succeeded));
+    assert_eq!(app.device_log.len(), 2);
+
+    // The card shows the indicator, not the load's output text.
+    let texts = rendered_texts(&mut app);
+    assert!(texts.iter().any(|text| text.contains("Succeeded")));
+    assert!(
+        !texts
+            .iter()
+            .any(|text| text.contains("Program load complete"))
+    );
+
+    // The log window shows both directions once opened.
+    app.log_view_open = true;
+    let texts = rendered_texts(&mut app);
+    assert!(texts.iter().any(|text| text == "progload -p:1"));
+    assert!(texts.iter().any(|text| text == "Program load complete"));
+    assert!(texts.iter().any(|text| text.contains("W223-CP")));
+
+    // A failure flips the indicator.
+    app.apply_worker_event(WorkerEvent::Error {
+        id,
+        message: "Could not create remote file /program01/x.lpz".into(),
+    });
+    assert_eq!(app.devices[0].last_outcome, Some(Outcome::Failed));
+    let texts = rendered_texts(&mut app);
+    assert!(texts.iter().any(|text| text.contains("Failed")));
+}
+
+#[test]
+fn program_signatures_are_found_beside_the_program() {
+    let dir = TestDir::new();
+    let program = dir.path().join("W classrooms.lpz");
+    std::fs::write(&program, b"program").unwrap();
+
+    // Nothing beside it yet.
+    assert!(signature_beside(&program).is_none());
+
+    // A directory of the right name is not a signature file.
+    let signature = dir.path().join("W classrooms.sig");
+    std::fs::create_dir(&signature).unwrap();
+    assert!(signature_beside(&program).is_none());
+    std::fs::remove_dir(&signature).unwrap();
+
+    std::fs::write(&signature, b"signature").unwrap();
+    assert_eq!(signature_beside(&program), Some(signature));
+
+    // A signature for a different program is not picked up.
+    let other = dir.path().join("other.lpz");
+    std::fs::write(&other, b"program").unwrap();
+    assert!(signature_beside(&other).is_none());
+}
+
+#[test]
+fn a_missing_program_signature_is_recorded_and_does_not_block_the_load() {
+    let dir = TestDir::new();
+    let program = dir.path().join("W classrooms.lpz");
+    std::fs::write(&program, b"program").unwrap();
+
+    let mut app = app();
+    let mut entry = AddressEntry {
+        host: "192.0.2.1".into(),
+        model: "RMC4".into(),
+        kind: DeviceKind::Processor,
+        ..Default::default()
+    };
+    entry.program_slots[0] = Some(program.clone());
+    let mut device = Device::from_address(&entry);
+    device.selected = true;
+    let id = device.id.clone();
+    app.devices.push(device);
+
+    app.load_assigned_programs();
+    assert!(app.notice.is_none());
+    assert!(app.worker_pool.is_busy(&id));
+    assert!(app.device_log.entries().any(|entry| {
+        entry
+            .text
+            .contains("No signature file beside W classrooms.lpz")
+    }));
+
+    // With the signature present, nothing is noted.
+    std::fs::write(dir.path().join("W classrooms.sig"), b"signature").unwrap();
+    app.device_log.clear();
+    app.load_assigned_programs();
+    assert!(app.notice.is_none());
+    assert!(
+        !app.device_log
+            .entries()
+            .any(|entry| entry.text.contains("No signature file"))
+    );
+}
+
+#[test]
 fn manual_add_promotes_discovered_endpoint_instead_of_duplicating_it() {
     let mut app = app();
     app.merge_discovered(discovered("192.0.2.1"));
@@ -461,6 +680,32 @@ fn rendered_texts(app: &mut LoadRunnerApp) -> Vec<String> {
         .collect();
     output.drop_without_applying_deltas();
     texts
+}
+
+#[test]
+fn touchpanel_cards_show_the_project_in_a_slot_instead_of_a_button() {
+    let mut app = app();
+    let entry = AddressEntry {
+        host: "192.0.2.41".into(),
+        name: "LOBBY-TSW".into(),
+        model: "TSW-1070".into(),
+        kind: DeviceKind::Touchpanel,
+        touchpanel_project: Some(PathBuf::from("projects/lobby.vtz")),
+        ..Default::default()
+    };
+    app.devices.push(Device::from_address(&entry));
+
+    let texts = rendered_texts(&mut app);
+    assert!(texts.iter().any(|text| text == "PROJECT"));
+    assert!(texts.iter().any(|text| text == "lobby.vtz"));
+    assert!(!texts.iter().any(|text| {
+        text == "Replace touchpanel project…" || text == "Assign touchpanel project…"
+    }));
+
+    app.devices[0].touchpanel_project = None;
+    let texts = rendered_texts(&mut app);
+    assert!(texts.iter().any(|text| text == "PROJECT"));
+    assert!(texts.iter().any(|text| text == "Unassigned"));
 }
 
 #[test]

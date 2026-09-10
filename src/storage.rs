@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs, io,
     path::{Path, PathBuf},
+    sync::OnceLock,
 };
 
 use directories::ProjectDirs;
@@ -218,13 +219,30 @@ const fn address_book_version() -> u32 {
     1
 }
 
-pub fn config_path() -> Option<PathBuf> {
+static CONFIG_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Redirects every stored file at startup, so a throwaway profile cannot touch
+/// the real address book. Later calls are refused: paths are read from here for
+/// the rest of the process, and moving them mid-run would split the two halves
+/// of a save across directories.
+pub fn set_config_dir(dir: PathBuf) -> Result<(), PathBuf> {
+    CONFIG_DIR_OVERRIDE.set(dir)
+}
+
+pub fn config_dir() -> Option<PathBuf> {
+    if let Some(dir) = CONFIG_DIR_OVERRIDE.get() {
+        return Some(dir.clone());
+    }
     ProjectDirs::from("com", "WorldDomination", "CrestronLoadRunner")
-        .map(|dirs| dirs.config_dir().join("address-book.json"))
+        .map(|dirs| dirs.config_dir().to_path_buf())
+}
+
+pub fn config_path() -> Option<PathBuf> {
+    config_dir().map(|dir| dir.join("address-book.json"))
 }
 
 pub fn firmware_dir() -> Option<PathBuf> {
-    config_path().and_then(|path| path.parent().map(|parent| parent.join("firmware")))
+    config_dir().map(|dir| dir.join("firmware"))
 }
 
 #[cfg(test)]
@@ -232,6 +250,14 @@ mod tests {
     use super::*;
     use crate::model::DeviceKind;
     use crate::test_support::TestDir;
+
+    #[test]
+    fn stored_files_sit_together_in_the_configuration_directory() {
+        // --config-dir has to move every stored file, not just the address book.
+        let dir = config_dir().expect("a configuration directory");
+        assert_eq!(config_path().unwrap(), dir.join("address-book.json"));
+        assert_eq!(firmware_dir().unwrap(), dir.join("firmware"));
+    }
 
     #[test]
     fn rejects_portable_document_as_local_config() {

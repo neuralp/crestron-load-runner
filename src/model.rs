@@ -20,6 +20,14 @@ impl DeviceKind {
     }
 }
 
+/// How the device's last finished operation ended. The card shows this
+/// instead of the operation's own text, which goes to the device log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    Succeeded,
+    Failed,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeviceSource {
     Discovered,
@@ -62,6 +70,7 @@ pub struct Device {
     pub progress: Option<(u64, u64)>,
     pub details: Option<DeviceDetails>,
     pub last_message: String,
+    pub last_outcome: Option<Outcome>,
 }
 
 impl Device {
@@ -90,6 +99,7 @@ impl Device {
             progress: None,
             details: None,
             last_message: String::new(),
+            last_outcome: None,
         }
     }
 

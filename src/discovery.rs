@@ -207,6 +207,7 @@ pub(crate) fn parse_response(data: &[u8], host: String) -> Option<Device> {
         progress: None,
         details: None,
         last_message: "Discovered on the local network".into(),
+        last_outcome: None,
     })
 }
 

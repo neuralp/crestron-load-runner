@@ -8,13 +8,17 @@ A native Rust/egui utility for discovering Crestron devices, keeping an address 
 - Manual and autodiscovery-to-address-book workflows with processor/touchpanel classification
 - Device-list text search across model, hostname, IP address, MAC address, and firmware
 - Address-book import and export as portable JSON files
-- Dedicated background worker thread per SSH device
-- App-specific trust-on-first-use SSH host-key verification
+- Dedicated background worker thread per SSH device, each driving an asynchronous `russh` session
+- App-specific trust-on-first-use SSH host-key verification, with **Forget SSH host key** on a device's right-click menu to ask again
+- `--config-dir` for an isolated settings, address-book, and firmware profile
 - Persistent `.lpz` processor assignments for program slots 1–10
+- Program signatures uploaded automatically: a `.sig` file beside the assigned `.lpz` is sent to the same slot directory as `.zig`
 - Persistent processor configuration-file assignments for slots 1–10
 - Persistent `.vtz` touchpanel project assignments
 - Network, program, IP table, and optional Cresnet detail views
-- Multi-device loading from the top action bar
+- Success/fail indicator on each device card, with the operation's own text kept in the device log
+- In-memory device log of every line sent to and received from devices, opened with **Device log…** on the details panel
+- Multi-device loading from the top action bar: **Load Assigned Program**, **Load Assigned Config**, **Load Assigned Touchpanel**, and **Load Firmware**
 - Resizable device/details split with a one-third initial device-list width
 - Saved default SSH credentials, with per-device credentials taking precedence
 - Firmware editor with a persistent per-model catalog and managed local firmware copies
@@ -25,7 +29,12 @@ A native Rust/egui utility for discovering Crestron devices, keeping an address 
 cargo run --release
 ```
 
-The current address book is stored in the platform user configuration directory. Each device's trusted SSH host-key fingerprint is stored on that device's address-book entry, so it is included in portable address-book JSON files alongside assigned program, configuration, and touchpanel file paths. Address-book changes remain in memory until saved; the status bar appends `*` to the current file while it has unsaved changes and reports load/save results without opening a notice dialog. Per-device passwords are held in memory only. A default username and password can be saved in **File → Preferences** and are used when the corresponding per-device credential is blank.
+### Command-line options
+
+- `--config-dir <DIR>`: keep settings, the address book, and the firmware library in `DIR` instead of the platform user configuration directory. Use it for a throwaway profile — screenshots, demos, or trying an address book — without touching the real one. The directory is created on first save.
+- `-h`, `--help`: print usage and exit.
+
+The current address book is stored in the platform user configuration directory, or in `--config-dir` when that is given. Each device's trusted SSH host-key fingerprint is stored on that device's address-book entry, so it is included in portable address-book JSON files alongside assigned program, configuration, and touchpanel file paths. Address-book changes remain in memory until saved; the status bar appends `*` to the current file while it has unsaved changes and reports load/save results without opening a notice dialog. Per-device passwords are held in memory only. A default username and password can be saved in **File → Preferences** and are used when the corresponding per-device credential is blank.
 
 ## Saving and operation safety
 
@@ -43,7 +52,7 @@ Files are copied and SHA-256 verified in a background worker. The catalog is sav
 
 Select address-book targets and choose **Load Firmware** to upload the firmware assigned to each target's model. PUF files are uploaded to the device firmware directory and applied with the Crestron `puf` command; ZIP updates use `pushupdate full`. Firmware installation can restart or temporarily disconnect a device, so verify the model assignment before loading.
 
-Storage is a `firmware` subdirectory beside the local `address-book.json` settings file:
+Storage is a `firmware` subdirectory beside the local `address-book.json` settings file, so `--config-dir` moves it too:
 
 - Linux: `~/.config/crestronloadrunner/firmware/` (or `$XDG_CONFIG_HOME/crestronloadrunner/firmware/`)
 - Windows: `%APPDATA%\WorldDomination\CrestronLoadRunner\config\firmware\`
@@ -55,10 +64,27 @@ This directory contains `catalog.json` and checksum-named `.firmware` copies. Th
 The application uses Crestron console commands over SSH:
 
 - Details: `hostname`, `ver`, `ipconfig`, `proginf`, `ipt -t`, `REPORTCRESNET`
-- Processor load: SFTP upload followed by `progload -p:<slot> <file>`
-- Touchpanel load: SFTP upload followed by `projectload <file>`
+- Processor load: SFTP upload into `/program<NN>` for the target slot, with the program's `.sig` file uploaded alongside it as `.zig`, followed by `progload -p:<slot>`
+- Configuration load: SFTP upload into `/user`; no console command is issued
+- Touchpanel load: SFTP upload into the panel's `/display` directory followed by `projectload`
 
 Command availability and output vary by Crestron firmware generation. Verify load behavior on a non-production device before deploying broadly.
+
+The SFTP namespace is not the one the SSH console presents. A program the console addresses as `\SIMPLpp01` is written over SFTP to `/program01`, so these paths are SFTP paths and cannot be read off a console directory listing.
+
+## Device log
+
+Every console command sent to a device and every response it returns is recorded in memory for the session, along with app-side notes for connection attempts, SFTP transfers and failures. Open it with **Device log…** on the Device details panel. The window filters to the selected device by default, and offers **Copy all** and **Clear**.
+
+A device card shows only whether the last operation succeeded or failed; the text it produced goes to the log. Hovering the indicator shows the last message.
+
+The log holds 2000 entries, dropping the oldest and reporting how many were dropped, and truncates any single entry over 8 KB. It is never written to disk, and timestamps are UTC because resolving a local time zone would mean adding a dependency.
+
+## SSH implementation
+
+SSH and SFTP use [`russh`](https://crates.io/crates/russh) with the `ring` backend: a pure-Rust client that needs no OpenSSL, Perl, or NASM to build. This matters for Crestron hardware. 4-Series devices advertise `ssh-rsa` alongside `ecdsa-sha2-nistp256` but some of them only complete a handshake with the ECDSA key, and the previous libssh2 client fell back to Windows CNG, whose host-key support is RSA-only. It therefore negotiated the one algorithm such a device could not honor, the device closed the connection, and the failure surfaced as `Unable to exchange encryption keys`.
+
+Because the negotiated host key depends on which algorithms the client supports, a fingerprint trusted by an older build of this app can stop matching even though the device is unchanged — a device commonly holds several host keys. That is reported as a changed host key and the connection is refused; use **Forget SSH host key** on the device's right-click menu and trust the new fingerprint when prompted.
 
 ## Security
 
