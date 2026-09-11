@@ -16,8 +16,11 @@ A native Rust/egui utility for discovering Crestron devices, keeping an address 
 - Persistent processor configuration-file assignments for slots 1–10
 - Persistent `.vtz` touchpanel project assignments
 - Network, program, IP table, and optional Cresnet detail views
+- Running program summary drawn from `progcomments`: source file, program file, compile time, and programmer
+- Cresnet report parsed into a table of ID, model, firmware, and serial, for processors
 - Success/fail indicator on each device card, with the operation's own text kept in the device log
 - In-memory device log of every line sent to and received from devices, opened with **Device log…** on the details panel
+- Interactive SSH console for one device in its own window, opened with **Connect SSH…**
 - Multi-device loading from the top action bar: **Load Assigned Program**, **Load Assigned Config**, **Load Assigned Touchpanel**, and **Load Firmware**
 - Resizable device/details split with a one-third initial device-list width
 - Script and firmware editors open as separate operating-system windows, so they stay usable beside the main one
@@ -102,14 +105,23 @@ Scripts run sequentially on each device over one authenticated SSH connection, u
 
 The library is `scripts.json` beside `preferences.json`, so `--config-dir` also isolates scripts. Saves use a temporary file, replacement, and read-back verification. Unreadable libraries are not overwritten, and address-book saves cannot overwrite the script library. Scripts and command logs are plain text: do not put passwords or other secrets in them. Run-time variable values are not saved in the library, but rendered commands are logged.
 
+## The SSH console
+
+**Connect SSH…**, on a device's right-click menu and on the details panel, opens an interactive console for that device in its own window. It connects as it opens, using the same credentials and the same trust-on-first-use host-key check as every other operation; a device whose key has not been trusted yet asks in the main window, and the console can be opened again once it has been.
+
+A line is sent when it is entered, and the up and down arrows walk back through what has been entered before. **Auto-scroll** keeps the newest line in view and can be turned off to read back through the output while the device is still talking. Everything typed and everything received also reaches the device log, so a console session leaves the same record as a script or a load. Closing the window, or **Disconnect**, ends the session. A window whose session has ended — by either hand — offers **Reconnect** in the same place, which opens another and keeps what the last one said above a line marking where the new one begins. Choosing **Connect SSH…** again for a device whose window is already open does the same.
+
+The session is asked for a terminal, so a device echoes what is typed the way it would to any terminal program. This is a line console rather than a terminal emulator: colour and cursor-movement sequences are removed rather than acted on, and the scrollback is plain text that can be selected and copied. A console does not queue behind the device's other operations and does not hold up exiting, since it lasts as long as it is wanted rather than as long as a command takes.
+
 ## Device commands
 
 The application uses Crestron console commands over SSH:
 
-- Details: `hostname`, `ver`, `ipconfig`, `proginfo`, `ipt -t`, `REPORTCRESNET`
+- Details: `hostname`, `ver`, `ipconfig`, `progcomments`, `ipt -t`, `REPORTCRESNET`
 - Processor load: SFTP upload into `/program<NN>` for the target slot, with the program's `.sig` file uploaded alongside it as `.zig`, followed by `progload -p:<slot>`
 - Configuration load: SFTP upload into `/user`; no console command is issued
 - Touchpanel load: SFTP upload into the panel's `/display` directory followed by `projectload`
+- Console: an interactive shell channel with a terminal requested, which is what **Connect SSH…** opens
 - Firmware load: SFTP upload into `/firmware`, then `pushupdate full` for a ZIP, or `puf` for a PUF followed — after the device restarts and is reconnected to — by `puf -results`
 
 Command availability and output vary by Crestron firmware generation. Verify load behavior on a non-production device before deploying broadly.

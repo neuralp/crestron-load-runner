@@ -286,14 +286,15 @@ fn quitting_saves_or_abandons_unsaved_scripts() {
 }
 
 #[test]
-fn running_program_info_is_visible_only_for_processors() {
+fn program_and_cresnet_reports_are_visible_only_for_processors() {
     let mut app = app();
     let mut device = Device::from_address(&AddressEntry {
         host: "192.0.2.1".into(),
         ..Default::default()
     });
     device.details = Some(crate::model::DeviceDetails {
-        programs: "Source Archive: processor-only.zip".into(),
+        programs: "Program File: processor-only.smw".into(),
+        cresnet: Some("0A: STATUSSIGN [v1.3443.00016, #01415779]".into()),
         ..Default::default()
     });
     app.selected_id = Some(device.id.clone());
@@ -317,11 +318,14 @@ fn running_program_info_is_visible_only_for_processors() {
             matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == label)
         })
         };
-        assert_eq!(has_text("Running programs"), kind == DeviceKind::Processor);
-        assert_eq!(
-            has_text("processor-only.zip"),
-            kind == DeviceKind::Processor
-        );
+        let processor = kind == DeviceKind::Processor;
+        assert_eq!(has_text("Running programs"), processor);
+        assert_eq!(has_text("processor-only.smw"), processor);
+        // The Cresnet bus is a processor's, and is reported as a table.
+        assert_eq!(has_text("Cresnet devices"), processor);
+        for cell in ["ID", "Model", "Firmware", "Serial", "0A", "#01415779"] {
+            assert_eq!(has_text(cell), processor, "{cell}");
+        }
         assert!(has_text("Identity"));
         assert!(has_text("Network"));
         assert!(has_text("IP table"));
@@ -409,23 +413,43 @@ fn device_footer_buttons_are_centered_and_add_device_opens_the_dialog() {
     }
 }
 
+/// A real `progcomments` answer, which carries far more than is shown.
+const PROGCOMMENTS: &str = concat!(
+    "Program Boot Directory: /simpl/app01\r\n",
+    "Source File:  C:\\Working Directory\\A2\\mke\\A2_MKE\\simpl\\A2_MKE_Template_A_v1.0\r\n",
+    "Program File: A2_MKE_Template_A_v1.0.smw\r\n",
+    "System Name:  slot01_a2_mke\r\n",
+    "Programmer:   A2\r\n",
+    "Compiled On:  6/12/2026 5:18 PM\r\n",
+    "Compiler Rev: 3.03\r\n",
+    "CrestronDB:   228.50.003.00\r\n",
+    "DeviceDB:     200.455.001.00\r\n",
+    "SYMLIB Rev:   1240\r\n",
+    "IOLIB Rev:    1240\r\n",
+    "IOPCFG Rev:   4.1.76\r\n",
+    "Source Env:   SIMPL Windows v4.3200.02\r\n",
+    "Target Rack:  CP4N\r\n",
+    "Config Rev:   22\r\n",
+    "Include4.dat: 2.21.257\r\n",
+    "Friendly Name:slot01_a2_mke\r\n",
+);
+
 #[test]
 fn program_info_parses_requested_fields_without_truncating_values() {
-    let contents = "Compile Date/Time:       9/10/2026 9:48 PM\r\nSource Env. Version:     SIMPL Windows v4.3200.02\r\nCompiler Version:        3.03\r\nRack Type:               RMC3\r\nSource Archive:          rmc3_test_archive.zip\r\nTimes (in milliseconds):\r\n  LoadSymbols:              14851\r\nMemory Usage\r\n\tTotal Physical Memory: 171016192 Bytes";
     assert_eq!(
-        parse_program_info(contents),
+        parse_program_info(PROGCOMMENTS),
         [
-            Some("9/10/2026 9:48 PM"),
-            Some("SIMPL Windows v4.3200.02"),
-            Some("RMC3"),
-            Some("rmc3_test_archive.zip"),
+            // A drive letter's colon belongs to the value, not to the field.
+            Some("C:\\Working Directory\\A2\\mke\\A2_MKE\\simpl\\A2_MKE_Template_A_v1.0"),
+            Some("A2_MKE_Template_A_v1.0.smw"),
+            Some("6/12/2026 5:18 PM"),
+            Some("A2"),
         ]
     );
+    // A field with no value, and one whose name is only part of another's.
     assert_eq!(
-        parse_program_info(
-            "  Source Archive: C:\\Projects\\room.zip\nRack Type: RMC3\nSource Env. Version: "
-        ),
-        [None, Some(""), Some("RMC3"), Some("C:\\Projects\\room.zip")]
+        parse_program_info("  Program File: room.smw\nProgrammer:\nSource Files: two.smw"),
+        [None, Some("room.smw"), None, Some("")]
     );
     assert_eq!(parse_program_info("No program loaded"), [None; 4]);
     assert_eq!(parse_program_info(""), [None; 4]);
@@ -433,7 +457,7 @@ fn program_info_parses_requested_fields_without_truncating_values() {
 
 #[test]
 fn program_info_shows_summary_with_raw_response_collapsed_and_expandable() {
-    let contents = "Compile Date/Time: 9/10/2026 9:48 PM\nSource Env. Version: SIMPL Windows v4.3200.02\nRack Type: RMC3\nSource Archive: rmc3_test_archive.zip\nCompiler Version: 3.03";
+    let contents = PROGCOMMENTS;
     let ctx = egui::Context::default();
     let render = |ui: &mut egui::Ui| {
         ui.style_mut().animation_time = 0.0;
@@ -460,7 +484,8 @@ fn program_info_shows_summary_with_raw_response_collapsed_and_expandable() {
     for value in parse_program_info(contents).into_iter().flatten() {
         assert!(labels.contains(&value));
     }
-    assert!(!labels.iter().any(|text| text.contains("Compiler Version")));
+    // Everything else the device said stays behind the raw response.
+    assert!(!labels.iter().any(|text| text.contains("CrestronDB")));
     let toggle = output
         .shapes
         .iter()
@@ -487,8 +512,11 @@ fn program_info_shows_summary_with_raw_response_collapsed_and_expandable() {
         ctx.run_ui(raw, render).drop_without_applying_deltas();
     }
     let output = ctx.run_ui(input(), render);
+    // Opened, the raw response carries everything the summary leaves out.
     assert!(output.shapes.iter().any(|shape| {
-        matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == contents)
+        matches!(&shape.shape, egui::Shape::Text(text)
+            if text.galley.text().contains("CrestronDB")
+                && text.galley.text().contains("Program Boot Directory"))
     }));
     output.drop_without_applying_deltas();
 }

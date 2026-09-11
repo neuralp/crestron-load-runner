@@ -359,6 +359,13 @@ async fn connect(
     let _ = events.send(WorkerEvent::Connecting {
         id: spec.id.clone(),
     });
+    open_connection(spec, events).await
+}
+
+async fn open_connection(
+    spec: &ConnectionSpec,
+    events: &Sender<WorkerEvent>,
+) -> WorkerResult<Handle<TrustOnFirstUse>> {
     if spec.credentials.username.trim().is_empty() {
         return Err(message(spec, "Enter an SSH username before connecting"));
     }
@@ -516,7 +523,7 @@ async fn refresh(spec: &ConnectionSpec, events: &Sender<WorkerEvent>) -> WorkerR
         ),
         network: section_result(run_command(spec, &session, "ipconfig", SSH_TIMEOUT, events).await),
         programs: section_result(
-            run_command(spec, &session, "proginfo", SSH_TIMEOUT, events).await,
+            run_command(spec, &session, "progcomments", SSH_TIMEOUT, events).await,
         ),
         ip_table: section_result(run_command(spec, &session, "ipt -t", SSH_TIMEOUT, events).await),
         cresnet: optional_section(
@@ -653,6 +660,141 @@ impl Transfer {
             remote,
             display,
         }
+    }
+}
+
+/// What an interactive session tells its window.
+#[derive(Debug)]
+pub enum TerminalEvent {
+    Opened,
+    Output(Vec<u8>),
+    /// Why the session ended. Empty when the device simply closed it.
+    Closed(String),
+}
+
+/// Opens an interactive shell on its own thread, outside the command queue: a
+/// session a person is typing into lasts as long as they want it to, and must
+/// not hold up the queued operations or stop the application closing.
+///
+/// Everything typed and everything received also reaches the device log, so a
+/// terminal leaves the same record as any other operation.
+pub fn open_terminal(
+    spec: ConnectionSpec,
+    input: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    output: Sender<TerminalEvent>,
+    events: Sender<WorkerEvent>,
+) -> Result<(), String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("Could not start the SSH runtime: {error}"))?;
+    thread::Builder::new()
+        .name(format!("terminal-{}", spec.id))
+        .spawn(move || {
+            let reason = match runtime.block_on(terminal_session(&spec, input, &output, &events)) {
+                Ok(()) => String::new(),
+                Err(ConnectError::UnknownHostKey { id, fingerprint }) => {
+                    log(&events, &id, Direction::Note, "Host key is not trusted");
+                    let _ = events.send(WorkerEvent::HostKeyUnknown { id, fingerprint });
+                    "The host key is not trusted yet. Accept it, then connect again.".to_owned()
+                }
+                Err(ConnectError::Message { message, .. }) => message,
+            };
+            if !reason.is_empty() {
+                log(&events, &spec.id, Direction::Note, &reason);
+            }
+            let _ = output.send(TerminalEvent::Closed(reason));
+        })
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+async fn terminal_session(
+    spec: &ConnectionSpec,
+    mut input: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    output: &Sender<TerminalEvent>,
+    events: &Sender<WorkerEvent>,
+) -> WorkerResult<()> {
+    // Without announcing it: the device card belongs to the queued operations,
+    // and a terminal is not one of them.
+    let session = open_connection(spec, events).await?;
+    let mut channel = session
+        .channel_open_session()
+        .await
+        .map_err(|error| message(spec, format!("Could not open an SSH channel: {error}")))?;
+    // A console that expects a person expects a terminal, so ask for the same
+    // one a terminal program would.
+    channel
+        .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+        .await
+        .map_err(|error| message(spec, format!("The device refused a terminal: {error}")))?;
+    channel
+        .request_shell(true)
+        .await
+        .map_err(|error| message(spec, format!("The device refused a shell: {error}")))?;
+    log(events, &spec.id, Direction::Note, "Terminal opened");
+    let _ = output.send(TerminalEvent::Opened);
+
+    let mut received = Vec::new();
+    loop {
+        tokio::select! {
+            typed = input.recv() => {
+                // The window has gone; close the session with it.
+                let Some(typed) = typed else { break };
+                log(events, &spec.id, Direction::Sent, &String::from_utf8_lossy(&typed));
+                channel
+                    .data(typed.as_slice())
+                    .await
+                    .map_err(|error| message(spec, format!("Could not send: {error}")))?;
+            }
+            message = channel.wait() => match message {
+                Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => {
+                    log_lines(events, &spec.id, &mut received, &data);
+                    let _ = output.send(TerminalEvent::Output(data.to_vec()));
+                }
+                // Either end closing the channel ends the session.
+                Some(ChannelMsg::Eof | ChannelMsg::Close) | None => break,
+                Some(_) => {}
+            },
+        }
+    }
+    // Whatever arrived without a newline behind it is still worth recording.
+    if !received.is_empty() {
+        log(
+            events,
+            &spec.id,
+            Direction::Received,
+            &String::from_utf8_lossy(&received),
+        );
+    }
+    log(events, &spec.id, Direction::Note, "Terminal closed");
+    let _ = channel.close().await;
+    disconnect(session).await;
+    Ok(())
+}
+
+/// The device log holds lines, while a terminal receives whatever arrives, so
+/// output is held back until a line of it is complete.
+fn log_lines(events: &Sender<WorkerEvent>, id: &str, held: &mut Vec<u8>, data: &[u8]) {
+    held.extend_from_slice(data);
+    while let Some(end) = held.iter().position(|byte| *byte == b'\n') {
+        let line: Vec<u8> = held.drain(..=end).collect();
+        log(
+            events,
+            id,
+            Direction::Received,
+            &String::from_utf8_lossy(&line),
+        );
+    }
+    // A device that never sends a newline must not grow the buffer forever.
+    if held.len() > 8 * 1024 {
+        let line = std::mem::take(held);
+        log(
+            events,
+            id,
+            Direction::Received,
+            &String::from_utf8_lossy(&line),
+        );
     }
 }
 
@@ -1445,6 +1587,176 @@ mod tests {
             Some("archive.tar.zig")
         );
         assert!(signature_remote_name("..").is_none());
+    }
+
+    /// A session a person types into: it stays open, carries what is typed
+    /// both ways, and leaves the same record in the device log as anything else.
+    #[test]
+    fn a_terminal_carries_a_console_both_ways_and_into_the_device_log() {
+        struct ConsoleServer {
+            received: Arc<Mutex<Vec<String>>>,
+            greeted: bool,
+        }
+        impl russh::server::Handler for ConsoleServer {
+            type Error = russh::Error;
+
+            async fn auth_password(
+                &mut self,
+                _user: &str,
+                _password: &str,
+            ) -> Result<russh::server::Auth, Self::Error> {
+                Ok(russh::server::Auth::Accept)
+            }
+
+            async fn channel_open_session(
+                &mut self,
+                _channel: russh::Channel<russh::server::Msg>,
+                reply: russh::server::ChannelOpenHandle,
+                _session: &mut russh::server::Session,
+            ) -> Result<(), Self::Error> {
+                reply.accept().await;
+                Ok(())
+            }
+
+            async fn pty_request(
+                &mut self,
+                channel: russh::ChannelId,
+                term: &str,
+                _col_width: u32,
+                _row_height: u32,
+                _pix_width: u32,
+                _pix_height: u32,
+                _modes: &[(russh::Pty, u32)],
+                session: &mut russh::server::Session,
+            ) -> Result<(), Self::Error> {
+                self.received.lock().unwrap().push(format!("pty:{term}"));
+                session.channel_success(channel)?;
+                Ok(())
+            }
+
+            async fn shell_request(
+                &mut self,
+                channel: russh::ChannelId,
+                session: &mut russh::server::Session,
+            ) -> Result<(), Self::Error> {
+                self.received.lock().unwrap().push("shell".to_owned());
+                session.channel_success(channel)?;
+                // A console greets whoever opened it.
+                session.data(channel, "RMC4 Console\r\n>".to_owned())?;
+                self.greeted = true;
+                Ok(())
+            }
+
+            async fn data(
+                &mut self,
+                channel: russh::ChannelId,
+                data: &[u8],
+                session: &mut russh::server::Session,
+            ) -> Result<(), Self::Error> {
+                let typed = String::from_utf8_lossy(data).into_owned();
+                self.received.lock().unwrap().push(typed.clone());
+                // Echoed the way a console with a terminal does, then answered.
+                session.data(channel, format!("{typed}\nRMC4\r\n>"))?;
+                Ok(())
+            }
+        }
+
+        // The window side of a terminal is blocking, so the test is too, and
+        // the server needs a thread of its own to be answering meanwhile.
+        let key = russh::keys::PrivateKey::from(
+            russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&[11; 32]),
+        );
+        let fingerprint = host_fingerprint(key.public_key()).unwrap();
+        let config = Arc::new(russh::server::Config {
+            keys: vec![key],
+            auth_rejection_time: Duration::ZERO,
+            ..Default::default()
+        });
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let handler = ConsoleServer {
+            received: received.clone(),
+            greeted: false,
+        };
+        thread::spawn(move || {
+            runtime().block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                let (stream, _) = listener.accept().await.unwrap();
+                if let Ok(session) = russh::server::run_stream(config, stream, handler).await {
+                    let _ = session.await;
+                }
+            });
+        });
+
+        {
+            let mut spec = spec();
+            spec.port = port;
+            spec.trusted_fingerprint = Some(fingerprint);
+            let (events, worker_events) = mpsc::channel();
+            let (input, from_window) = tokio::sync::mpsc::unbounded_channel();
+            let (to_window, output) = mpsc::channel();
+            open_terminal(spec, from_window, to_window, events).unwrap();
+
+            // The session opens on its own; the window does not ask it to.
+            let next = |output: &mpsc::Receiver<TerminalEvent>| {
+                output.recv_timeout(Duration::from_secs(10)).unwrap()
+            };
+            assert!(matches!(next(&output), TerminalEvent::Opened));
+            let mut shown = String::new();
+            while !shown.contains('>') {
+                match next(&output) {
+                    TerminalEvent::Output(data) => shown.push_str(&String::from_utf8_lossy(&data)),
+                    other => panic!("{other:?}"),
+                }
+            }
+            assert!(shown.contains("RMC4 Console"), "{shown:?}");
+
+            input.send(b"hostname\r".to_vec()).unwrap();
+            shown.clear();
+            while !shown.contains("RMC4") {
+                match next(&output) {
+                    TerminalEvent::Output(data) => shown.push_str(&String::from_utf8_lossy(&data)),
+                    other => panic!("{other:?}"),
+                }
+            }
+
+            // Closing the window ends the session.
+            drop(input);
+            let closed = loop {
+                match next(&output) {
+                    TerminalEvent::Closed(reason) => break reason,
+                    TerminalEvent::Output(_) => continue,
+                    other => panic!("{other:?}"),
+                }
+            };
+            assert_eq!(closed, "", "a session closed from here reports no fault");
+
+            assert_eq!(
+                *received.lock().unwrap(),
+                ["pty:xterm", "shell", "hostname\r"],
+                "a terminal is asked for, and what is typed reaches the device"
+            );
+            let logged = worker_events
+                .try_iter()
+                .filter_map(|event| match event {
+                    WorkerEvent::Log {
+                        direction, text, ..
+                    } => Some((direction, text)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let said = |direction: Direction, wanted: &str| {
+                logged
+                    .iter()
+                    .any(|(seen, text)| *seen == direction && text.contains(wanted))
+            };
+            assert!(said(Direction::Note, "Terminal opened"), "{logged:?}");
+            assert!(said(Direction::Sent, "hostname"), "{logged:?}");
+            assert!(said(Direction::Received, "RMC4 Console"), "{logged:?}");
+            assert!(said(Direction::Note, "Terminal closed"), "{logged:?}");
+        }
     }
 
     /// Drives the whole PUF sequence against a device that answers `puf`, drops

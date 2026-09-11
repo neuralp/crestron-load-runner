@@ -6,6 +6,7 @@ mod app;
 mod archive;
 mod backdrop;
 mod cli;
+mod cresnet;
 mod device_log;
 mod discovery;
 mod firmware;
@@ -18,6 +19,7 @@ mod puf;
 mod scripts;
 mod ssh;
 mod storage;
+mod terminal;
 
 #[cfg(test)]
 mod test_support;

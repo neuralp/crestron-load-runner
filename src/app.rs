@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver},
 };
@@ -140,6 +140,10 @@ pub struct LoadRunnerApp {
     search: String,
     worker_pool: WorkerPool,
     worker_events: Receiver<WorkerEvent>,
+    /// Kept so an interactive session can log to the same device log the
+    /// queued operations write to.
+    worker_sender: std::sync::mpsc::Sender<WorkerEvent>,
+    terminals: BTreeMap<String, crate::terminal::Terminal>,
     discovery_events: Receiver<DiscoveryEvent>,
     discovery_sender: std::sync::mpsc::Sender<DiscoveryEvent>,
     discovering: bool,
@@ -251,8 +255,10 @@ impl LoadRunnerApp {
             filter: DeviceFilter::All,
             view: DeviceView::All,
             search: String::new(),
-            worker_pool: WorkerPool::new(worker_sender),
+            worker_pool: WorkerPool::new(worker_sender.clone()),
             worker_events,
+            worker_sender,
+            terminals: BTreeMap::new(),
             discovery_events,
             discovery_sender,
             discovering: false,
@@ -554,6 +560,23 @@ impl LoadRunnerApp {
         {
             self.notice = Some(error);
         }
+    }
+
+    /// Opens an interactive session on one device, or brings back the window of
+    /// a session that has ended so it can be started again.
+    fn open_terminal(&mut self, id: &str) {
+        if let Some(terminal) = self.terminals.get_mut(id).filter(|terminal| terminal.open) {
+            terminal.ensure_connected();
+            return;
+        }
+        let Some(connection) = self.connection_spec(id) else {
+            return;
+        };
+        let name = self.device_name(id);
+        self.terminals.insert(
+            id.to_owned(),
+            crate::terminal::Terminal::open(&name, connection, self.worker_sender.clone()),
+        );
     }
 
     fn open_script_run(&mut self, target: Option<&str>) {
@@ -1692,6 +1715,10 @@ impl LoadRunnerApp {
         let mut add_to_address_book = false;
         let mut forget_host_key = false;
         response.context_menu(|ui| {
+            if ui.button("Connect SSH…").clicked() {
+                self.open_terminal(id);
+                ui.close();
+            }
             if ui.button("Run Script…").clicked() {
                 self.open_script_run(Some(id));
                 ui.close();
@@ -1805,6 +1832,7 @@ impl LoadRunnerApp {
                 };
 
                 let mut refresh = false;
+                let mut terminal = false;
                 let mut remove = false;
                 let mut open_log = false;
                 let mut address_changed = false;
@@ -1877,6 +1905,13 @@ impl LoadRunnerApp {
                             refresh = true;
                         }
                         if ui
+                            .button("Connect SSH…")
+                            .on_hover_text("An interactive console in its own window")
+                            .clicked()
+                        {
+                            terminal = true;
+                        }
+                        if ui
                             .button("Device log…")
                             .on_hover_text("Every line sent to and received from devices")
                             .clicked()
@@ -1915,6 +1950,9 @@ impl LoadRunnerApp {
                 if refresh {
                     self.refresh_device(&id);
                 }
+                if terminal {
+                    self.open_terminal(&id);
+                }
                 if remove {
                     self.remove_selected_address();
                     return;
@@ -1946,8 +1984,10 @@ impl LoadRunnerApp {
                         program_info_section(ui, &id, &details.programs);
                     }
                     crate::ip_table::show(ui, &id, &details.ip_table);
-                    if let Some(cresnet) = details.cresnet {
-                        detail_section(ui, "Cresnet", &cresnet, false);
+                    if let Some(cresnet) = details.cresnet
+                        && self.devices[index].kind == DeviceKind::Processor
+                    {
+                        crate::cresnet::show(ui, &id, &cresnet);
                     }
                 } else {
                     ui.label("Connect to retrieve network, program, IP table, and Cresnet information.");
@@ -2067,6 +2107,11 @@ impl LoadRunnerApp {
         // drawing even while a modal owns the main window.
         self.firmware_editor.show(ctx);
         self.script_editor.show(ctx);
+        for terminal in self.terminals.values_mut() {
+            terminal.show(ctx);
+        }
+        // A closed window keeps nothing: its session has already ended.
+        self.terminals.retain(|_, terminal| terminal.open);
         if self.modal_open() {
             self.backdrop.paint(ctx);
         }
@@ -2587,12 +2632,9 @@ fn device_type_badge(ui: &mut egui::Ui, kind: DeviceKind) {
         });
 }
 
-const PROGRAM_INFO_FIELDS: [&str; 4] = [
-    "Compile Date/Time",
-    "Source Env. Version",
-    "Rack Type",
-    "Source Archive",
-];
+/// What is shown out of a `progcomments` answer. It names about fifteen
+/// fields; the rest stay behind the raw response.
+const PROGRAM_INFO_FIELDS: [&str; 4] = ["Source File", "Program File", "Compiled On", "Programmer"];
 
 fn parse_program_info(contents: &str) -> [Option<&str>; 4] {
     let mut values = [None; 4];
