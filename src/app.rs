@@ -160,6 +160,8 @@ pub struct LoadRunnerApp {
     preferences_open: bool,
     preferences_draft: PreferencesDraft,
     firmware_editor: crate::firmware::FirmwareEditor,
+    script_editor: crate::scripts::ScriptEditor,
+    script_run: Option<crate::scripts::RunDialog>,
     notice: Option<String>,
 }
 
@@ -200,6 +202,12 @@ impl LoadRunnerApp {
         };
         Self {
             preferences,
+            script_editor: crate::scripts::ScriptEditor::load(
+                preferences_path
+                    .as_ref()
+                    .map(|path| path.with_file_name("scripts.json")),
+            ),
+            script_run: None,
             preferences_path,
             address_book,
             devices,
@@ -500,6 +508,60 @@ impl LoadRunnerApp {
         }
     }
 
+    fn open_script_run(&mut self, target: Option<&str>) {
+        let targets = self
+            .devices
+            .iter()
+            .filter(|device| {
+                target.map_or(
+                    device.selected && device.source == DeviceSource::AddressBook,
+                    |id| device.id == id,
+                )
+            })
+            .map(crate::scripts::ScriptTarget::from)
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            self.notice =
+                Some("Select at least one address-book target device to run a script".into());
+            return;
+        }
+        self.script_run = Some(crate::scripts::RunDialog::new(
+            self.script_editor.scripts.clone(),
+            targets,
+        ));
+    }
+
+    fn queue_script(&mut self, request: crate::scripts::RunRequest) {
+        // Validate the complete target set before queueing anything. The dialog
+        // snapshots targets, so a later selection change cannot broaden a run.
+        let jobs = request
+            .jobs
+            .into_iter()
+            .map(|(id, commands)| {
+                self.connection_spec(&id)
+                    .map(|connection| (id, connection, commands))
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(jobs) = jobs else {
+            self.notice = Some(
+                "A script target was removed. Open Run Script again to review the targets".into(),
+            );
+            return;
+        };
+        for (id, connection, commands) in jobs {
+            if let Err(error) = self.worker_pool.send(
+                &id,
+                WorkerCommand::RunScript {
+                    connection,
+                    name: request.name.clone(),
+                    commands,
+                },
+            ) {
+                self.notice = Some(error);
+            }
+        }
+    }
+
     /// Drops a stored fingerprint so the next connection asks again. A device
     /// can offer several host keys, and which one is negotiated depends on the
     /// algorithms the client supports, so a stored key can stop matching
@@ -553,11 +615,15 @@ impl LoadRunnerApp {
     }
 
     fn load_assigned_programs(&mut self) {
+        self.load_assigned_programs_for(None);
+    }
+
+    fn load_assigned_programs_for(&mut self, target: Option<&str>) {
         let jobs: Vec<(String, PathBuf, u8)> = self
             .devices
             .iter()
             .filter(|device| {
-                device.selected
+                target.map_or(device.selected, |id| device.id == id)
                     && device.source == DeviceSource::AddressBook
                     && device.kind == DeviceKind::Processor
             })
@@ -619,11 +685,15 @@ impl LoadRunnerApp {
     }
 
     fn load_assigned_configs(&mut self) {
+        self.load_assigned_configs_for(None);
+    }
+
+    fn load_assigned_configs_for(&mut self, target: Option<&str>) {
         let jobs: Vec<(String, PathBuf)> = self
             .devices
             .iter()
             .filter(|device| {
-                device.selected
+                target.map_or(device.selected, |id| device.id == id)
                     && device.source == DeviceSource::AddressBook
                     && device.kind == DeviceKind::Processor
             })
@@ -668,11 +738,15 @@ impl LoadRunnerApp {
     }
 
     fn load_assigned_touchpanels(&mut self) {
+        self.load_assigned_touchpanels_for(None);
+    }
+
+    fn load_assigned_touchpanels_for(&mut self, target: Option<&str>) {
         let jobs: Vec<(String, PathBuf)> = self
             .devices
             .iter()
             .filter(|device| {
-                device.selected
+                target.map_or(device.selected, |id| device.id == id)
                     && device.source == DeviceSource::AddressBook
                     && device.kind == DeviceKind::Touchpanel
             })
@@ -853,6 +927,12 @@ impl LoadRunnerApp {
     }
 
     fn request_action(&mut self, action: PendingAction, ctx: &egui::Context) {
+        if matches!(action, PendingAction::Quit) && self.script_editor.is_dirty() {
+            self.script_editor.open = true;
+            self.notice =
+                Some("Save scripts or discard changes in Script Editor before quitting".into());
+            return;
+        }
         if self.firmware_editor.is_busy() {
             self.status_message = "Wait for the firmware file import to finish".into();
             self.status_is_error = true;
@@ -1130,16 +1210,21 @@ impl LoadRunnerApp {
                         self.open_preferences();
                         ui.close();
                     }
-                    if ui.button("Firmware Editor…").clicked() {
-                        self.firmware_editor.open = true;
-                        ui.close();
-                    }
                     ui.separator();
                     if ui.button("Quit").clicked() {
                         self.request_action(PendingAction::Quit, ui.ctx());
                     }
                 });
                 ui.menu_button("Devices", |ui| {
+                    if ui.button("Firmware Editor…").clicked() {
+                        self.firmware_editor.open = true;
+                        ui.close();
+                    }
+                    if ui.button("Script Editor…").clicked() {
+                        self.script_editor.open = true;
+                        ui.close();
+                    }
+                    ui.separator();
                     if ui
                         .add_enabled(!self.discovering, egui::Button::new("Discover now"))
                         .clicked()
@@ -1202,10 +1287,6 @@ impl LoadRunnerApp {
     fn action_bar(&mut self, root: &mut egui::Ui) {
         egui::Panel::top("actions").show(root, |ui| {
             ui.horizontal_wrapped(|ui| {
-                if ui.button("Add Device").clicked() {
-                    self.add_device_open = true;
-                }
-                ui.separator();
                 if ui.button("Load Assigned Program").clicked() {
                     self.load_assigned_programs();
                 }
@@ -1217,6 +1298,9 @@ impl LoadRunnerApp {
                 }
                 if ui.button("Load Firmware").clicked() {
                     self.load_assigned_firmware();
+                }
+                if ui.button("Run Script").clicked() {
+                    self.open_script_run(None);
                 }
                 ui.separator();
                 let selected = self.devices.iter().filter(|device| device.selected).count();
@@ -1348,32 +1432,7 @@ impl LoadRunnerApp {
                 egui::Panel::bottom("device_discovery_action")
                     .exact_size(48.0)
                     .show(ui, |ui| {
-                        ui.horizontal_centered(|ui| {
-                            let label = if self.discovering {
-                                "Discovering…"
-                            } else {
-                                "Discover Devices"
-                            };
-                            if ui
-                                .add_enabled(
-                                    !self.discovering,
-                                    egui::Button::new(label).min_size(egui::vec2(140.0, 32.0)),
-                                )
-                                .clicked()
-                            {
-                                self.start_discovery();
-                            }
-                            if ui
-                                .add(
-                                    egui::Button::new("Clear Devices")
-                                        .min_size(egui::vec2(110.0, 32.0)),
-                                )
-                                .on_hover_text("Immediately clear all devices")
-                                .clicked()
-                            {
-                                self.clear_devices();
-                            }
-                        });
+                        self.device_actions(ui);
                     });
 
                 egui::ScrollArea::vertical().show(ui, |ui| {
@@ -1392,6 +1451,49 @@ impl LoadRunnerApp {
             });
     }
 
+    fn device_actions(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_centered(|ui| {
+            let gaps = 2.0 * ui.spacing().item_spacing.x;
+            let available = ui.available_width();
+            // Center the group; shrink and wrap labels in a narrow sidebar.
+            let scale = ((available - gaps) / 350.0).clamp(0.0, 1.0);
+            ui.add_space(((available - (350.0 * scale + gaps)) / 2.0).max(0.0));
+            let label = if self.discovering {
+                "Discovering…"
+            } else {
+                "Discover Devices"
+            };
+            if ui
+                .add_enabled_ui(!self.discovering, |ui| {
+                    ui.add_sized([140.0 * scale, 32.0], egui::Button::new(label).wrap())
+                })
+                .inner
+                .clicked()
+            {
+                self.start_discovery();
+            }
+            if ui
+                .add_sized(
+                    [100.0 * scale, 32.0],
+                    egui::Button::new("Add Device").wrap(),
+                )
+                .clicked()
+            {
+                self.add_device_open = true;
+            }
+            if ui
+                .add_sized(
+                    [110.0 * scale, 32.0],
+                    egui::Button::new("Clear Devices").wrap(),
+                )
+                .on_hover_text("Immediately clear all devices")
+                .clicked()
+            {
+                self.clear_devices();
+            }
+        });
+    }
+
     fn device_card(&mut self, ui: &mut egui::Ui, id: &str) {
         let is_current = self.selected_id.as_deref() == Some(id);
         let Some(index) = self.devices.iter().position(|device| device.id == id) else {
@@ -1406,6 +1508,9 @@ impl LoadRunnerApp {
         let response = frame
             .show(ui, |ui| {
                 ui.scope_builder(egui::UiBuilder::new().sense(egui::Sense::click()), |ui| {
+                    // Card text participates in card clicks; selectable output
+                    // remains available in Device Details.
+                    ui.style_mut().interaction.selectable_labels = false;
                     ui.set_min_width(ui.available_width());
                     let device = &mut self.devices[index];
                     let in_address_book = device.source == DeviceSource::AddressBook;
@@ -1517,6 +1622,48 @@ impl LoadRunnerApp {
         let mut add_to_address_book = false;
         let mut forget_host_key = false;
         response.context_menu(|ui| {
+            if ui.button("Run Script…").clicked() {
+                self.open_script_run(Some(id));
+                ui.close();
+            }
+            ui.separator();
+            if !is_discovered {
+                let device = &self.devices[index];
+                let kind = device.kind;
+                let has_program = device.program_slots.iter().any(Option::is_some);
+                let has_config = device.config_slots.iter().any(Option::is_some);
+                let has_project = device.touchpanel_project.is_some();
+                match kind {
+                    DeviceKind::Processor => {
+                        if ui
+                            .add_enabled(has_program, egui::Button::new("Load Assigned Program"))
+                            .clicked()
+                        {
+                            self.load_assigned_programs_for(Some(id));
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(has_config, egui::Button::new("Load Assigned Config"))
+                            .clicked()
+                        {
+                            self.load_assigned_configs_for(Some(id));
+                            ui.close();
+                        }
+                        ui.separator();
+                    }
+                    DeviceKind::Touchpanel => {
+                        if ui
+                            .add_enabled(has_project, egui::Button::new("Load Assigned Touchpanel"))
+                            .clicked()
+                        {
+                            self.load_assigned_touchpanels_for(Some(id));
+                            ui.close();
+                        }
+                        ui.separator();
+                    }
+                    DeviceKind::Unknown => {}
+                }
+            }
             if is_discovered {
                 if ui.button("Add to address book").clicked() {
                     add_to_address_book = true;
@@ -1556,6 +1703,9 @@ impl LoadRunnerApp {
         });
         if response.clicked() || response.secondary_clicked() {
             self.selected_id = Some(id.to_owned());
+        }
+        if response.double_clicked() {
+            self.refresh_device(id);
         }
         if assignments_changed {
             self.mark_address_book_dirty();
@@ -1722,8 +1872,10 @@ impl LoadRunnerApp {
                 if let Some(details) = details {
                     detail_section(ui, "Identity", &details.identity, true);
                     detail_section(ui, "Network", &details.network, true);
-                    detail_section(ui, "Running programs", &details.programs, true);
-                    detail_section(ui, "IP table", &details.ip_table, true);
+                    if self.devices[index].kind == DeviceKind::Processor {
+                        program_info_section(ui, &id, &details.programs);
+                    }
+                    crate::ip_table::show(ui, &id, &details.ip_table);
                     if let Some(cresnet) = details.cresnet {
                         detail_section(ui, "Cresnet", &cresnet, false);
                     }
@@ -2022,6 +2174,15 @@ impl LoadRunnerApp {
         }
 
         self.firmware_editor.show(ctx);
+        self.script_editor.show(ctx);
+        if let Some(mut dialog) = self.script_run.take() {
+            if let Some(request) = dialog.show(ctx) {
+                self.queue_script(request);
+            }
+            if dialog.open {
+                self.script_run = Some(dialog);
+            }
+        }
 
         if let Some(message) = self.notice.clone() {
             let mut open = true;
@@ -2184,22 +2345,40 @@ fn slot_one_assignment(
 
 fn processor_assignments(ui: &mut egui::Ui, device: &mut Device) -> bool {
     let mut changed = false;
-    egui::CollapsingHeader::new("Program slot assignments")
-        .default_open(true)
+    let programs = egui::CollapsingHeader::new("Program slot assignments")
+        .id_salt(("program_assignments", &device.id))
+        .default_open(false)
         .show(ui, |ui| {
             for slot in 0..10 {
                 changed |=
                     assignment_slot(ui, slot + 1, &mut device.program_slots[slot], Some("lpz"));
             }
         });
-    egui::CollapsingHeader::new("Configuration slot assignments")
+    if programs.body_response.is_none() {
+        slot_one_summary(ui, device.program_slots[0].as_deref());
+    }
+    let configs = egui::CollapsingHeader::new("Configuration slot assignments")
+        .id_salt(("config_assignments", &device.id))
         .default_open(false)
         .show(ui, |ui| {
             for slot in 0..10 {
                 changed |= assignment_slot(ui, slot + 1, &mut device.config_slots[slot], None);
             }
         });
+    if configs.body_response.is_none() {
+        slot_one_summary(ui, device.config_slots[0].as_deref());
+    }
     changed
+}
+
+fn slot_one_summary(ui: &mut egui::Ui, assignment: Option<&Path>) {
+    let name = assignment
+        .map(file_display_name)
+        .unwrap_or_else(|| "Unassigned".into());
+    let response = ui.add(egui::Label::new(format!("Slot 1: {name}")).selectable(true));
+    if let Some(path) = assignment {
+        response.on_hover_text(path.display().to_string());
+    }
 }
 
 fn touchpanel_assignment(ui: &mut egui::Ui, device: &mut Device) -> bool {
@@ -2321,16 +2500,80 @@ fn device_type_badge(ui: &mut egui::Ui, kind: DeviceKind) {
         });
 }
 
+const PROGRAM_INFO_FIELDS: [&str; 4] = [
+    "Compile Date/Time",
+    "Source Env. Version",
+    "Rack Type",
+    "Source Archive",
+];
+
+fn parse_program_info(contents: &str) -> [Option<&str>; 4] {
+    let mut values = [None; 4];
+    for line in contents.lines() {
+        // Split only once: timestamps and archive paths can contain colons.
+        if let Some((key, value)) = line.split_once(':')
+            && let Some(index) = PROGRAM_INFO_FIELDS
+                .iter()
+                .position(|field| *field == key.trim())
+        {
+            values[index] = Some(value.trim());
+        }
+    }
+    values
+}
+
+fn program_info_section(ui: &mut egui::Ui, device_id: &str, contents: &str) {
+    ui.push_id(("program_info", device_id), |ui| {
+        egui::CollapsingHeader::new("Running programs")
+            .default_open(true)
+            .show(ui, |ui| {
+                let values = parse_program_info(contents);
+                if values.iter().any(Option::is_some) {
+                    egui::Frame::new()
+                        .inner_margin(4)
+                        .fill(ui.visuals().text_edit_bg_color())
+                        .stroke(egui::Stroke::new(1.0, egui::Color32::BLACK))
+                        .show(ui, |ui| {
+                            egui::Grid::new("summary").num_columns(2).show(ui, |ui| {
+                                for (field, value) in PROGRAM_INFO_FIELDS.iter().zip(values) {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(format!("{field}:")).strong(),
+                                        )
+                                        .selectable(true),
+                                    );
+                                    ui.add(
+                                        egui::Label::new(value.unwrap_or("Not reported"))
+                                            .selectable(true),
+                                    );
+                                    ui.end_row();
+                                }
+                            });
+                        });
+                } else {
+                    ui.label("No program information fields were reported.");
+                }
+                detail_section(ui, "Raw response", contents, false);
+            });
+    });
+}
+
 fn detail_section(ui: &mut egui::Ui, title: &str, contents: &str, open: bool) {
     egui::CollapsingHeader::new(title)
         .default_open(open)
         .show(ui, |ui| {
-            let mut text = contents.trim().to_owned();
+            // An immutable text buffer allows selection/copy without editing.
+            let mut text = contents.trim();
             ui.add(
                 egui::TextEdit::multiline(&mut text)
+                    .frame(
+                        egui::Frame::new()
+                            .inner_margin(4)
+                            .fill(ui.visuals().text_edit_bg_color())
+                            .stroke(egui::Stroke::new(1.0, egui::Color32::BLACK)),
+                    )
                     .font(egui::TextStyle::Monospace)
-                    .desired_width(f32::INFINITY)
-                    .interactive(false),
+                    .desired_width(f32::INFINITY),
             );
         });
 }

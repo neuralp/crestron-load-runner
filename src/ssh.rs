@@ -41,6 +41,11 @@ pub struct ConnectionSpec {
 #[derive(Debug)]
 pub enum WorkerCommand {
     Refresh(ConnectionSpec),
+    RunScript {
+        connection: ConnectionSpec,
+        name: String,
+        commands: Vec<String>,
+    },
     UploadProgram {
         connection: ConnectionSpec,
         local_path: PathBuf,
@@ -217,6 +222,11 @@ fn spawn_worker(
 async fn dispatch(command: WorkerCommand, events: &Sender<WorkerEvent>) -> WorkerResult<()> {
     match command {
         WorkerCommand::Refresh(connection) => refresh(&connection, events).await,
+        WorkerCommand::RunScript {
+            connection,
+            name,
+            commands,
+        } => run_script(&connection, &name, &commands, events).await,
         WorkerCommand::UploadProgram {
             connection,
             local_path,
@@ -373,6 +383,28 @@ fn tcp_connect(spec: &ConnectionSpec) -> WorkerResult<tokio::net::TcpStream> {
     tokio::net::TcpStream::from_std(stream).map_err(|error| message(spec, error.to_string()))
 }
 
+fn ssh_preferences() -> russh::Preferred {
+    let mut preferred = russh::Preferred::default();
+    // Russh supports NIST ECDH but omits it from its defaults. CrestronSSH
+    // devices need it ahead of DH group exchange, which fails with russh
+    // on the RMC3. Keep modern defaults first and do not enable SHA-1 KEX.
+    let mut kex = preferred.kex.to_vec();
+    let position = kex
+        .iter()
+        .position(|name| *name == russh::kex::DH_GEX_SHA256)
+        .unwrap_or(0);
+    kex.splice(
+        position..position,
+        [
+            russh::kex::ECDH_SHA2_NISTP256,
+            russh::kex::ECDH_SHA2_NISTP384,
+            russh::kex::ECDH_SHA2_NISTP521,
+        ],
+    );
+    preferred.kex = kex.into();
+    preferred
+}
+
 async fn open_session(
     spec: &ConnectionSpec,
     stream: tokio::net::TcpStream,
@@ -381,6 +413,7 @@ async fn open_session(
 ) -> WorkerResult<Handle<TrustOnFirstUse>> {
     let config = Arc::new(client::Config {
         inactivity_timeout: Some(timeout),
+        preferred: ssh_preferences(),
         ..Default::default()
     });
     let handler = TrustOnFirstUse {
@@ -451,7 +484,9 @@ async fn refresh(spec: &ConnectionSpec, events: &Sender<WorkerEvent>) -> WorkerR
             section_result(run_command(spec, &session, "ver", SSH_TIMEOUT, events).await)
         ),
         network: section_result(run_command(spec, &session, "ipconfig", SSH_TIMEOUT, events).await),
-        programs: section_result(run_command(spec, &session, "proginf", SSH_TIMEOUT, events).await),
+        programs: section_result(
+            run_command(spec, &session, "proginfo", SSH_TIMEOUT, events).await,
+        ),
         ip_table: section_result(run_command(spec, &session, "ipt -t", SSH_TIMEOUT, events).await),
         cresnet: optional_section(
             run_command(spec, &session, "REPORTCRESNET", SSH_TIMEOUT, events).await,
@@ -484,6 +519,48 @@ async fn run_command(
         Err(error) => log(events, &spec.id, Direction::Received, error),
     }
     result
+}
+
+async fn run_script(
+    spec: &ConnectionSpec,
+    name: &str,
+    commands: &[String],
+    events: &Sender<WorkerEvent>,
+) -> WorkerResult<()> {
+    if commands.is_empty()
+        || commands.iter().any(|command| {
+            command.trim().is_empty() || command.chars().any(|c| c.is_control() && c != '\t')
+        })
+    {
+        return Err(message(
+            spec,
+            "A script must contain nonempty, single-line commands",
+        ));
+    }
+    let session = connect(spec, events).await?;
+    log(
+        events,
+        &spec.id,
+        Direction::Note,
+        &format!("Running script {name} ({} commands)", commands.len()),
+    );
+    let mut result = Ok(());
+    for (index, command) in commands.iter().enumerate() {
+        if let Err(error) = run_command(spec, &session, command, SSH_TIMEOUT, events).await {
+            result = Err(message(
+                spec,
+                format!("Script {name} stopped at command {}: {error}", index + 1),
+            ));
+            break;
+        }
+    }
+    disconnect(session).await;
+    result?;
+    let _ = events.send(WorkerEvent::Complete {
+        id: spec.id.clone(),
+        message: format!("Script {name} completed ({} commands)", commands.len()),
+    });
+    Ok(())
 }
 
 async fn exec(session: &Handle<TrustOnFirstUse>, command: &str) -> Result<String, String> {
@@ -875,6 +952,143 @@ mod tests {
             },
             trusted_fingerprint: None,
         }
+    }
+
+    #[test]
+    fn scripts_execute_over_ssh_in_order_stop_on_failure_and_require_trust() {
+        struct ScriptServer {
+            received: Arc<Mutex<Vec<String>>>,
+        }
+        impl russh::server::Handler for ScriptServer {
+            type Error = russh::Error;
+
+            async fn auth_password(
+                &mut self,
+                user: &str,
+                password: &str,
+            ) -> Result<russh::server::Auth, Self::Error> {
+                assert_eq!((user, password), ("admin", "secret"));
+                Ok(russh::server::Auth::Accept)
+            }
+
+            async fn channel_open_session(
+                &mut self,
+                _channel: russh::Channel<russh::server::Msg>,
+                reply: russh::server::ChannelOpenHandle,
+                _session: &mut russh::server::Session,
+            ) -> Result<(), Self::Error> {
+                reply.accept().await;
+                Ok(())
+            }
+
+            async fn exec_request(
+                &mut self,
+                channel: russh::ChannelId,
+                data: &[u8],
+                session: &mut russh::server::Session,
+            ) -> Result<(), Self::Error> {
+                let command = String::from_utf8(data.to_vec()).unwrap();
+                self.received.lock().unwrap().push(command.clone());
+                session.channel_success(channel)?;
+                session.data(channel, format!("output for {command}"))?;
+                session.exit_status_request(channel, if command == "fail" { 1 } else { 0 })?;
+                session.eof(channel)?;
+                session.close(channel)?;
+                Ok(())
+            }
+        }
+
+        for (trusted, fail) in [(true, false), (true, true), (false, false)] {
+            runtime().block_on(async {
+                // A deterministic key for this loopback-only test server.
+                let key = russh::keys::PrivateKey::from(
+                    russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&[42; 32]),
+                );
+                let fingerprint = host_fingerprint(key.public_key()).unwrap();
+                let config = Arc::new(russh::server::Config {
+                    keys: vec![key],
+                    auth_rejection_time: Duration::ZERO,
+                    ..Default::default()
+                });
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let port = listener.local_addr().unwrap().port();
+                let received = Arc::new(Mutex::new(Vec::new()));
+                let handler = ScriptServer { received: received.clone() };
+                let server = tokio::spawn(async move {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    if let Ok(session) = russh::server::run_stream(config, stream, handler).await {
+                        let _ = session.await;
+                    }
+                });
+                let mut spec = spec();
+                spec.port = port;
+                spec.trusted_fingerprint = trusted.then_some(fingerprint);
+                let commands = vec!["first".into(), if fail { "fail".into() } else { "second".into() }, "third".into()];
+                let (events, receiver) = mpsc::channel();
+                let result = tokio::time::timeout(Duration::from_secs(5), run_script(&spec, "Test", &commands, &events)).await.unwrap();
+                if !trusted {
+                    assert!(matches!(result, Err(ConnectError::UnknownHostKey { .. })));
+                    assert!(received.lock().unwrap().is_empty());
+                } else if fail {
+                    assert!(matches!(result, Err(ConnectError::Message { message, .. }) if message.contains("command 2")));
+                    assert_eq!(*received.lock().unwrap(), ["first", "fail"]);
+                } else {
+                    result.unwrap();
+                    assert_eq!(*received.lock().unwrap(), commands);
+                }
+                let events = receiver.try_iter().collect::<Vec<_>>();
+                assert_eq!(events.iter().any(|event| matches!(event, WorkerEvent::Complete { .. })), trusted && !fail);
+                if trusted {
+                    assert!(events.iter().any(|event| matches!(event, WorkerEvent::Log { text, direction: Direction::Received, .. } if text == "output for first")));
+                }
+                server.abort();
+            });
+        }
+    }
+
+    #[test]
+    fn ecdh_precedes_group_exchange_without_enabling_sha1() {
+        let preferred = ssh_preferences();
+        let position = |name| preferred.kex.iter().position(|n| *n == name).unwrap();
+        assert!(position(russh::kex::CURVE25519) < position(russh::kex::ECDH_SHA2_NISTP256));
+        for name in [
+            russh::kex::ECDH_SHA2_NISTP256,
+            russh::kex::ECDH_SHA2_NISTP384,
+            russh::kex::ECDH_SHA2_NISTP521,
+        ] {
+            assert!(position(name) < position(russh::kex::DH_GEX_SHA256));
+        }
+        assert!(!preferred.kex.contains(&russh::kex::DH_G1_SHA1));
+        assert!(!preferred.kex.contains(&russh::kex::DH_G14_SHA1));
+        assert!(!preferred.kex.contains(&russh::kex::DH_GEX_SHA1));
+        for name in russh::Preferred::default().kex.iter() {
+            assert!(preferred.kex.contains(name));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires CRESTRON_SSH_PROBE_HOST; performs a handshake only, no authentication"]
+    fn live_ssh_handshake() {
+        let mut spec = spec();
+        spec.host = std::env::var("CRESTRON_SSH_PROBE_HOST").expect("set probe host");
+        spec.credentials = Credentials::default();
+        spec.trusted_fingerprint = std::env::var("CRESTRON_SSH_PROBE_FINGERPRINT").ok();
+        runtime().block_on(async {
+            let seen = SeenFingerprint::default();
+            let stream = tcp_connect(&spec).unwrap();
+            match open_session(&spec, stream, SSH_TIMEOUT, &seen).await {
+                Ok(session) => {
+                    println!("Handshake completed; fingerprint: {:?}", seen.get());
+                    disconnect(session).await;
+                }
+                Err(ConnectError::UnknownHostKey { fingerprint, .. })
+                    if spec.trusted_fingerprint.is_none() =>
+                {
+                    println!("Reached host-key verification: {fingerprint}");
+                }
+                Err(error) => panic!("Handshake failed: {error:?}"),
+            }
+        });
     }
 
     #[test]

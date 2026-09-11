@@ -7,7 +7,9 @@ mod cli;
 mod device_log;
 mod discovery;
 mod firmware;
+mod ip_table;
 mod model;
+mod scripts;
 mod ssh;
 mod storage;
 

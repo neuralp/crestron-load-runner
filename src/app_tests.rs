@@ -28,6 +28,633 @@ fn input() -> egui::RawInput {
 }
 
 #[test]
+fn scripts_can_be_previewed_and_run_for_selected_or_one_device() {
+    for single in [false, true] {
+        let mut app = app();
+        app.script_editor.scripts.push(crate::scripts::Script {
+            name: "Inspect".into(),
+            body: "hostname\nver".into(),
+        });
+        for (host, selected) in [("192.0.2.1", false), ("192.0.2.2", true)] {
+            let mut device = Device::from_address(&AddressEntry {
+                host: host.into(),
+                ..Default::default()
+            });
+            device.selected = selected;
+            app.devices.push(device);
+        }
+        let id = app.devices[0].id.clone();
+        let other = app.devices[1].id.clone();
+        let ctx = egui::Context::default();
+        let click = |app: &mut LoadRunnerApp, label| {
+            for _ in 0..2 {
+                ctx.run_ui(input(), |ui| app.show(ui))
+                    .drop_without_applying_deltas();
+            }
+            let output = ctx.run_ui(input(), |ui| app.show(ui));
+            let pos = output
+                .shapes
+                .iter()
+                .find_map(|shape| {
+                    if let egui::Shape::Text(text) = &shape.shape
+                        && text.galley.text() == label
+                    {
+                        Some(text.pos + text.galley.size() * 0.5)
+                    } else {
+                        None
+                    }
+                })
+                .expect(label);
+            output.drop_without_applying_deltas();
+            for pressed in [true, false] {
+                let mut raw = input();
+                raw.events.push(egui::Event::PointerMoved(pos));
+                raw.events.push(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                });
+                ctx.run_ui(raw, |ui| app.show(ui))
+                    .drop_without_applying_deltas();
+            }
+        };
+        if single {
+            app.open_script_run(Some(&id));
+        } else {
+            click(&mut app, "Run Script");
+        }
+        assert!(app.script_run.is_some());
+        assert!(!app.worker_pool.has_pending());
+        // Changing target checkboxes while the preview is open cannot retarget it.
+        app.devices[0].selected = true;
+        app.devices[1].selected = false;
+        click(&mut app, "Run on these devices");
+        assert!(app.script_run.is_none());
+        assert_eq!(app.worker_pool.is_busy(&id), single);
+        assert_eq!(app.worker_pool.is_busy(&other), !single);
+        assert!(app.devices[0].selected);
+        assert!(!app.devices[1].selected);
+    }
+}
+
+#[test]
+fn device_menu_contains_both_editors_and_unsaved_scripts_block_quit() {
+    let mut app = app();
+    let ctx = egui::Context::default();
+    let click = |app: &mut LoadRunnerApp, label| {
+        for _ in 0..2 {
+            ctx.run_ui(input(), |ui| app.show(ui))
+                .drop_without_applying_deltas();
+        }
+        let output = ctx.run_ui(input(), |ui| app.show(ui));
+        let pos = output
+            .shapes
+            .iter()
+            .find_map(|shape| {
+                if let egui::Shape::Text(text) = &shape.shape
+                    && text.galley.text() == label
+                {
+                    Some(text.pos + text.galley.size() * 0.5)
+                } else {
+                    None
+                }
+            })
+            .expect(label);
+        output.drop_without_applying_deltas();
+        for pressed in [true, false] {
+            let mut raw = input();
+            raw.events.push(egui::Event::PointerMoved(pos));
+            raw.events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+            ctx.run_ui(raw, |ui| app.show(ui))
+                .drop_without_applying_deltas();
+        }
+    };
+    click(&mut app, "File");
+    let output = ctx.run_ui(input(), |ui| app.show(ui));
+    assert!(!output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if matches!(text.galley.text(), "Firmware Editor…" | "Script Editor…"))));
+    output.drop_without_applying_deltas();
+    click(&mut app, "Devices");
+    let output = ctx.run_ui(input(), |ui| app.show(ui));
+    assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == "Firmware Editor…")));
+    output.drop_without_applying_deltas();
+    click(&mut app, "Script Editor…");
+    assert!(app.script_editor.open);
+    click(&mut app, "New script");
+    assert!(app.script_editor.is_dirty());
+    app.request_action(PendingAction::Quit, &ctx);
+    assert!(!app.close_approved);
+    assert!(app.notice.as_deref().unwrap().contains("Save scripts"));
+}
+
+#[test]
+fn running_program_info_is_visible_only_for_processors() {
+    let mut app = app();
+    let mut device = Device::from_address(&AddressEntry {
+        host: "192.0.2.1".into(),
+        ..Default::default()
+    });
+    device.details = Some(crate::model::DeviceDetails {
+        programs: "Source Archive: processor-only.zip".into(),
+        ..Default::default()
+    });
+    app.selected_id = Some(device.id.clone());
+    app.devices.push(device);
+    let ctx = egui::Context::default();
+    // Reuse the device and UI context to catch stale display after a type change.
+    for kind in [
+        DeviceKind::Processor,
+        DeviceKind::Touchpanel,
+        DeviceKind::Unknown,
+        DeviceKind::Processor,
+    ] {
+        app.devices[0].kind = kind;
+        for _ in 0..2 {
+            ctx.run_ui(input(), |ui| app.details_panel(ui))
+                .drop_without_applying_deltas();
+        }
+        let output = ctx.run_ui(input(), |ui| app.details_panel(ui));
+        let has_text = |label| {
+            output.shapes.iter().any(|shape| {
+            matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == label)
+        })
+        };
+        assert_eq!(has_text("Running programs"), kind == DeviceKind::Processor);
+        assert_eq!(
+            has_text("processor-only.zip"),
+            kind == DeviceKind::Processor
+        );
+        assert!(has_text("Identity"));
+        assert!(has_text("Network"));
+        assert!(has_text("IP table"));
+        output.drop_without_applying_deltas();
+    }
+}
+
+#[test]
+fn device_footer_buttons_are_centered_and_add_device_opens_the_dialog() {
+    for width in [300.0, 500.0] {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        let raw_input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width, 48.0),
+            )),
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            ctx.run_ui(raw_input(), |ui| app.device_actions(ui))
+                .drop_without_applying_deltas();
+        }
+        let output = ctx.run_ui(raw_input(), |ui| app.device_actions(ui));
+        let button_rect = |label| {
+            let center = output
+                .shapes
+                .iter()
+                .find_map(|shape| {
+                    if let egui::Shape::Text(text) = &shape.shape
+                        && text.galley.text() == label
+                    {
+                        Some(text.pos + text.galley.size() * 0.5)
+                    } else {
+                        None
+                    }
+                })
+                .expect(label);
+            output
+                .shapes
+                .iter()
+                .filter_map(|shape| {
+                    if let egui::Shape::Rect(rect) = &shape.shape
+                        && rect.rect.contains(center)
+                    {
+                        Some(rect.rect)
+                    } else {
+                        None
+                    }
+                })
+                .min_by(|a, b| a.area().total_cmp(&b.area()))
+                .expect("button frame")
+        };
+        let discover = button_rect("Discover Devices");
+        let add = button_rect("Add Device");
+        let clear = button_rect("Clear Devices");
+        assert!(discover.right() < add.left() && add.right() < clear.left());
+        let group = discover.union(add).union(clear);
+        assert!(
+            (group.center().x - width / 2.0).abs() < 2.0,
+            "{width}: {group:?}"
+        );
+        assert!((group.center().y - 24.0).abs() < 2.0, "{group:?}");
+        assert!(group.left() >= 0.0 && group.right() <= width);
+        let pos = add.center();
+        output.drop_without_applying_deltas();
+        for pressed in [true, false] {
+            let mut raw = raw_input();
+            raw.events.push(egui::Event::PointerMoved(pos));
+            raw.events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+            ctx.run_ui(raw, |ui| app.device_actions(ui))
+                .drop_without_applying_deltas();
+        }
+        assert!(app.add_device_open);
+        let output = ctx.run_ui(input(), |ui| app.action_bar(ui));
+        assert!(!output.shapes.iter().any(|shape| {
+            matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == "Add Device")
+        }));
+        output.drop_without_applying_deltas();
+    }
+}
+
+#[test]
+fn program_info_parses_requested_fields_without_truncating_values() {
+    let contents = "Compile Date/Time:       9/10/2026 9:48 PM\r\nSource Env. Version:     SIMPL Windows v4.3200.02\r\nCompiler Version:        3.03\r\nRack Type:               RMC3\r\nSource Archive:          rmc3_test_archive.zip\r\nTimes (in milliseconds):\r\n  LoadSymbols:              14851\r\nMemory Usage\r\n\tTotal Physical Memory: 171016192 Bytes";
+    assert_eq!(
+        parse_program_info(contents),
+        [
+            Some("9/10/2026 9:48 PM"),
+            Some("SIMPL Windows v4.3200.02"),
+            Some("RMC3"),
+            Some("rmc3_test_archive.zip"),
+        ]
+    );
+    assert_eq!(
+        parse_program_info(
+            "  Source Archive: C:\\Projects\\room.zip\nRack Type: RMC3\nSource Env. Version: "
+        ),
+        [None, Some(""), Some("RMC3"), Some("C:\\Projects\\room.zip")]
+    );
+    assert_eq!(parse_program_info("No program loaded"), [None; 4]);
+    assert_eq!(parse_program_info(""), [None; 4]);
+}
+
+#[test]
+fn program_info_shows_summary_with_raw_response_collapsed_and_expandable() {
+    let contents = "Compile Date/Time: 9/10/2026 9:48 PM\nSource Env. Version: SIMPL Windows v4.3200.02\nRack Type: RMC3\nSource Archive: rmc3_test_archive.zip\nCompiler Version: 3.03";
+    let ctx = egui::Context::default();
+    let render = |ui: &mut egui::Ui| {
+        ui.style_mut().animation_time = 0.0;
+        program_info_section(ui, "test", contents);
+    };
+    for _ in 0..2 {
+        ctx.run_ui(input(), render).drop_without_applying_deltas();
+    }
+    let output = ctx.run_ui(input(), render);
+    let labels: Vec<_> = output
+        .shapes
+        .iter()
+        .filter_map(|shape| {
+            if let egui::Shape::Text(text) = &shape.shape {
+                Some(text.galley.text())
+            } else {
+                None
+            }
+        })
+        .collect();
+    for field in PROGRAM_INFO_FIELDS {
+        assert!(labels.contains(&format!("{field}:").as_str()));
+    }
+    for value in parse_program_info(contents).into_iter().flatten() {
+        assert!(labels.contains(&value));
+    }
+    assert!(!labels.iter().any(|text| text.contains("Compiler Version")));
+    let toggle = output
+        .shapes
+        .iter()
+        .find_map(|shape| {
+            if let egui::Shape::Text(text) = &shape.shape
+                && text.galley.text() == "Raw response"
+            {
+                Some(text.pos + text.galley.size() * 0.5)
+            } else {
+                None
+            }
+        })
+        .expect("raw response toggle rendered");
+    output.drop_without_applying_deltas();
+    for pressed in [true, false] {
+        let mut raw = input();
+        raw.events.push(egui::Event::PointerMoved(toggle));
+        raw.events.push(egui::Event::PointerButton {
+            pos: toggle,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+        ctx.run_ui(raw, render).drop_without_applying_deltas();
+    }
+    let output = ctx.run_ui(input(), render);
+    assert!(output.shapes.iter().any(|shape| {
+        matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == contents)
+    }));
+    output.drop_without_applying_deltas();
+}
+
+#[test]
+fn details_assignment_sections_start_collapsed_with_slot_one_summaries() {
+    for assigned in [false, true] {
+        let ctx = egui::Context::default();
+        let mut device = Device::from_address(&AddressEntry {
+            host: "192.0.2.1".into(),
+            kind: DeviceKind::Processor,
+            ..Default::default()
+        });
+        if assigned {
+            device.program_slots[0] = Some(PathBuf::from("room.lpz"));
+            device.config_slots[0] = Some(PathBuf::from("room.json"));
+        }
+        device.program_slots[1] = Some(PathBuf::from("hidden.lpz"));
+        for _ in 0..2 {
+            ctx.run_ui(input(), |ui| {
+                assert!(!processor_assignments(ui, &mut device));
+            })
+            .drop_without_applying_deltas();
+        }
+        let output = ctx.run_ui(input(), |ui| {
+            assert!(!processor_assignments(ui, &mut device));
+        });
+        let labels: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| {
+                if let egui::Shape::Text(text) = &shape.shape {
+                    Some(text.galley.text())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(labels.contains(&"Program slot assignments"));
+        assert!(labels.contains(&"Configuration slot assignments"));
+        if assigned {
+            assert!(labels.contains(&"Slot 1: room.lpz"));
+            assert!(labels.contains(&"Slot 1: room.json"));
+        } else {
+            assert_eq!(
+                labels
+                    .iter()
+                    .filter(|text| **text == "Slot 1: Unassigned")
+                    .count(),
+                2
+            );
+        }
+        assert!(!labels.contains(&"Slot 2"));
+        assert!(!labels.contains(&"hidden.lpz"));
+        assert!(!labels.contains(&"Choose…"));
+        output.drop_without_applying_deltas();
+    }
+}
+
+#[test]
+fn details_text_can_be_selected_with_mouse_and_copied_but_not_edited() {
+    for ip_table in [false, true] {
+        let ctx = egui::Context::default();
+        let contents = "Read only device output";
+        let render = |ui: &mut egui::Ui| {
+            if ip_table {
+                crate::ip_table::show(ui, "test", contents);
+            } else {
+                detail_section(ui, "Identity", contents, true);
+            }
+        };
+        for _ in 0..2 {
+            ctx.run_ui(input(), render).drop_without_applying_deltas();
+        }
+        let output = ctx.run_ui(input(), render);
+        assert!(
+            output.shapes.iter().any(|shape| {
+                matches!(&shape.shape, egui::Shape::Rect(rect)
+                if rect.stroke == egui::Stroke::new(1.0, egui::Color32::BLACK))
+            }),
+            "detail text retains its black border"
+        );
+        let (start, end) = output
+            .shapes
+            .iter()
+            .find_map(|shape| {
+                if let egui::Shape::Text(text) = &shape.shape
+                    && text.galley.text() == contents
+                {
+                    let start = text.pos + egui::vec2(0.0, text.galley.size().y * 0.5);
+                    Some((start, start + egui::vec2(text.galley.size().x, 0.0)))
+                } else {
+                    None
+                }
+            })
+            .expect("detail text rendered");
+        output.drop_without_applying_deltas();
+        for (pos, pressed) in [(start, true), (end, false)] {
+            if !pressed {
+                let mut drag = input();
+                drag.events.push(egui::Event::PointerMoved(end));
+                ctx.run_ui(drag, render).drop_without_applying_deltas();
+            }
+            let mut raw = input();
+            raw.events.push(egui::Event::PointerMoved(pos));
+            raw.events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+            ctx.run_ui(raw, render).drop_without_applying_deltas();
+        }
+        let mut raw = input();
+        raw.events.push(egui::Event::Copy);
+        let output = ctx.run_ui(raw, render);
+        assert!(
+            output.platform_output.commands.iter().any(|command| {
+                matches!(command, egui::OutputCommand::CopyText(text) if text == contents)
+            }),
+            "mouse selection must be copyable"
+        );
+        output.drop_without_applying_deltas();
+        let mut raw = input();
+        raw.events.push(egui::Event::Text("replacement".into()));
+        let output = ctx.run_ui(raw, render);
+        assert!(output.shapes.iter().any(|shape| {
+            matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == contents)
+        }));
+        output.drop_without_applying_deltas();
+    }
+}
+
+#[test]
+fn double_clicking_a_device_card_refreshes_only_that_device() {
+    for source in [DeviceSource::AddressBook, DeviceSource::Discovered] {
+        for background in [false, true] {
+            let mut app = app();
+            let mut device = Device::from_address(&AddressEntry {
+                host: "192.0.2.1".into(),
+                kind: DeviceKind::Processor,
+                ..Default::default()
+            });
+            device.source = source;
+            let id = device.id.clone();
+            app.devices.push(device);
+            let mut other = Device::from_address(&AddressEntry {
+                host: "192.0.2.2".into(),
+                ..Default::default()
+            });
+            other.selected = true;
+            let other_id = other.id.clone();
+            app.devices.push(other);
+            let ctx = egui::Context::default();
+            ctx.run_ui(input(), |ui| app.device_card(ui, &id))
+                .drop_without_applying_deltas();
+            let output = ctx.run_ui(input(), |ui| app.device_card(ui, &id));
+            let mut pos = output
+                .shapes
+                .iter()
+                .find_map(|shape| {
+                    if let egui::Shape::Text(text) = &shape.shape
+                        && text.galley.text() == "192.0.2.1"
+                    {
+                        Some(text.pos + text.galley.size() * 0.5)
+                    } else {
+                        None
+                    }
+                })
+                .expect("device label rendered");
+            if background {
+                pos += egui::vec2(300.0, 20.0);
+            }
+            output.drop_without_applying_deltas();
+            for click in 0..2 {
+                for pressed in [true, false] {
+                    let mut raw = input();
+                    raw.events.push(egui::Event::PointerMoved(pos));
+                    raw.events.push(egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                    ctx.run_ui(raw, |ui| app.device_card(ui, &id))
+                        .drop_without_applying_deltas();
+                }
+                assert_eq!(app.selected_id.as_deref(), Some(id.as_str()));
+                assert_eq!(app.worker_pool.is_busy(&id), click == 1);
+            }
+            assert!(!app.worker_pool.is_busy(&other_id));
+            assert!(!app.devices[0].selected);
+            assert!(app.devices[1].selected);
+            assert!(!app.address_book_dirty);
+            assert!(app.notice.is_none());
+        }
+    }
+}
+
+#[test]
+fn device_context_loads_only_the_clicked_device_and_preserves_targets() {
+    for (kind, label) in [
+        (DeviceKind::Processor, "Load Assigned Program"),
+        (DeviceKind::Processor, "Load Assigned Config"),
+        (DeviceKind::Touchpanel, "Load Assigned Touchpanel"),
+    ] {
+        let dir = TestDir::new();
+        let config = dir.path().join("room.json");
+        std::fs::write(&config, b"{}").unwrap();
+        let mut app = app();
+        for (host, selected) in [("192.0.2.1", false), ("192.0.2.2", true)] {
+            let mut device = Device::from_address(&AddressEntry {
+                host: host.into(),
+                kind,
+                ..Default::default()
+            });
+            device.selected = selected;
+            // Exercise assignments beyond slot 1 as well as the project.
+            device.program_slots[3] = Some(dir.path().join("room.lpz"));
+            device.config_slots[3] = Some(config.clone());
+            device.touchpanel_project = Some(dir.path().join("room.vtz"));
+            app.devices.push(device);
+        }
+        let id = app.devices[0].id.clone();
+        let other = app.devices[1].id.clone();
+        let ctx = egui::Context::default();
+        ctx.run_ui(input(), |ui| app.device_card(ui, &id))
+            .drop_without_applying_deltas();
+        let output = ctx.run_ui(input(), |ui| app.device_card(ui, &id));
+        let host = output
+            .shapes
+            .iter()
+            .find_map(|clipped| {
+                if let egui::Shape::Text(text) = &clipped.shape
+                    && text.galley.text() == "192.0.2.1"
+                {
+                    Some(text.pos + text.galley.size() * 0.5)
+                } else {
+                    None
+                }
+            })
+            .expect("device host rendered");
+        // Click the card background, away from selectable labels and controls.
+        let host = host + egui::vec2(300.0, 20.0);
+        output.drop_without_applying_deltas();
+        for pressed in [true, false] {
+            let mut raw = input();
+            raw.events.push(egui::Event::PointerMoved(host));
+            raw.events.push(egui::Event::PointerButton {
+                pos: host,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+            ctx.run_ui(raw, |ui| app.device_card(ui, &id))
+                .drop_without_applying_deltas();
+        }
+        ctx.run_ui(input(), |ui| app.device_card(ui, &id))
+            .drop_without_applying_deltas();
+        let output = ctx.run_ui(input(), |ui| app.device_card(ui, &id));
+        let mut button = None;
+        for clipped in &output.shapes {
+            if let egui::Shape::Text(text) = &clipped.shape {
+                let text_label = text.galley.text();
+                if text_label == label {
+                    button = Some(text.pos + text.galley.size() * 0.5);
+                }
+                if kind == DeviceKind::Touchpanel {
+                    assert_ne!(text_label, "Load Assigned Program");
+                    assert_ne!(text_label, "Load Assigned Config");
+                } else {
+                    assert_ne!(text_label, "Load Assigned Touchpanel");
+                }
+            }
+        }
+        let button = button.expect(label);
+        output.drop_without_applying_deltas();
+        for pressed in [true, false] {
+            let mut raw = input();
+            raw.events.push(egui::Event::PointerMoved(button));
+            raw.events.push(egui::Event::PointerButton {
+                pos: button,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+            ctx.run_ui(raw, |ui| app.device_card(ui, &id))
+                .drop_without_applying_deltas();
+        }
+        assert!(app.notice.is_none(), "{label}: {:?}", app.notice);
+        assert!(app.worker_pool.is_busy(&id), "{label}");
+        assert!(!app.worker_pool.is_busy(&other), "{label}");
+        assert!(!app.devices[0].selected);
+        assert!(app.devices[1].selected);
+        assert!(!app.address_book_dirty);
+    }
+}
+
+#[test]
 fn window_close_is_guarded_even_when_minimized() {
     let mut app = app();
     app.address_book_dirty = true;

@@ -58,7 +58,7 @@ Preferences live in `preferences.json` in the platform user configuration direct
 
 ## Firmware library
 
-Open **File → Firmware Editor…** and select a discovered model or enter a model manually, then choose **Choose firmware file…** to assign or replace its firmware. Models are remembered across restarts and are not removed by **Clear Devices**. The editor does not infer models from filenames.
+Open **Devices → Firmware Editor…** and select a discovered model or enter a model manually, then choose **Choose firmware file…** to assign or replace its firmware. Models are remembered across restarts and are not removed by **Clear Devices**. The editor does not infer models from filenames.
 
 Files are copied and SHA-256 verified in a background worker. The catalog is saved automatically, independently of address-book edits, with each model's original filename, relative stored filename, byte count, and SHA-256 checksum. You can move or delete the original source file after a successful import. **Remove assignment** also deletes the stored copy; content shared by another model is retained until its last assignment is removed.
 
@@ -71,18 +71,30 @@ Storage is a `firmware` subdirectory beside the `preferences.json` file, so `--c
 
 This directory contains `catalog.json` and checksum-named `.firmware` copies. Their contents are unchanged; the original filenames are recorded in the JSON. Back up the entire directory, not just the catalog. The editor displays its storage location and reports missing files or import/save errors. Exiting is blocked until an active import finishes.
 
+## Scripts
+
+Open **Devices → Script Editor…**, choose **New script**, give it a unique name, and enter Crestron console commands, one per line. Blank lines and full-line `#` comments are ignored. **Save scripts** saves the whole library, including edits, renames, and deletions; **Discard changes** restores the saved library. Closing the editor keeps drafts in memory, and quitting requires saving or discarding them. Only saved scripts can run.
+
+Select address-book devices with their **Target** checkboxes, then click **Run Script** after **Load Firmware** in the top bar. Choose a saved script, fill in any variables, review the rendered commands for every target, and click **Run on these devices**. Alternatively, right-click a device and choose **Run Script…** to target only that device, regardless of the checkboxes. The preview snapshots both the targets and script; later selection or editor changes do not alter that run.
+
+Templates use `{{variable}}` substitutions. Built-ins are `{{device.name}}` (display name, falling back to the host), `{{device.host}}`, `{{device.port}}`, `{{device.model}}`, `{{device.mac}}`, `{{device.firmware}}`, and `{{device.kind}}`. Other names, such as `{{room}}`, become run-time input fields shared across that run's targets. The `device.` prefix is reserved; misspelled built-ins are rejected. Missing or empty values and control characters block execution. Values are inserted literally, without quoting or recursive expansion: review the preview, especially spaces or command separators. There are no loops, conditionals, or local shell execution.
+
+Scripts run sequentially on each device over one authenticated SSH connection, using a separate exec channel per command. Different devices use their existing independent worker queues. Interactive prompts and persistent shell state between commands are not supported. Each command has a 20-second timeout. An SSH error, timeout, or nonzero remote exit status stops the remaining commands on that device, without rolling back earlier commands or stopping other devices. Some Crestron firmware reports command errors only as text without a failing exit status; inspect the device log. A timeout does not prove the remote command stopped. Host-key verification remains required; after trusting a new key, review and run the script again.
+
+The library is `scripts.json` beside `preferences.json`, so `--config-dir` also isolates scripts. Saves use a temporary file, replacement, and read-back verification. Unreadable libraries are not overwritten, and address-book saves cannot overwrite the script library. Scripts and command logs are plain text: do not put passwords or other secrets in them. Run-time variable values are not saved in the library, but rendered commands are logged.
+
 ## Device commands
 
 The application uses Crestron console commands over SSH:
 
-- Details: `hostname`, `ver`, `ipconfig`, `proginf`, `ipt -t`, `REPORTCRESNET`
+- Details: `hostname`, `ver`, `ipconfig`, `proginfo`, `ipt -t`, `REPORTCRESNET`
 - Processor load: SFTP upload into `/program<NN>` for the target slot, with the program's `.sig` file uploaded alongside it as `.zig`, followed by `progload -p:<slot>`
 - Configuration load: SFTP upload into `/user`; no console command is issued
 - Touchpanel load: SFTP upload into the panel's `/display` directory followed by `projectload`
 
 Command availability and output vary by Crestron firmware generation. Verify load behavior on a non-production device before deploying broadly.
 
-The SFTP namespace is not the one the SSH console presents. A program the console addresses as `\SIMPLpp01` is written over SFTP to `/program01`, so these paths are SFTP paths and cannot be read off a console directory listing.
+The SFTP namespace is not the one the SSH console presents. A program the console addresses as `\SIMPLpp01` is written over SFTP to `/program01`, so these paths are SFTP paths and cannot be read off a console directory listing.
 
 ## Device log
 
@@ -97,6 +109,10 @@ The log holds 2000 entries, dropping the oldest and reporting how many were drop
 SSH and SFTP use [`russh`](https://crates.io/crates/russh) with the `ring` backend: a pure-Rust client that needs no OpenSSL, Perl, or NASM to build. This matters for Crestron hardware. 4-Series devices advertise `ssh-rsa` alongside `ecdsa-sha2-nistp256` but some of them only complete a handshake with the ECDSA key, and the previous libssh2 client fell back to Windows CNG, whose host-key support is RSA-only. It therefore negotiated the one algorithm such a device could not honor, the device closed the connection, and the failure surfaced as `Unable to exchange encryption keys`.
 
 Because the negotiated host key depends on which algorithms the client supports, a fingerprint trusted by an older build of this app can stop matching even though the device is unchanged — a device commonly holds several host keys. That is reported as a changed host key and the connection is refused; use **Forget SSH host key** on the device's right-click menu and trust the new fingerprint when prompted.
+
+The client explicitly enables NIST ECDH key exchange ahead of DH group exchange, while retaining the modern default algorithms first. Russh 0.63 supports NIST ECDH but does not enable it by default; the default group-exchange path failed against an RMC3 with `Key exchange init failed`, while ECDH completed successfully. This compatibility setting does not enable SHA-1 key exchange or change host-key verification.
+
+For a handshake-only diagnostic (no authentication or device commands), run `CRESTRON_SSH_PROBE_HOST=<host> cargo test live_ssh_handshake -- --ignored --nocapture`. With no trusted fingerprint it stops at host-key verification and prints the offered fingerprint. Set `CRESTRON_SSH_PROBE_FINGERPRINT` to a verified fingerprint to exercise the complete handshake. The probe does not save trust or change the address book.
 
 ## Security
 

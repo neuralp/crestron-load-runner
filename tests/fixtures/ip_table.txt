@@ -1,0 +1,11 @@
+TableStart:[ IP Table for program 1 ]
+CIP_ID  |Type    |Status    |DevID   |Port   |IP Address/SiteName       |Model Name          |Description         |RoomId
+-------------------------------------------------------------------------------------------------------------------------
+     3  |Gway    |OFFLINE   |        |41794  |127.000.000.001  | DM-TX-201-C  | DM-TX-201-C  | Not Specified
+     4  |Gway    |OFFLINE   |        |41794  |127.000.000.001  | DM-TX-201-C  | DM-TX-201-C  | Not Specified
+     7  |Gway    |OFFLINE   |        |41794  |127.000.000.001  | RoomView Connected Display  | RoomView Connected Display (room01_display02)  | Not Specified
+     8  |Gway    |OFFLINE   |        |41794  |127.000.000.001  | RoomView Connected Display  | RoomView Connected Display (room01_display03)  | Not Specified
+    11  |Gway    |OFFLINE   |        |41794  |127.000.000.001  | TS-770  | TS-770  | Not Specified
+    81  |Client  |WAITING   |        |   23  |140.104.108.231  | TCP/IP Client  | turtle_av_telnet  | Not Specified
+     5  |Gway    |OFFLINE   |        |41794  |127.000.000.001  | CEN-IO-IR-104  | CEN-IO-IR-104  | Not Specified
+     6  |Gway    |OFFLINE   |        |41794  |127.000.000.001  | CEN-IO-COM-102  | CEN-IO-COM-102  | Not Specified

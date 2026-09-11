@@ -204,6 +204,8 @@ pub fn validate_portable_path(path: &Path) -> io::Result<()> {
     let preferences =
         preferences_path().ok_or_else(|| io::Error::other("no configuration directory"))?;
     ensure_separate_path(path, &preferences)?;
+    ensure_separate_path(path, &preferences.with_file_name("scripts.json"))?;
+    ensure_separate_path(path, &preferences.with_file_name("scripts.json.tmp"))?;
     let firmware = firmware_dir().ok_or_else(|| io::Error::other("no configuration directory"))?;
     if resolved_path(path)?.starts_with(resolved_path(&firmware)?) {
         return Err(io::Error::other(
@@ -216,7 +218,7 @@ pub fn validate_portable_path(path: &Path) -> io::Result<()> {
 fn ensure_separate_path(path: &Path, internal: &Path) -> io::Result<()> {
     if resolved_path(path)? == resolved_path(internal)? {
         return Err(io::Error::other(
-            "choose a JSON file outside the application preferences file",
+            "choose a JSON file separate from application-owned preferences and script files",
         ));
     }
     Ok(())
@@ -272,6 +274,13 @@ mod tests {
     use super::*;
     use crate::model::DeviceKind;
     use crate::test_support::TestDir;
+
+    #[test]
+    fn portable_books_cannot_overwrite_script_storage() {
+        let preferences = preferences_path().unwrap();
+        assert!(validate_portable_path(&preferences.with_file_name("scripts.json")).is_err());
+        assert!(validate_portable_path(&preferences.with_file_name("scripts.json.tmp")).is_err());
+    }
 
     #[test]
     fn stored_files_sit_together_in_the_configuration_directory() {
