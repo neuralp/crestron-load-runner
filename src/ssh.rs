@@ -27,6 +27,31 @@ use crate::{
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(6);
 const SSH_TIMEOUT: Duration = Duration::from_secs(20);
 const LOAD_TIMEOUT: Duration = Duration::from_secs(300);
+/// How a PUF update is applied and how its outcome is asked for.
+const PUF_COMMAND: &str = "puf";
+const PUF_RESULTS_COMMAND: &str = "puf -results";
+
+/// How long the PUF sequence waits at each step. Named rather than inlined so
+/// that a test can drive the same code without waiting out a real restart.
+#[derive(Clone, Copy, Debug)]
+struct Timings {
+    /// Between attempts to reach the restarting device.
+    poll: Duration,
+    /// How long the device has altogether to come back.
+    limit: Duration,
+    /// Between attempts to get an answer out of a console that has just booted.
+    settle: Duration,
+    attempts: usize,
+}
+
+impl Timings {
+    const DEVICE: Self = Self {
+        poll: Duration::from_secs(10),
+        limit: Duration::from_secs(900),
+        settle: Duration::from_secs(5),
+        attempts: 6,
+    };
+}
 const CHUNK: usize = 64 * 1024;
 
 #[derive(Clone, Debug)]
@@ -87,6 +112,12 @@ pub enum WorkerEvent {
         id: String,
         sent: u64,
         total: u64,
+    },
+    /// Where a long operation has got to, when there are no bytes to count.
+    Status {
+        id: String,
+        message: String,
+        progress: Option<(u64, u64)>,
     },
     Complete {
         id: String,
@@ -638,7 +669,7 @@ async fn upload_staged(
         .ok_or_else(|| message(spec, "The selected file has an unsafe or missing file name"))?;
     let (remote_path, command) = transfer(&file_name);
     let transfer = Transfer::new(local_path, remote_path, file_name);
-    upload_files(spec, vec![transfer], command, events).await
+    upload_files(spec, vec![transfer], Apply::from(command), events).await
 }
 
 /// A program is staged with its signature: the processor reads the signature
@@ -671,7 +702,13 @@ async fn upload_program(
             remote_name,
         ));
     }
-    upload_files(spec, transfers, Some(format!("progload -p:{slot}")), events).await
+    upload_files(
+        spec,
+        transfers,
+        Apply::Command(format!("progload -p:{slot}")),
+        events,
+    )
+    .await
 }
 
 /// Slot N runs the program staged in its own directory. Note that the SFTP
@@ -709,31 +746,201 @@ async fn upload_firmware(
     remote_name: &str,
     events: &Sender<WorkerEvent>,
 ) -> WorkerResult<()> {
-    let Some((remote_path, command)) = firmware_transfer(remote_name) else {
+    let Some((remote_path, apply)) = firmware_transfer(remote_name) else {
         return Err(message(
             spec,
             "The assigned firmware has an unsafe or missing file name",
         ));
     };
     let transfer = Transfer::new(local_path, remote_path, remote_name.to_owned());
-    upload_files(spec, vec![transfer], Some(command), events).await
+    upload_files(spec, vec![transfer], apply, events).await
 }
 
-fn firmware_transfer(remote_name: &str) -> Option<(String, String)> {
+/// What to do once the firmware is staged. Only the file name decides: a zip
+/// update is pushed in place, and everything else is a PUF, which the device
+/// applies to itself and then restarts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Apply {
+    Nothing,
+    Command(String),
+    Puf,
+}
+
+impl From<Option<String>> for Apply {
+    fn from(command: Option<String>) -> Self {
+        command.map_or(Self::Nothing, Self::Command)
+    }
+}
+
+/// The name never reaches a console command, but it does become a remote path,
+/// so it still has to be a plain file name.
+fn firmware_transfer(remote_name: &str) -> Option<(String, Apply)> {
     if !is_safe_command_file_name(remote_name) {
         return None;
     }
     let remote_path = format!("/firmware/{remote_name}");
-    let command = if Path::new(remote_name)
+    let apply = if Path::new(remote_name)
         .extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
     {
-        "pushupdate full".to_owned()
+        Apply::Command("pushupdate full".to_owned())
     } else {
-        format!(r"puf \romdisk\user\system\{remote_name}")
+        Apply::Puf
     };
-    Some((remote_path, command))
+    Some((remote_path, apply))
+}
+
+/// Applies a staged PUF: the device works through the update, reporting as it
+/// goes, then restarts without closing the session politely. It is unreachable
+/// for minutes, and its port answers again before its console does, so the
+/// wait is a repeated login and the results query is retried after it.
+async fn apply_puf(
+    spec: &ConnectionSpec,
+    session: Handle<TrustOnFirstUse>,
+    timings: Timings,
+    events: &Sender<WorkerEvent>,
+) -> WorkerResult<String> {
+    log(events, &spec.id, Direction::Sent, PUF_COMMAND);
+    let report =
+        match tokio::time::timeout(LOAD_TIMEOUT, exec_until_closed(&session, PUF_COMMAND)).await {
+            Ok(Ok(report)) => report,
+            // Neither a dropped connection nor a silent one proves the update
+            // failed; the device is asked directly once it is back.
+            Ok(Err(error)) => format!("(the connection ended: {error})"),
+            Err(_) => format!("({PUF_COMMAND} was still running after {LOAD_TIMEOUT:?})"),
+        };
+    log(events, &spec.id, Direction::Received, &report);
+    disconnect(session).await;
+
+    let session = await_restart(spec, timings, events).await?;
+    let results = read_puf_results(spec, &session, timings, events).await;
+    disconnect(session).await;
+    let Some(results) = crate::puf::parse(&results) else {
+        return Ok("the device did not report component results".to_owned());
+    };
+    log(events, &spec.id, Direction::Note, &results.as_text());
+    Ok(results.summary())
+}
+
+/// The device is gone while it restarts, so every attempt is expected to fail
+/// until it is not. An untrusted host key is not a restart and stops the wait.
+async fn await_restart(
+    spec: &ConnectionSpec,
+    timings: Timings,
+    events: &Sender<WorkerEvent>,
+) -> WorkerResult<Handle<TrustOnFirstUse>> {
+    log(
+        events,
+        &spec.id,
+        Direction::Note,
+        &format!(
+            "Waiting for the device to restart, checking {}:{} every {} seconds for up to {}",
+            spec.host,
+            spec.port,
+            timings.poll.as_secs(),
+            clock(timings.limit)
+        ),
+    );
+    let started = tokio::time::Instant::now();
+    loop {
+        tokio::time::sleep(timings.poll).await;
+        let waited = started.elapsed();
+        match connect(spec, events).await {
+            Ok(session) => {
+                log(
+                    events,
+                    &spec.id,
+                    Direction::Note,
+                    &format!("The device answered after {}", clock(waited)),
+                );
+                return Ok(session);
+            }
+            Err(error @ ConnectError::UnknownHostKey { .. }) => return Err(error),
+            Err(ConnectError::Message {
+                message: reason, ..
+            }) => {
+                log(
+                    events,
+                    &spec.id,
+                    Direction::Note,
+                    &format!("Not back after {}: {reason}", clock(waited)),
+                );
+                if waited >= timings.limit {
+                    return Err(message(
+                        spec,
+                        format!(
+                            "The device did not come back within {}: {reason}",
+                            clock(timings.limit)
+                        ),
+                    ));
+                }
+                let _ = events.send(WorkerEvent::Status {
+                    id: spec.id.clone(),
+                    message: format!(
+                        "Waiting for the device to restart ({} of {})",
+                        clock(waited),
+                        clock(timings.limit)
+                    ),
+                    progress: Some((waited.as_secs(), timings.limit.as_secs())),
+                });
+            }
+        }
+    }
+}
+
+/// A device that has just booted accepts a login before its console will
+/// answer, so the query is repeated until it produces the report.
+async fn read_puf_results(
+    spec: &ConnectionSpec,
+    session: &Handle<TrustOnFirstUse>,
+    timings: Timings,
+    events: &Sender<WorkerEvent>,
+) -> String {
+    let mut last = String::new();
+    for attempt in 0..timings.attempts {
+        if attempt > 0 {
+            tokio::time::sleep(timings.settle).await;
+        }
+        match run_command(spec, session, PUF_RESULTS_COMMAND, SSH_TIMEOUT, events).await {
+            Ok(output) if crate::puf::parse(&output).is_some() => return output,
+            Ok(output) => last = output,
+            Err(error) => last = error,
+        }
+    }
+    last
+}
+
+/// Everything the device says before it stops saying anything. A restart ends
+/// the channel partway through, which is the expected ending here, so neither
+/// the exit status nor the missing close is treated as a failure.
+async fn exec_until_closed(
+    session: &Handle<TrustOnFirstUse>,
+    command: &str,
+) -> Result<String, String> {
+    let mut channel = session
+        .channel_open_session()
+        .await
+        .map_err(|error| error.to_string())?;
+    channel
+        .exec(true, command)
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut output = Vec::new();
+    while let Some(message) = channel.wait().await {
+        match message {
+            ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => {
+                output.extend_from_slice(&data);
+            }
+            _ => {}
+        }
+    }
+    Ok(String::from_utf8_lossy(&output).into_owned())
+}
+
+fn clock(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    format!("{}:{:02}", seconds / 60, seconds % 60)
 }
 
 /// Stages every file over one connection and one SFTP session, then runs the
@@ -742,7 +949,7 @@ fn firmware_transfer(remote_name: &str) -> Option<(String, String)> {
 async fn upload_files(
     spec: &ConnectionSpec,
     transfers: Vec<Transfer>,
-    command: Option<String>,
+    apply: Apply,
     events: &Sender<WorkerEvent>,
 ) -> WorkerResult<()> {
     // Opened before connecting so a missing file fails without touching the device.
@@ -831,29 +1038,33 @@ async fn upload_files(
     }
     let _ = sftp.close().await;
 
-    let Some(command) = command else {
-        disconnect(session).await;
-        events
-            .send(WorkerEvent::Complete {
-                id: spec.id.clone(),
-                message: format!("Uploaded {display_name}"),
-            })
-            .map_err(|error| message(spec, error.to_string()))?;
-        return Ok(());
-    };
-
-    let output = run_command(spec, &session, &command, LOAD_TIMEOUT, events)
-        .await
-        .map_err(|error| message(spec, format!("Load command failed: {error}")))?;
-    disconnect(session).await;
-    events
-        .send(WorkerEvent::Complete {
-            id: spec.id.clone(),
-            message: if output.trim().is_empty() {
+    let completion = match apply {
+        Apply::Nothing => {
+            disconnect(session).await;
+            format!("Uploaded {display_name}")
+        }
+        Apply::Command(command) => {
+            let output = run_command(spec, &session, &command, LOAD_TIMEOUT, events)
+                .await
+                .map_err(|error| message(spec, format!("Load command failed: {error}")))?;
+            disconnect(session).await;
+            if output.trim().is_empty() {
                 format!("Uploaded {display_name}; command completed")
             } else {
                 format!("Uploaded {display_name}: {}", output.trim())
-            },
+            }
+        }
+        // Takes over the session: the device restarts partway through and is
+        // reconnected to before it will say how the update went.
+        Apply::Puf => {
+            let summary = apply_puf(spec, session, Timings::DEVICE, events).await?;
+            format!("Updated firmware from {display_name}: {summary}")
+        }
+    };
+    events
+        .send(WorkerEvent::Complete {
+            id: spec.id.clone(),
+            message: completion,
         })
         .map_err(|error| message(spec, error.to_string()))?;
     Ok(())
@@ -1236,23 +1447,212 @@ mod tests {
         assert!(signature_remote_name("..").is_none());
     }
 
+    /// Drives the whole PUF sequence against a device that answers `puf`, drops
+    /// the connection as it restarts, comes back, and only then has results.
+    #[test]
+    fn puf_update_survives_the_restart_and_reports_the_component_table() {
+        const TABLE: &str = "The PUF update result by components:\n\
+             ----Name----+----Result----\n\
+             Bootloader  | Success\n\
+             OS          | Success\n";
+
+        #[derive(Clone)]
+        struct PufServer {
+            received: Arc<Mutex<Vec<String>>>,
+        }
+        impl russh::server::Handler for PufServer {
+            type Error = russh::Error;
+
+            async fn auth_password(
+                &mut self,
+                _user: &str,
+                _password: &str,
+            ) -> Result<russh::server::Auth, Self::Error> {
+                Ok(russh::server::Auth::Accept)
+            }
+
+            async fn channel_open_session(
+                &mut self,
+                _channel: russh::Channel<russh::server::Msg>,
+                reply: russh::server::ChannelOpenHandle,
+                _session: &mut russh::server::Session,
+            ) -> Result<(), Self::Error> {
+                reply.accept().await;
+                Ok(())
+            }
+
+            async fn exec_request(
+                &mut self,
+                channel: russh::ChannelId,
+                data: &[u8],
+                session: &mut russh::server::Session,
+            ) -> Result<(), Self::Error> {
+                let command = String::from_utf8(data.to_vec()).unwrap();
+                let mut received = self.received.lock().unwrap();
+                received.push(command.clone());
+                let asked = received.iter().filter(|seen| **seen == command).count();
+                drop(received);
+                session.channel_success(channel)?;
+                if command == PUF_COMMAND {
+                    // Report, then vanish mid-command the way a restart does.
+                    session.data(channel, "Updating component 1 of 2\n".to_owned())?;
+                    session.disconnect(Disconnect::ByApplication, "rebooting", "")?;
+                    return Ok(());
+                }
+                // A console that has only just booted answers without results.
+                let answer = if asked > 1 {
+                    TABLE.to_owned()
+                } else {
+                    "Results are not available yet\n".to_owned()
+                };
+                session.data(channel, answer)?;
+                session.exit_status_request(channel, 0)?;
+                session.eof(channel)?;
+                session.close(channel)?;
+                Ok(())
+            }
+        }
+
+        runtime().block_on(async {
+            let key = russh::keys::PrivateKey::from(
+                russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&[7; 32]),
+            );
+            let fingerprint = host_fingerprint(key.public_key()).unwrap();
+            let config = Arc::new(russh::server::Config {
+                keys: vec![key],
+                auth_rejection_time: Duration::ZERO,
+                ..Default::default()
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let received = Arc::new(Mutex::new(Vec::new()));
+            let handler = PufServer {
+                received: received.clone(),
+            };
+            // The device is reachable again straight away; the restart wait is
+            // what makes the second login a new connection.
+            let server = tokio::spawn(async move {
+                loop {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let (config, handler) = (config.clone(), handler.clone());
+                    tokio::spawn(async move {
+                        if let Ok(session) =
+                            russh::server::run_stream(config, stream, handler).await
+                        {
+                            let _ = session.await;
+                        }
+                    });
+                }
+            });
+
+            let mut spec = spec();
+            spec.port = port;
+            spec.trusted_fingerprint = Some(fingerprint);
+            let timings = Timings {
+                poll: Duration::from_millis(20),
+                limit: Duration::from_secs(5),
+                settle: Duration::from_millis(20),
+                attempts: 4,
+            };
+            let (events, receiver) = mpsc::channel();
+            let session = connect(&spec, &events).await.unwrap();
+            let summary = tokio::time::timeout(
+                Duration::from_secs(20),
+                apply_puf(&spec, session, timings, &events),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+            assert_eq!(summary, "2 component(s): Success ×2");
+            assert_eq!(
+                *received.lock().unwrap(),
+                [PUF_COMMAND, PUF_RESULTS_COMMAND, PUF_RESULTS_COMMAND],
+                "the results query has to be repeated until the console answers"
+            );
+            let logged = receiver
+                .try_iter()
+                .filter_map(|event| match event {
+                    WorkerEvent::Log { text, .. } => Some(text),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            // What the device said before it went, and the table it gave after.
+            assert!(logged.contains("Updating component 1 of 2"), "{logged}");
+            assert!(logged.contains("Bootloader  Success"), "{logged}");
+            server.abort();
+        });
+    }
+
+    #[test]
+    fn a_device_that_never_comes_back_gives_up_instead_of_waiting_forever() {
+        runtime().block_on(async {
+            // Bound and dropped, so the port is closed and refuses at once.
+            let port = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port();
+            let mut spec = spec();
+            spec.port = port;
+            let timings = Timings {
+                poll: Duration::from_millis(20),
+                limit: Duration::from_millis(60),
+                settle: Duration::from_millis(20),
+                attempts: 2,
+            };
+            let (events, receiver) = mpsc::channel();
+            let result = tokio::time::timeout(
+                Duration::from_secs(20),
+                await_restart(&spec, timings, &events),
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(result, Err(ConnectError::Message { message, .. })
+                    if message.contains("did not come back within 0:00")),
+                "the wait has to end with the limit it was given"
+            );
+            // The wait is reported while it runs, not only when it ends.
+            assert!(receiver.try_iter().any(|event| matches!(
+                event,
+                WorkerEvent::Status { message, progress: Some((_, 0)), .. }
+                    if message.starts_with("Waiting for the device to restart")
+            )));
+        });
+    }
+
     #[test]
     fn builds_crestron_firmware_transfer_paths_and_commands() {
+        // A PUF is applied by a command with no name in it: the device finds
+        // the file it was handed in the firmware directory.
         assert_eq!(
             firmware_transfer("rmc4_2.8000.00001.puf"),
-            Some((
-                "/firmware/rmc4_2.8000.00001.puf".to_owned(),
-                r"puf \romdisk\user\system\rmc4_2.8000.00001.puf".to_owned(),
-            ))
+            Some(("/firmware/rmc4_2.8000.00001.puf".to_owned(), Apply::Puf))
+        );
+        assert_eq!(
+            firmware_transfer("no_extension"),
+            Some(("/firmware/no_extension".to_owned(), Apply::Puf))
         );
         assert_eq!(
             firmware_transfer("update.ZIP"),
             Some((
                 "/firmware/update.ZIP".to_owned(),
-                "pushupdate full".to_owned(),
+                Apply::Command("pushupdate full".to_owned()),
             ))
         );
         assert!(firmware_transfer("unsafe firmware.puf").is_none());
+        assert!(firmware_transfer("../escape.puf").is_none());
+    }
+
+    #[test]
+    fn elapsed_time_reads_as_a_clock() {
+        assert_eq!(clock(Duration::from_secs(0)), "0:00");
+        assert_eq!(clock(Duration::from_secs(9)), "0:09");
+        assert_eq!(clock(Duration::from_secs(630)), "10:30");
+        assert_eq!(clock(Timings::DEVICE.limit), "15:00");
     }
 
     #[test]

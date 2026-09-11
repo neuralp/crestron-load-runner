@@ -3,12 +3,18 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod archive;
+mod backdrop;
 mod cli;
 mod device_log;
 mod discovery;
 mod firmware;
 mod ip_table;
+/// The application mark, shared with `build.rs` by direct inclusion.
+mod logo;
 mod model;
+mod popout;
+mod puf;
 mod scripts;
 mod ssh;
 mod storage;
@@ -41,7 +47,8 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1360.0, 820.0])
-            .with_min_inner_size([1000.0, 620.0]),
+            .with_min_inner_size([1000.0, 620.0])
+            .with_icon(window_icon()),
         ..Default::default()
     };
 
@@ -60,6 +67,17 @@ fn main() -> eframe::Result {
             .show();
     }
     result
+}
+
+/// The mark for the title bar and the task switcher. The executable carries its
+/// own copy for the file on disk; this one is what the running window shows.
+fn window_icon() -> eframe::egui::IconData {
+    const SIZE: usize = 256;
+    eframe::egui::IconData {
+        rgba: logo::rasterize(SIZE),
+        width: SIZE as u32,
+        height: SIZE as u32,
+    }
 }
 
 /// Rejects a path that cannot hold the configuration before the address book is

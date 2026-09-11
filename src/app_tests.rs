@@ -33,6 +33,7 @@ fn scripts_can_be_previewed_and_run_for_selected_or_one_device() {
         let mut app = app();
         app.script_editor.scripts.push(crate::scripts::Script {
             name: "Inspect".into(),
+            model: String::new(),
             body: "hostname\nver".into(),
         });
         for (host, selected) in [("192.0.2.1", false), ("192.0.2.2", true)] {
@@ -99,7 +100,7 @@ fn scripts_can_be_previewed_and_run_for_selected_or_one_device() {
 }
 
 #[test]
-fn device_menu_contains_both_editors_and_unsaved_scripts_block_quit() {
+fn device_menu_contains_both_editors_and_unsaved_scripts_are_confirmed_on_quit() {
     let mut app = app();
     let ctx = egui::Context::default();
     let click = |app: &mut LoadRunnerApp, label| {
@@ -147,9 +148,141 @@ fn device_menu_contains_both_editors_and_unsaved_scripts_block_quit() {
     assert!(app.script_editor.open);
     click(&mut app, "New script");
     assert!(app.script_editor.is_dirty());
+    // Unsaved scripts no longer block quitting; they are named in the
+    // confirmation, and quitting anyway abandons the drafts.
     app.request_action(PendingAction::Quit, &ctx);
+    assert_eq!(app.pending_action, Some(PendingAction::Quit));
     assert!(!app.close_approved);
-    assert!(app.notice.as_deref().unwrap().contains("Save scripts"));
+    assert!(app.notice.is_none());
+    // The first frame measures and positions the modal.
+    ctx.run_ui(input(), |ui| app.show(ui))
+        .drop_without_applying_deltas();
+    let output = ctx.run_ui(input(), |ui| app.show(ui));
+    let drawn = output
+        .shapes
+        .iter()
+        .filter_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) => Some(text.galley.text().to_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    output.drop_without_applying_deltas();
+    assert!(
+        drawn
+            .iter()
+            .any(|text| text.contains("unsaved changes in the script library")),
+        "{drawn:?}"
+    );
+    app.confirm_pending_action(false, &ctx);
+    assert!(app.close_approved);
+    assert!(app.script_editor.is_dirty());
+}
+
+#[test]
+fn a_modal_backdrop_covers_the_window_and_every_other_window_under_it() {
+    let mut app = app();
+    // A plain window, to prove the backdrop is not merely above the panels.
+    app.log_view_open = true;
+    let ctx = egui::Context::default();
+    let painted = |app: &mut LoadRunnerApp| {
+        // The first frame measures and positions the modal.
+        ctx.run_ui(input(), |ui| app.show(ui))
+            .drop_without_applying_deltas();
+        let output = ctx.run_ui(input(), |ui| app.show(ui));
+        let backdrop = output.shapes.iter().position(|clipped| {
+            matches!(&clipped.shape, egui::Shape::Rect(rect)
+                if rect.fill == crate::backdrop::DIM && rect.rect.contains_rect(ctx.content_rect()))
+        });
+        let text = |label: &str| {
+            output.shapes.iter().position(|clipped| {
+                matches!(&clipped.shape, egui::Shape::Text(text) if text.galley.text() == label)
+            })
+        };
+        let found = (backdrop, text("Device log"), text("Close"));
+        output.drop_without_applying_deltas();
+        found
+    };
+
+    // Nothing is dimmed while no dialog is up.
+    let (backdrop, log, _) = painted(&mut app);
+    assert!(backdrop.is_none());
+    assert!(log.is_some());
+
+    app.about_open = true;
+    let (backdrop, log, close) = painted(&mut app);
+    let backdrop = backdrop.expect("the backdrop was not painted");
+    assert!(
+        log.unwrap() < backdrop,
+        "the device log window is not behind it"
+    );
+    assert!(
+        backdrop < close.unwrap(),
+        "the dialog is not in front of it"
+    );
+}
+
+#[test]
+fn the_editors_keep_their_windows_while_a_dialog_owns_the_main_one() {
+    let mut app = app();
+    app.script_editor.open = true;
+    app.firmware_editor.open = true;
+    app.address_book_dirty = true;
+    let ctx = egui::Context::default();
+    app.request_action(PendingAction::Quit, &ctx);
+    ctx.run_ui(input(), |ui| app.show(ui))
+        .drop_without_applying_deltas();
+    let output = ctx.run_ui(input(), |ui| app.show(ui));
+    let drawn = output
+        .shapes
+        .iter()
+        .filter_map(|clipped| match &clipped.shape {
+            egui::Shape::Text(text) => Some(text.galley.text().to_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    output.drop_without_applying_deltas();
+    for expected in ["Script Editor", "Firmware Editor", "Unsaved changes"] {
+        assert!(
+            drawn.iter().any(|text| text == expected),
+            "{expected}: {drawn:?}"
+        );
+    }
+}
+
+#[test]
+fn quitting_saves_or_abandons_unsaved_scripts() {
+    let dir = TestDir::new();
+    let path = dir.path().join("scripts.json");
+    let ctx = egui::Context::default();
+    let script = |name: &str| crate::scripts::Script {
+        name: name.into(),
+        model: String::new(),
+        body: "ver".into(),
+    };
+
+    // A script that cannot be saved keeps the confirmation up, exactly as a
+    // failing address-book save does.
+    let mut app = app();
+    app.script_editor = crate::scripts::ScriptEditor::load(Some(path.clone()));
+    app.script_editor.draft_script(script(""));
+    app.request_action(PendingAction::Quit, &ctx);
+    app.confirm_pending_action(true, &ctx);
+    assert_eq!(app.pending_action, Some(PendingAction::Quit));
+    assert!(!app.close_approved);
+    assert!(app.status_is_error);
+    assert!(!path.exists());
+
+    // Save and quit writes the library before closing.
+    let mut app = LoadRunnerApp::from_parts(Preferences::default(), None, Vec::new(), None);
+    app.script_editor = crate::scripts::ScriptEditor::load(Some(path.clone()));
+    app.script_editor.draft_script(script("Info"));
+    app.request_action(PendingAction::Quit, &ctx);
+    app.confirm_pending_action(true, &ctx);
+    assert!(app.close_approved);
+    assert_eq!(
+        crate::scripts::ScriptEditor::load(Some(path.clone())).scripts,
+        vec![script("Info")]
+    );
 }
 
 #[test]

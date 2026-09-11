@@ -208,6 +208,9 @@ fn copy_firmware(root: &Path, source: &Path) -> io::Result<FirmwareFile> {
 
 type ImportResult = Result<(String, FirmwareFile), String>;
 
+/// Starting width of the catalog tree; the divider is draggable from there.
+const TREE_WIDTH: f32 = 240.0;
+
 #[derive(Default)]
 pub struct FirmwareEditor {
     pub open: bool,
@@ -216,6 +219,7 @@ pub struct FirmwareEditor {
     observed_models: BTreeSet<String>,
     selected_model: String,
     manual_model: String,
+    insight: Option<Insight>,
     pending: Option<Receiver<ImportResult>>,
     error: Option<String>,
     load_failed: bool,
@@ -475,22 +479,44 @@ impl FirmwareEditor {
         if !self.open {
             return;
         }
-        let mut open = self.open;
-        egui::Window::new("Firmware Editor")
-            .open(&mut open)
-            .default_width(620.0)
-            .collapsible(false)
-            .show(ctx, |ui| {
-                ui.label(
-                    "Assign one firmware file per discovered or manually entered device model.",
-                );
-                ui.small(
-                    "Files are copied into local storage. Use Load Firmware in the main window to install them.",
-                );
-                if let Some(root) = &self.root {
-                    ui.small(format!("Storage: {}", root.display()));
-                }
-                if let Some(error) = self.error.clone() {
+        let open = crate::popout::window(ctx, "Firmware Editor", [860.0, 620.0], |ui| {
+            self.contents(ui)
+        });
+        self.open = open;
+    }
+
+    /// Tools across the top, the catalog tree on the left, and everything known
+    /// about the selected model's firmware on the right.
+    fn contents(&mut self, ui: &mut egui::Ui) {
+        let busy = self.is_busy();
+        egui::Panel::top("firmware_tools").show(ui, |ui| {
+            ui.add_space(4.0);
+            ui.add_enabled_ui(!busy && !self.load_failed, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Model");
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut self.manual_model)
+                            .hint_text("e.g. RMC4")
+                            .desired_width(200.0),
+                    );
+                    let entered = response.lost_focus()
+                        && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                    let added = ui
+                        .add_enabled(
+                            !self.manual_model.trim().is_empty(),
+                            egui::Button::new("Add model"),
+                        )
+                        .clicked();
+                    if entered || added {
+                        self.add_manual_model();
+                    }
+                    if busy {
+                        ui.spinner();
+                    }
+                });
+            });
+            if let Some(error) = self.error.clone() {
+                ui.horizontal_wrapped(|ui| {
                     ui.colored_label(ui.visuals().error_fg_color, error);
                     if ui.button("Retry catalog save / load").clicked() {
                         if self.load_failed {
@@ -499,117 +525,216 @@ impl FirmwareEditor {
                             self.error = None;
                         }
                     }
-                }
-                ui.separator();
-                let busy = self.is_busy();
-                ui.add_enabled_ui(!busy && !self.load_failed, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Model");
-                        let response = ui.add(
-                            egui::TextEdit::singleline(&mut self.manual_model)
-                                .hint_text("e.g. RMC4")
-                                .desired_width(240.0),
-                        );
-                        let enter_pressed = response.lost_focus()
-                            && ui.input(|input| input.key_pressed(egui::Key::Enter));
-                        let add_clicked = ui
-                            .add_enabled(
-                                !self.manual_model.trim().is_empty(),
-                                egui::Button::new("Add model"),
-                            )
-                            .clicked();
-                        if enter_pressed || add_clicked {
-                            self.add_manual_model();
-                        }
-                    });
                 });
-                ui.separator();
+            }
+            ui.add_space(4.0);
+        });
+        egui::Panel::bottom("firmware_status").show(ui, |ui| {
+            ui.add_space(4.0);
+            ui.label("Assign one firmware file per discovered or manually entered device model.");
+            ui.small(
+                "Files are copied into local storage. Use Load Firmware in the main window to install them.",
+            );
+            if let Some(root) = &self.root {
+                ui.small(format!("Storage: {}", root.display()));
+            }
+            if !self.message.is_empty() {
+                ui.label(&self.message);
+            }
+            ui.add_space(4.0);
+        });
+        egui::Panel::left("firmware_tree")
+            .default_size(TREE_WIDTH)
+            .show(ui, |ui| self.tree(ui));
+        egui::CentralPanel::default().show(ui, |ui| self.detail(ui));
+    }
+
+    /// The catalog as a tree: a branch per firmware file, holding every model
+    /// it is assigned to, with unassigned models left at the root.
+    fn tree(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical()
+            .id_salt("firmware_tree_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
                 if self.catalog.models.is_empty() {
-                    ui.label("No device models yet. Discover devices or enter a model above.");
+                    ui.weak("No device models yet — discover devices or add one above.");
+                    return;
                 }
-                ui.add_enabled_ui(!busy && !self.load_failed, |ui| {
-                    egui::ComboBox::from_id_salt("firmware_model")
-                        .selected_text(if self.selected_model.is_empty() {
-                            "Select a model"
-                        } else {
-                            &self.selected_model
-                        })
-                        .show_ui(ui, |ui| {
-                            for model in self.catalog.models.keys() {
+                let mut branches: BTreeMap<String, Vec<String>> = BTreeMap::new();
+                let mut roots = Vec::new();
+                for (model, assignment) in &self.catalog.models {
+                    match assignment {
+                        Some(file) => branches
+                            .entry(file.original_name.clone())
+                            .or_default()
+                            .push(model.clone()),
+                        None => roots.push(model.clone()),
+                    }
+                }
+                for (file, models) in &branches {
+                    egui::CollapsingHeader::new(file)
+                        .id_salt(("firmware_file", file))
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            for model in models {
                                 ui.selectable_value(&mut self.selected_model, model.clone(), model);
                             }
                         });
-                    let assignment = self.catalog.models.get(&self.selected_model).cloned();
-                    if let Some(assignment) = assignment {
-                        if let Some(file) = &assignment {
-                            ui.label(format!("Assigned: {}", file.original_name));
-                            ui.small(format!("{} bytes", file.bytes));
-                            ui.small(format!("SHA-256: {}", file.sha256));
-                            if let Some(root) = &self.root
-                                && !root.join(&file.stored_file).is_file()
-                            {
-                                ui.colored_label(
-                                    ui.visuals().error_fg_color,
-                                    "Stored file is missing. Choose the firmware file again.",
-                                );
-                            }
-                        } else {
-                            ui.label("No firmware assigned");
-                        }
-                        ui.horizontal(|ui| {
-                            if ui.button("Choose firmware file…").clicked()
-                                && let Some(path) = rfd::FileDialog::new().pick_file()
-                            {
-                                self.start_import(path);
-                            }
-                            if ui
-                                .add_enabled(
-                                    assignment.is_some(),
-                                    egui::Button::new("Remove assignment"),
-                                )
-                                .clicked()
-                            {
-                                let selected_model = self.selected_model.clone();
-                                match self.remove_assignment(&selected_model) {
-                                    Ok(message) => {
-                                        self.error = None;
-                                        self.message = message.into();
-                                    }
-                                    Err(error) => {
-                                        self.error =
-                                            Some(format!("Could not remove assignment: {error}"))
-                                    }
-                                }
-                            }
-                        });
-                    }
-                });
-                if busy {
-                    ui.spinner();
                 }
-                ui.label(&self.message);
-                ui.separator();
-                egui::ScrollArea::vertical()
-                    .max_height(260.0)
-                    .show(ui, |ui| {
-                        for (model, assignment) in &self.catalog.models {
-                            ui.horizontal(|ui| {
-                                if ui
-                                    .selectable_label(self.selected_model == *model, model)
-                                    .clicked()
-                                {
-                                    self.selected_model = model.clone();
-                                }
-                                ui.label(
-                                    assignment
-                                        .as_ref()
-                                        .map_or("Unassigned", |file| &file.original_name),
-                                );
-                            });
-                        }
-                    });
+                for model in &roots {
+                    ui.selectable_value(&mut self.selected_model, model.clone(), model);
+                }
             });
-        self.open = open;
+    }
+
+    fn detail(&mut self, ui: &mut egui::Ui) {
+        let Some(assignment) = self.catalog.models.get(&self.selected_model).cloned() else {
+            self.insight = None;
+            ui.weak("Select a model in the tree, or add one above.");
+            return;
+        };
+        ui.heading(&self.selected_model);
+        ui.add_enabled_ui(!self.is_busy() && !self.load_failed, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("Choose firmware file…").clicked()
+                    && let Some(path) = rfd::FileDialog::new().pick_file()
+                {
+                    self.start_import(path);
+                }
+                if ui
+                    .add_enabled(assignment.is_some(), egui::Button::new("Remove assignment"))
+                    .clicked()
+                {
+                    let model = self.selected_model.clone();
+                    match self.remove_assignment(&model) {
+                        Ok(message) => {
+                            self.error = None;
+                            self.message = message.into();
+                        }
+                        Err(error) => {
+                            self.error = Some(format!("Could not remove assignment: {error}"));
+                        }
+                    }
+                }
+            });
+        });
+        ui.separator();
+        let Some(file) = assignment else {
+            self.insight = None;
+            ui.label("No firmware assigned.");
+            return;
+        };
+        let stored = self.root.as_ref().map(|root| root.join(&file.stored_file));
+        if self
+            .insight
+            .as_ref()
+            .is_none_or(|held| held.of != file.stored_file)
+        {
+            self.insight = stored.as_deref().map(Insight::read);
+        }
+        egui::ScrollArea::vertical()
+            .id_salt("firmware_detail")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if stored.is_some_and(|stored| !stored.is_file()) {
+                    ui.colored_label(
+                        ui.visuals().error_fg_color,
+                        "Stored file is missing. Choose the firmware file again.",
+                    );
+                }
+                let insight = self.insight.as_ref();
+                table(
+                    ui,
+                    "firmware_file_facts",
+                    [
+                        ("File", file.original_name.clone()),
+                        ("Size", crate::archive::human_size(file.bytes)),
+                        (
+                            "Imported",
+                            insight
+                                .and_then(|insight| insight.imported.clone())
+                                .unwrap_or_else(|| "Unknown".into()),
+                        ),
+                        ("SHA-256", file.sha256.clone()),
+                    ],
+                );
+                let Some(insight) = insight else {
+                    return;
+                };
+                ui.add_space(8.0);
+                match &insight.archive {
+                    Err(error) => {
+                        ui.strong("Contents");
+                        ui.colored_label(ui.visuals().error_fg_color, error);
+                    }
+                    Ok(archive) if archive.package.is_empty() => {
+                        // A zip update describes nothing inside, so its own
+                        // files are all there is to report.
+                        ui.strong("Archive");
+                        table(
+                            ui,
+                            "firmware_archive_facts",
+                            [
+                                ("Files", archive.entries.to_string()),
+                                (
+                                    "Newest file",
+                                    archive.newest.clone().unwrap_or_else(|| "Unknown".into()),
+                                ),
+                            ],
+                        );
+                    }
+                    Ok(archive) => {
+                        ui.strong("Package");
+                        table(
+                            ui,
+                            "firmware_package",
+                            archive
+                                .package
+                                .iter()
+                                .map(|(key, value)| (key.as_str(), value.clone())),
+                        );
+                    }
+                }
+            });
+    }
+}
+
+/// Facts as aligned rows, which is how the package description reads best.
+fn table<'a>(ui: &mut egui::Ui, id: &str, rows: impl IntoIterator<Item = (&'a str, String)>) {
+    egui::Grid::new(id)
+        .num_columns(2)
+        .spacing([16.0, 4.0])
+        .striped(true)
+        .show(ui, |ui| {
+            for (name, value) in rows {
+                ui.label(name);
+                ui.add(egui::Label::new(egui::RichText::new(value).monospace()).wrap());
+                ui.end_row();
+            }
+        });
+}
+
+/// What the stored copy of a firmware file says about itself, read once per
+/// selection rather than every frame.
+struct Insight {
+    of: String,
+    imported: Option<String>,
+    archive: Result<crate::archive::Archive, String>,
+}
+
+impl Insight {
+    fn read(stored: &Path) -> Self {
+        Self {
+            of: stored
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            imported: fs::metadata(stored)
+                .and_then(|data| data.modified())
+                .ok()
+                .and_then(crate::archive::utc),
+            archive: crate::archive::read(stored),
+        }
     }
 }
 
@@ -808,18 +933,40 @@ mod tests {
     }
 
     #[test]
-    fn editor_renders_assignment_and_remove_button_persists_with_pointer_input() {
+    fn editor_shows_the_package_of_a_puf_and_removes_the_assignment() {
         let dir = TestDir::new();
         let root = dir.path().join("firmware");
         let source = dir.path().join("device.puf");
-        fs::write(&source, b"firmware UI fixture").unwrap();
+        fs::write(
+            &source,
+            crate::test_support::zip(&[
+                (
+                    "~.package.ini",
+                    b"[Package]\nName=RMC4 Firmware\nVersion=2.8001.00049\n",
+                    true,
+                    crate::test_support::stamp(2024, 3, 15, 14, 22),
+                ),
+                (
+                    "firmware.bin",
+                    b"payload",
+                    false,
+                    crate::test_support::stamp(2024, 3, 15, 14, 22),
+                ),
+            ]),
+        )
+        .unwrap();
         let file = copy_firmware(&root, &source).unwrap();
         let mut editor = FirmwareEditor::load(Some(root.clone()));
-        editor.observe_model("RMC4");
-        editor
-            .catalog
-            .models
-            .insert("RMC4".into(), Some(file.clone()));
+        for model in ["RMC4", "CP4", "TSW-1070"] {
+            editor.observe_model(model);
+        }
+        // Two models share the file, so the tree has to gather them under it.
+        for model in ["RMC4", "CP4"] {
+            editor
+                .catalog
+                .models
+                .insert(model.into(), Some(file.clone()));
+        }
         editor.save_catalog(editor.catalog.clone()).unwrap();
         editor.selected_model = "RMC4".into();
         editor.open = true;
@@ -827,29 +974,59 @@ mod tests {
         let input = || egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
-                egui::vec2(1000.0, 800.0),
+                egui::vec2(1200.0, 900.0),
             )),
             ..Default::default()
         };
         ctx.run_ui(input(), |ui| editor.show(ui.ctx()))
             .drop_without_applying_deltas();
         let output = ctx.run_ui(input(), |ui| editor.show(ui.ctx()));
-        let text_position = |label: &str| {
+        let placed = |label: &str| {
             output.shapes.iter().find_map(|clipped| {
                 if let egui::Shape::Text(text) = &clipped.shape
                     && text.galley.text() == label
                 {
-                    Some(text.pos + text.galley.size() * 0.5)
+                    Some(egui::Rect::from_min_size(text.pos, text.galley.size()))
                 } else {
                     None
                 }
             })
         };
-        assert!(text_position("Firmware Editor").is_some());
-        assert!(text_position("Add model").is_some());
-        assert!(text_position("Assigned: device.puf").is_some());
-        assert!(text_position("Choose firmware file…").is_some());
-        let remove = text_position("Remove assignment").unwrap();
+        for expected in [
+            "Firmware Editor",
+            "Add model",
+            // The tree: a branch per file, its models under it, unassigned at
+            // the root.
+            "device.puf",
+            "RMC4",
+            "CP4",
+            "TSW-1070",
+            // The detail pane.
+            "Choose firmware file…",
+            "File",
+            "Size",
+            "Imported",
+            "SHA-256",
+            // The package description, read out of the compressed entry.
+            "Package",
+            "Name",
+            "RMC4 Firmware",
+            "Version",
+            "2.8001.00049",
+        ] {
+            assert!(placed(expected).is_some(), "{expected} was not rendered");
+        }
+        assert!(placed(&crate::archive::human_size(file.bytes)).is_some());
+        assert!(
+            placed("CP4").unwrap().left() > placed("device.puf").unwrap().left(),
+            "assigned models are not indented under their file"
+        );
+        assert!(
+            placed("TSW-1070").unwrap().left() < placed("CP4").unwrap().left(),
+            "an unassigned model is not at the root"
+        );
+
+        let remove = placed("Remove assignment").unwrap().center();
         output.drop_without_applying_deltas();
         for pressed in [true, false] {
             let mut raw = input();
@@ -864,6 +1041,90 @@ mod tests {
                 .drop_without_applying_deltas();
         }
         assert!(Catalog::load(&root).unwrap().models["RMC4"].is_none());
-        assert!(!root.join(file.stored_file).exists());
+        // The other model still holds the file, so the copy has to survive.
+        assert!(root.join(&file.stored_file).exists());
+    }
+
+    #[test]
+    fn editor_reports_a_zip_update_and_a_file_it_cannot_read() {
+        let dir = TestDir::new();
+        let root = dir.path().join("firmware");
+        let update = dir.path().join("update.zip");
+        fs::write(
+            &update,
+            crate::test_support::zip(&[
+                (
+                    "a.bin",
+                    b"a",
+                    false,
+                    crate::test_support::stamp(2021, 6, 1, 9, 30),
+                ),
+                (
+                    "b.bin",
+                    b"bb",
+                    false,
+                    crate::test_support::stamp(2023, 12, 25, 18, 5),
+                ),
+            ]),
+        )
+        .unwrap();
+        let broken = dir.path().join("broken.puf");
+        fs::write(&broken, b"not an archive").unwrap();
+        let mut editor = FirmwareEditor::load(Some(root.clone()));
+        let ctx = egui::Context::default();
+        let drawn = |editor: &mut FirmwareEditor| {
+            let input = || egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1200.0, 900.0),
+                )),
+                ..Default::default()
+            };
+            ctx.run_ui(input(), |ui| editor.show(ui.ctx()))
+                .drop_without_applying_deltas();
+            let output = ctx.run_ui(input(), |ui| editor.show(ui.ctx()));
+            let text = output
+                .shapes
+                .iter()
+                .filter_map(|clipped| match &clipped.shape {
+                    egui::Shape::Text(text) => Some(text.galley.text().to_owned()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            output.drop_without_applying_deltas();
+            text
+        };
+        editor.open = true;
+        editor.observe_model("RMC4");
+
+        // No assignment yet.
+        editor.selected_model = "RMC4".into();
+        assert!(
+            drawn(&mut editor)
+                .iter()
+                .any(|text| text == "No firmware assigned.")
+        );
+
+        // A zip update reports its own files, since it describes nothing.
+        let file = copy_firmware(&root, &update).unwrap();
+        editor.catalog.models.insert("RMC4".into(), Some(file));
+        let text = drawn(&mut editor);
+        for expected in ["Archive", "Files", "2", "Newest file", "2023-12-25 18:05"] {
+            assert!(
+                text.iter().any(|drawn| drawn == expected),
+                "{expected}: {text:?}"
+            );
+        }
+        assert!(!text.iter().any(|drawn| drawn == "Package"));
+
+        // Something that is not an archive at all is reported, not hidden.
+        let file = copy_firmware(&root, &broken).unwrap();
+        editor.catalog.models.insert("RMC4".into(), Some(file));
+        let text = drawn(&mut editor);
+        assert!(text.iter().any(|drawn| drawn == "Contents"), "{text:?}");
+        assert!(
+            text.iter().any(|drawn| drawn.contains("Not a zip archive")),
+            "{text:?}"
+        );
     }
 }

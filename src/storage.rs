@@ -253,20 +253,90 @@ pub fn set_config_dir(dir: PathBuf) -> Result<(), PathBuf> {
     CONFIG_DIR_OVERRIDE.set(dir)
 }
 
+fn project_dirs() -> Option<ProjectDirs> {
+    ProjectDirs::from("com", "WorldDomination", "CrestronLoadRunner")
+}
+
 pub fn config_dir() -> Option<PathBuf> {
     if let Some(dir) = CONFIG_DIR_OVERRIDE.get() {
         return Some(dir.clone());
     }
-    ProjectDirs::from("com", "WorldDomination", "CrestronLoadRunner")
-        .map(|dirs| dirs.config_dir().to_path_buf())
+    project_dirs().map(|dirs| dirs.config_dir().to_path_buf())
 }
 
 pub fn preferences_path() -> Option<PathBuf> {
     config_dir().map(|dir| dir.join("preferences.json"))
 }
 
+/// Whole firmware images, which have no business in a roaming profile: they are
+/// large, they are reproducible from the vendor, and copying them between
+/// machines at every sign-in is a cost with no benefit. `--config-dir` still
+/// gathers everything in one place, so a throwaway profile cannot reach the
+/// real library.
 pub fn firmware_dir() -> Option<PathBuf> {
-    config_dir().map(|dir| dir.join("firmware"))
+    Some(choose_firmware_dir(
+        CONFIG_DIR_OVERRIDE.get().cloned(),
+        local_firmware_dir()?,
+        roaming_firmware_dir()?,
+        Path::exists,
+    ))
+}
+
+fn choose_firmware_dir(
+    override_dir: Option<PathBuf>,
+    local: PathBuf,
+    roaming: PathBuf,
+    exists: impl Fn(&Path) -> bool,
+) -> PathBuf {
+    if let Some(dir) = override_dir {
+        return dir.join("firmware");
+    }
+    // A library that an earlier build left in the roaming profile, and that
+    // could not be moved, is read where it stands rather than abandoned.
+    if !exists(&local) && exists(&roaming) {
+        roaming
+    } else {
+        local
+    }
+}
+
+fn local_firmware_dir() -> Option<PathBuf> {
+    project_dirs().map(|dirs| dirs.data_local_dir().join("firmware"))
+}
+
+/// Where earlier builds kept the firmware library, beside the preferences.
+fn roaming_firmware_dir() -> Option<PathBuf> {
+    project_dirs().map(|dirs| dirs.config_dir().join("firmware"))
+}
+
+/// Moves a firmware library that an earlier build left in the roaming profile.
+/// Called once at startup; returns what to tell the user when it could not.
+pub fn migrate_firmware_dir() -> Option<String> {
+    if CONFIG_DIR_OVERRIDE.get().is_some() {
+        return None;
+    }
+    migrate_firmware(&roaming_firmware_dir()?, &local_firmware_dir()?)
+}
+
+/// Renaming is instant within a volume, which is where both directories sit
+/// unless the profile is redirected. Where it is, the move is left to the user
+/// rather than copying gigabytes during startup, and the old directory goes on
+/// being used until they do it.
+fn migrate_firmware(roaming: &Path, local: &Path) -> Option<String> {
+    if !roaming.is_dir() || local.exists() {
+        return None;
+    }
+    let renamed = local
+        .parent()
+        .map_or(Ok(()), fs::create_dir_all)
+        .and_then(|()| fs::rename(roaming, local));
+    renamed.err().map(|error| {
+        format!(
+            "The firmware library is still in {} and could not be moved to {}: {error}.              Move that directory yourself to finish; until then it is used where it is.",
+            roaming.display(),
+            local.display()
+        )
+    })
 }
 
 #[cfg(test)]
@@ -283,11 +353,65 @@ mod tests {
     }
 
     #[test]
-    fn stored_files_sit_together_in_the_configuration_directory() {
-        // --config-dir has to move every stored file, not just the preferences.
+    fn preferences_and_the_script_library_stay_together() {
+        // --config-dir has to move the stored files, not just the preferences.
         let dir = config_dir().expect("a configuration directory");
         assert_eq!(preferences_path().unwrap(), dir.join("preferences.json"));
-        assert_eq!(firmware_dir().unwrap(), dir.join("firmware"));
+    }
+
+    #[test]
+    fn the_firmware_library_sits_outside_the_roaming_profile() {
+        let local = PathBuf::from("/local/data/firmware");
+        let roaming = PathBuf::from("/roaming/config/firmware");
+        let chosen = |present: &[&Path]| {
+            choose_firmware_dir(None, local.clone(), roaming.clone(), |path| {
+                present.contains(&path)
+            })
+        };
+        // A new profile, and one already moved, both use the local directory.
+        assert_eq!(chosen(&[]), local);
+        assert_eq!(chosen(&[&local]), local);
+        // A library an earlier build left behind is read where it stands.
+        assert_eq!(chosen(&[&roaming]), roaming);
+        // With both there the moved one is the library and the leftover is not.
+        assert_eq!(chosen(&[&local, &roaming]), local);
+        // A throwaway profile still gathers everything in one directory.
+        assert_eq!(
+            choose_firmware_dir(Some("/profile".into()), local, roaming, |_| true),
+            Path::new("/profile/firmware")
+        );
+    }
+
+    #[test]
+    fn migrating_the_firmware_library_moves_it_once_and_overwrites_nothing() {
+        let dir = TestDir::new();
+        let roaming = dir.path().join("roaming/config/firmware");
+        let local = dir.path().join("local/data/firmware");
+
+        // Nothing to move, and nothing created for the sake of it.
+        assert!(migrate_firmware(&roaming, &local).is_none());
+        assert!(!local.exists());
+
+        fs::create_dir_all(&roaming).unwrap();
+        fs::write(roaming.join("catalog.json"), b"moved").unwrap();
+        assert!(migrate_firmware(&roaming, &local).is_none());
+        assert!(!roaming.exists(), "the old directory is left behind");
+        assert_eq!(fs::read(local.join("catalog.json")).unwrap(), b"moved");
+
+        // A library that reappears in the old place never overwrites the one
+        // already moved.
+        fs::create_dir_all(&roaming).unwrap();
+        fs::write(roaming.join("catalog.json"), b"older").unwrap();
+        assert!(migrate_firmware(&roaming, &local).is_none());
+        assert!(roaming.is_dir());
+        assert_eq!(fs::read(local.join("catalog.json")).unwrap(), b"moved");
+
+        // A move that cannot happen is reported, and loses nothing.
+        let blocked = dir.path().join("blocked");
+        fs::write(&blocked, b"a file where a directory would go").unwrap();
+        let reported = migrate_firmware(&roaming, &blocked.join("data/firmware")).unwrap();
+        assert!(reported.contains("could not be moved"), "{reported}");
+        assert_eq!(fs::read(roaming.join("catalog.json")).unwrap(), b"older");
     }
 
     #[test]

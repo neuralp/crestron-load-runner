@@ -20,14 +20,23 @@ A native Rust/egui utility for discovering Crestron devices, keeping an address 
 - In-memory device log of every line sent to and received from devices, opened with **Device log…** on the details panel
 - Multi-device loading from the top action bar: **Load Assigned Program**, **Load Assigned Config**, **Load Assigned Touchpanel**, and **Load Firmware**
 - Resizable device/details split with a one-third initial device-list width
+- Script and firmware editors open as separate operating-system windows, so they stay usable beside the main one
+- Dialogs that block the main window frost and dim what is behind them
+- A drawn application mark, used in **Help → About**, on the window, and as the executable's icon
 - Saved default SSH credentials, with per-device credentials taking precedence, and a choice of what to open at startup
-- Firmware editor with a persistent per-model catalog and managed local firmware copies
+- Firmware editor with a persistent per-model catalog, managed local firmware copies, and `.puf` package details read from the file
 
 ## Build and run
 
 ```sh
 cargo run --release
 ```
+
+### The application mark
+
+The mark is described in `src/logo.rs` as three triangles in a unit square, not stored as an image. The application draws it in **Help → About** and rasters it for the window icon; `build.rs` includes the same file to raster the executable's icon into a six-size `.ico`, so the two cannot drift apart and there is no image file to keep in step with the source.
+
+Attaching an icon to the executable needs a resource compiler from the Windows SDK. Without one the build prints a warning and carries on: only the icon on the file in Explorer is missing, and the running window still shows the mark.
 
 ### Command-line options
 
@@ -48,7 +57,7 @@ Preferences live in `preferences.json` in the platform user configuration direct
 
 ## Saving and operation safety
 
-- Starting a new address book, opening another, or exiting (including the window close button) prompts **Save / Discard / Cancel** when there are unsaved changes. Failed saves leave the confirmation open, and so does cancelling the dialog that asks where an untitled book should go.
+- Starting a new address book, opening another, or exiting (including the window close button) prompts **Save / Discard / Cancel** when there are unsaved changes. The prompt names what is unsaved. Exiting also covers unsaved scripts, so **Save and quit** writes the address book and the script library, and **Discard all changes and quit** abandons both. Failed saves leave the confirmation open, and so does cancelling the dialog that asks where an untitled book should go.
 - Device removal, address-book switching, and exit are blocked while device operations are queued or running. Wait for them to finish; there is no force-cancel during an upload.
 - Autodiscovered devices are not part of the document, so they stay on screen across **New** and **Open**.
 - Every save is read back and compared with what is in memory before it is called a success — the file is the only copy of the data.
@@ -58,24 +67,34 @@ Preferences live in `preferences.json` in the platform user configuration direct
 
 ## Firmware library
 
-Open **Devices → Firmware Editor…** and select a discovered model or enter a model manually, then choose **Choose firmware file…** to assign or replace its firmware. Models are remembered across restarts and are not removed by **Clear Devices**. The editor does not infer models from filenames.
+Open **Devices → Firmware Editor…**, which opens in its own window: a tree of the catalog on the left and the selected model on the right. The tree branches on the assigned firmware file, so every model sharing a file sits under it and models with nothing assigned stay at the root. Select a model there or enter one above, then choose **Choose firmware file…** to assign or replace its firmware. Models are remembered across restarts and are not removed by **Clear Devices**. The editor does not infer models from filenames.
+
+The detail pane reports the assigned file's name, size, import time, and SHA-256, and then reads the firmware itself. A `.puf` is a zip carrying a `~.package.ini`, whose `[Package]` section is shown as a table — the name, version, build date, and whatever else the manufacturer put there. A `.zip` update describes nothing inside, so it reports its file count and the date of its newest entry instead. Only the archive index and that one description are read, never the firmware image, and anything unreadable is reported in place rather than hidden.
 
 Files are copied and SHA-256 verified in a background worker. The catalog is saved automatically, independently of address-book edits, with each model's original filename, relative stored filename, byte count, and SHA-256 checksum. You can move or delete the original source file after a successful import. **Remove assignment** also deletes the stored copy; content shared by another model is retained until its last assignment is removed.
 
-Select address-book targets and choose **Load Firmware** to upload the firmware assigned to each target's model. PUF files are uploaded to the device firmware directory and applied with the Crestron `puf` command; ZIP updates use `pushupdate full`. Firmware installation can restart or temporarily disconnect a device, so verify the model assignment before loading.
+Select address-book targets and choose **Load Firmware** to upload the firmware assigned to each target's model. Both kinds are staged in the device firmware directory. A ZIP update is then applied with `pushupdate full`.
 
-Storage is a `firmware` subdirectory beside the `preferences.json` file, so `--config-dir` moves it too:
+A PUF is applied with `puf`, which takes no file name — the device finds what was staged. It reports as it works, then restarts, which ends the session mid-command; that is expected, and neither the dropped connection nor a missing exit status is treated as a failure. The device is then logged into again every 10 seconds for up to 15 minutes, with the wait shown on the device card. A device that never answers ends the operation as a failure; an untrusted host key ends it at once rather than retrying for the full 15 minutes. Once it is back — the port answers before the console does, so the query is repeated until it produces a report — `puf -results` is read and its component table parsed. The table goes to the device log in full, and the card shows a tally of what the device called each component's result. Nothing here decides what counts as success: the device's own wording is carried through.
 
-- Linux: `~/.config/crestronloadrunner/firmware/` (or `$XDG_CONFIG_HOME/crestronloadrunner/firmware/`)
-- Windows: `%APPDATA%\WorldDomination\CrestronLoadRunner\config\firmware\`
+Firmware installation restarts the device, so verify the model assignment before loading. Exiting and switching address books stay blocked for the whole update, including the restart wait.
+
+Firmware images are large and can be fetched again from the vendor, so the library is kept with the local data rather than beside the preferences. On Windows that keeps it out of a roaming profile, where it would be copied back and forth at every sign-in:
+
+- Linux: `~/.local/share/crestronloadrunner/firmware/` (or `$XDG_DATA_HOME/crestronloadrunner/firmware/`)
+- Windows: `%LOCALAPPDATA%\WorldDomination\CrestronLoadRunner\data\firmware\`
+
+`--config-dir` still gathers every stored file into the directory it names, firmware included, so a throwaway profile cannot reach the real library. A library an earlier build left beside the preferences is moved here at startup. Where the two sit on different volumes the rename cannot happen; rather than copy gigabytes during startup the application reports it in the status bar and goes on using the old directory until you move it yourself.
 
 This directory contains `catalog.json` and checksum-named `.firmware` copies. Their contents are unchanged; the original filenames are recorded in the JSON. Back up the entire directory, not just the catalog. The editor displays its storage location and reports missing files or import/save errors. Exiting is blocked until an active import finishes.
 
 ## Scripts
 
-Open **Devices → Script Editor…**, choose **New script**, give it a unique name, and enter Crestron console commands, one per line. Blank lines and full-line `#` comments are ignored. **Save scripts** saves the whole library, including edits, renames, and deletions; **Discard changes** restores the saved library. Closing the editor keeps drafts in memory, and quitting requires saving or discarding them. Only saved scripts can run.
+Open **Devices → Script Editor…**, choose **New script**, give it a unique name, optionally a **Model**, and enter Crestron console commands, one per line. Blank lines and full-line `#` comments are ignored. The editor opens in its own window: a tree of the library on the left, the selected script on the right, and **New script**, **Delete script**, **Save scripts**, and **Discard changes** across the top. The tree branches on model, so every script sharing a model sits under it; scripts without one stay at the root. **Save scripts** saves the whole library, including edits, renames, and deletions; **Discard changes** restores the saved library. Closing the editor window keeps drafts in memory, and quitting asks whether to save or abandon them. Only saved scripts can run.
 
 Select address-book devices with their **Target** checkboxes, then click **Run Script** after **Load Firmware** in the top bar. Choose a saved script, fill in any variables, review the rendered commands for every target, and click **Run on these devices**. Alternatively, right-click a device and choose **Run Script…** to target only that device, regardless of the checkboxes. The preview snapshots both the targets and script; later selection or editor changes do not alter that run.
+
+**Model** is a case-insensitive wildcard pattern for the device models a script applies to: `*` matches any run of characters and `?` exactly one, so `TSW-*` covers every TSW panel and `TSW-10??` only the ten-inch ones. Run Script preselects the first script in the library whose model matches every target's discovered model; a blank model, an undiscovered model, or a mixed selection preselects the first script instead. The model only preselects. Any saved script can still be chosen and run on any target, so check the picker and the preview before running.
 
 Templates use `{{variable}}` substitutions. Built-ins are `{{device.name}}` (display name, falling back to the host), `{{device.host}}`, `{{device.port}}`, `{{device.model}}`, `{{device.mac}}`, `{{device.firmware}}`, and `{{device.kind}}`. Other names, such as `{{room}}`, become run-time input fields shared across that run's targets. The `device.` prefix is reserved; misspelled built-ins are rejected. Missing or empty values and control characters block execution. Values are inserted literally, without quoting or recursive expansion: review the preview, especially spaces or command separators. There are no loops, conditionals, or local shell execution.
 
@@ -91,6 +110,7 @@ The application uses Crestron console commands over SSH:
 - Processor load: SFTP upload into `/program<NN>` for the target slot, with the program's `.sig` file uploaded alongside it as `.zig`, followed by `progload -p:<slot>`
 - Configuration load: SFTP upload into `/user`; no console command is issued
 - Touchpanel load: SFTP upload into the panel's `/display` directory followed by `projectload`
+- Firmware load: SFTP upload into `/firmware`, then `pushupdate full` for a ZIP, or `puf` for a PUF followed — after the device restarts and is reconnected to — by `puf -results`
 
 Command availability and output vary by Crestron firmware generation. Verify load behavior on a non-production device before deploying broadly.
 

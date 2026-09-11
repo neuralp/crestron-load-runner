@@ -159,22 +159,57 @@ pub struct LoadRunnerApp {
     about_open: bool,
     preferences_open: bool,
     preferences_draft: PreferencesDraft,
+    backdrop: crate::backdrop::Backdrop,
     firmware_editor: crate::firmware::FirmwareEditor,
     script_editor: crate::scripts::ScriptEditor,
     script_run: Option<crate::scripts::RunDialog>,
     notice: Option<String>,
 }
 
+/// The application mark, drawn rather than loaded so it is sharp at any size
+/// and in any theme. The same description rasters the executable's icon.
+fn mark(ui: &mut egui::Ui, size: f32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let gold = egui::Color32::from_rgb(
+        crate::logo::GOLD[0],
+        crate::logo::GOLD[1],
+        crate::logo::GOLD[2],
+    );
+    for triangle in crate::logo::TRIANGLES {
+        let corners = triangle
+            .iter()
+            .map(|(x, y)| rect.min + egui::vec2(x * size, y * size))
+            .collect();
+        ui.painter().add(egui::Shape::convex_polygon(
+            corners,
+            gold,
+            egui::Stroke::NONE,
+        ));
+    }
+}
+
+/// A dialog that blocks the main window. The backdrop is painted separately,
+/// once per frame, so that stacked dialogs do not darken it twice.
+fn modal(id: &str) -> egui::Modal {
+    egui::Modal::new(egui::Id::new(id)).backdrop_color(egui::Color32::TRANSPARENT)
+}
+
 impl LoadRunnerApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        // Before the editor reads the catalog, since where it reads depends on
+        // whether a library from an earlier build could be moved.
+        let moved = crate::storage::migrate_firmware_dir();
         let (preferences, load_error) = Preferences::load();
         let (startup_book, startup_error) = crate::storage::startup_address_book(&preferences);
         let mut app = Self::from_parts(
             preferences,
             crate::storage::preferences_path(),
             Vec::new(),
-            load_error.or(startup_error),
+            moved.or(load_error).or(startup_error),
         );
         app.firmware_editor = crate::firmware::FirmwareEditor::load(crate::storage::firmware_dir());
         if let Some(path) = startup_book {
@@ -202,6 +237,7 @@ impl LoadRunnerApp {
         };
         Self {
             preferences,
+            backdrop: crate::backdrop::Backdrop::default(),
             script_editor: crate::scripts::ScriptEditor::load(
                 preferences_path
                     .as_ref()
@@ -280,6 +316,18 @@ impl LoadRunnerApp {
                     device.connection = ConnectionState::Busy;
                     device.progress = Some((sent, total));
                     device.last_message = format!("Uploading {sent} of {total} bytes");
+                    device.last_outcome = None;
+                }
+            }
+            WorkerEvent::Status {
+                id,
+                message,
+                progress,
+            } => {
+                if let Some(device) = self.device_mut(&id) {
+                    device.connection = ConnectionState::Busy;
+                    device.progress = progress;
+                    device.last_message = message;
                     device.last_outcome = None;
                 }
             }
@@ -926,13 +974,21 @@ impl LoadRunnerApp {
         self.status_is_error = false;
     }
 
-    fn request_action(&mut self, action: PendingAction, ctx: &egui::Context) {
-        if matches!(action, PendingAction::Quit) && self.script_editor.is_dirty() {
-            self.script_editor.open = true;
-            self.notice =
-                Some("Save scripts or discard changes in Script Editor before quitting".into());
-            return;
+    /// What the pending action would throw away. Quitting abandons the script
+    /// drafts too, so it has to ask about them; switching address books leaves
+    /// the separate script library alone.
+    fn unsaved(&self, action: &PendingAction) -> Vec<&'static str> {
+        let mut unsaved = Vec::new();
+        if self.address_book_dirty {
+            unsaved.push("address book");
         }
+        if *action == PendingAction::Quit && self.script_editor.is_dirty() {
+            unsaved.push("script library");
+        }
+        unsaved
+    }
+
+    fn request_action(&mut self, action: PendingAction, ctx: &egui::Context) {
         if self.firmware_editor.is_busy() {
             self.status_message = "Wait for the firmware file import to finish".into();
             self.status_is_error = true;
@@ -943,10 +999,10 @@ impl LoadRunnerApp {
             self.status_is_error = true;
             return;
         }
-        if self.address_book_dirty {
-            self.pending_action = Some(action);
-        } else {
+        if self.unsaved(&action).is_empty() {
             self.execute_action(action, ctx);
+        } else {
+            self.pending_action = Some(action);
         }
     }
 
@@ -966,12 +1022,26 @@ impl LoadRunnerApp {
         }
     }
 
+    /// `save` writes everything the confirmation listed; otherwise the listed
+    /// changes are abandoned. Either way a failure leaves the confirmation up.
     fn confirm_pending_action(&mut self, save: bool, ctx: &egui::Context) {
-        if self.firmware_editor.is_busy()
-            || self.worker_pool.has_pending()
-            || (save && !self.save_address_book())
-        {
+        if self.firmware_editor.is_busy() || self.worker_pool.has_pending() {
             return;
+        }
+        if save {
+            if self.address_book_dirty && !self.save_address_book() {
+                return;
+            }
+            if self
+                .pending_action
+                .as_ref()
+                .is_some_and(|action| self.unsaved(action).contains(&"script library"))
+                && let Err(error) = self.script_editor.save()
+            {
+                self.status_message = error;
+                self.status_is_error = true;
+                return;
+            }
         }
         if let Some(action) = self.pending_action.take() {
             self.execute_action(action, ctx);
@@ -1981,19 +2051,49 @@ impl LoadRunnerApp {
             .map_or_else(|| id.to_owned(), |device| device.display_name().to_owned())
     }
 
+    /// Whether a dialog is blocking the main window, and so whether the
+    /// frosted backdrop belongs behind it.
+    fn modal_open(&self) -> bool {
+        self.pending_action.is_some()
+            || self.add_device_open
+            || self.preferences_open
+            || self.about_open
+            || self.script_run.is_some()
+            || self.notice.is_some()
+    }
+
     fn dialogs(&mut self, ctx: &egui::Context) {
-        if self.pending_action.is_some() {
-            egui::Modal::new(egui::Id::new("unsaved_address_book")).show(ctx, |ui| {
-                ui.heading("Unsaved address-book changes");
-                ui.label("Save your changes before continuing?");
+        // The editors are separate operating-system windows, so they keep
+        // drawing even while a modal owns the main window.
+        self.firmware_editor.show(ctx);
+        self.script_editor.show(ctx);
+        if self.modal_open() {
+            self.backdrop.paint(ctx);
+        }
+        if let Some(action) = self.pending_action.clone() {
+            let quitting = action == PendingAction::Quit;
+            let unsaved = self.unsaved(&action).join(" and the ");
+            modal("unsaved_address_book").show(ctx, |ui| {
+                ui.heading("Unsaved changes");
+                ui.label(format!("There are unsaved changes in the {unsaved}."));
                 if self.status_is_error {
                     ui.colored_label(ui.visuals().error_fg_color, &self.status_message);
                 }
                 ui.horizontal(|ui| {
-                    if ui.button("Save").clicked() {
+                    if ui
+                        .button(if quitting { "Save and quit" } else { "Save" })
+                        .clicked()
+                    {
                         self.confirm_pending_action(true, ctx);
                     }
-                    if ui.button("Discard").clicked() {
+                    if ui
+                        .button(if quitting {
+                            "Discard all changes and quit"
+                        } else {
+                            "Discard"
+                        })
+                        .clicked()
+                    {
                         self.confirm_pending_action(false, ctx);
                     }
                     if ui.button("Cancel").clicked() {
@@ -2004,177 +2104,170 @@ impl LoadRunnerApp {
             return;
         }
         if self.add_device_open {
-            let mut open = self.add_device_open;
-            egui::Window::new("Add address-book device")
-                .collapsible(false)
-                .resizable(false)
-                .open(&mut open)
-                .show(ctx, |ui| {
-                    egui::Grid::new("address_form")
-                        .num_columns(2)
-                        .spacing([12.0, 8.0])
-                        .show(ui, |ui| {
-                            ui.label("Name");
-                            ui.text_edit_singleline(&mut self.address_draft.name);
-                            ui.end_row();
-                            ui.label("IP / hostname");
-                            ui.text_edit_singleline(&mut self.address_draft.host);
-                            ui.end_row();
-                            ui.label("SSH port");
-                            ui.add(
-                                egui::DragValue::new(&mut self.address_draft.port).range(1..=65535),
-                            );
-                            ui.end_row();
-                            ui.label("Device type");
-                            egui::ComboBox::from_id_salt("address_kind")
-                                .selected_text(self.address_draft.kind.label())
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(
-                                        &mut self.address_draft.kind,
-                                        DeviceKind::Processor,
-                                        "Processor",
-                                    );
-                                    ui.selectable_value(
-                                        &mut self.address_draft.kind,
-                                        DeviceKind::Touchpanel,
-                                        "Touchpanel",
-                                    );
-                                    ui.selectable_value(
-                                        &mut self.address_draft.kind,
-                                        DeviceKind::Unknown,
-                                        "Unknown",
-                                    );
-                                });
-                            ui.end_row();
-                            ui.label("Username");
-                            ui.text_edit_singleline(&mut self.address_draft.username);
-                            ui.end_row();
-                            ui.label("Password");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.address_draft.password)
-                                    .password(true),
-                            );
-                            ui.end_row();
-                        });
-                    ui.small("The address and username are saved. The password is session-only.");
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        if ui.button("Add device").clicked() {
-                            self.add_address();
-                        }
-                        if ui.button("Cancel").clicked() {
-                            self.add_device_open = false;
-                        }
+            modal("add_device").show(ctx, |ui| {
+                ui.heading("Add address-book device");
+                egui::Grid::new("address_form")
+                    .num_columns(2)
+                    .spacing([12.0, 8.0])
+                    .show(ui, |ui| {
+                        ui.label("Name");
+                        ui.text_edit_singleline(&mut self.address_draft.name);
+                        ui.end_row();
+                        ui.label("IP / hostname");
+                        ui.text_edit_singleline(&mut self.address_draft.host);
+                        ui.end_row();
+                        ui.label("SSH port");
+                        ui.add(egui::DragValue::new(&mut self.address_draft.port).range(1..=65535));
+                        ui.end_row();
+                        ui.label("Device type");
+                        egui::ComboBox::from_id_salt("address_kind")
+                            .selected_text(self.address_draft.kind.label())
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.address_draft.kind,
+                                    DeviceKind::Processor,
+                                    "Processor",
+                                );
+                                ui.selectable_value(
+                                    &mut self.address_draft.kind,
+                                    DeviceKind::Touchpanel,
+                                    "Touchpanel",
+                                );
+                                ui.selectable_value(
+                                    &mut self.address_draft.kind,
+                                    DeviceKind::Unknown,
+                                    "Unknown",
+                                );
+                            });
+                        ui.end_row();
+                        ui.label("Username");
+                        ui.text_edit_singleline(&mut self.address_draft.username);
+                        ui.end_row();
+                        ui.label("Password");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.address_draft.password)
+                                .password(true),
+                        );
+                        ui.end_row();
                     });
+                ui.small("The address and username are saved. The password is session-only.");
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Add device").clicked() {
+                        self.add_address();
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.add_device_open = false;
+                    }
                 });
-            self.add_device_open &= open;
+            });
         }
 
         if self.preferences_open {
-            let mut open = self.preferences_open;
-            egui::Window::new("Preferences")
-                .collapsible(false)
-                .resizable(false)
-                .open(&mut open)
-                .show(ctx, |ui| {
-                    ui.label("Default SSH credentials");
-                    ui.small("Used when a device does not have its own username or password.");
-                    ui.add_space(8.0);
-                    egui::Grid::new("preferences_form")
-                        .num_columns(2)
-                        .spacing([12.0, 8.0])
-                        .show(ui, |ui| {
-                            ui.label("Username");
-                            ui.text_edit_singleline(&mut self.preferences_draft.default_username);
-                            ui.end_row();
-                            ui.label("Password");
-                            ui.add(
-                                egui::TextEdit::singleline(
-                                    &mut self.preferences_draft.default_password,
-                                )
-                                .password(true),
-                            );
-                            ui.end_row();
-                        });
-                    ui.small("These credentials are saved in the local application settings.");
-                    ui.add_space(12.0);
-                    ui.separator();
-                    ui.label("At startup");
-                    ui.radio_value(
-                        &mut self.preferences_draft.startup,
-                        StartupBook::Empty,
-                        "Start with an empty address book",
-                    );
-                    ui.radio_value(
-                        &mut self.preferences_draft.startup,
-                        StartupBook::MostRecent,
-                        "Reopen the most recent address book",
-                    );
-                    ui.radio_value(
-                        &mut self.preferences_draft.startup,
-                        StartupBook::Specific,
-                        "Always open a specific address book",
-                    );
-                    let specific = self.preferences_draft.startup == StartupBook::Specific;
-                    let current = self.current_address_book.clone();
-                    ui.add_enabled_ui(specific, |ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            let chosen = &mut self.preferences_draft.default_address_book;
-                            let label = chosen
-                                .as_deref()
-                                .map_or_else(|| "None".to_owned(), file_display_name);
-                            let path = ui.monospace(label);
-                            if let Some(chosen) = chosen.as_deref() {
-                                path.on_hover_text(chosen.display().to_string());
-                            }
-                            if ui.small_button("Choose…").clicked()
-                                && let Some(path) = rfd::FileDialog::new()
-                                    .add_filter("JSON", &["json"])
-                                    .pick_file()
-                            {
-                                *chosen = Some(path);
-                            }
-                            if ui
-                                .add_enabled(
-                                    current.is_some(),
-                                    egui::Button::new("Use current").small(),
-                                )
-                                .clicked()
-                            {
-                                *chosen = current;
-                            }
-                            if chosen.is_some() && ui.small_button("Clear").clicked() {
-                                *chosen = None;
-                            }
-                        });
+            modal("preferences").show(ctx, |ui| {
+                ui.heading("Preferences");
+                ui.label("Default SSH credentials");
+                ui.small("Used when a device does not have its own username or password.");
+                ui.add_space(8.0);
+                egui::Grid::new("preferences_form")
+                    .num_columns(2)
+                    .spacing([12.0, 8.0])
+                    .show(ui, |ui| {
+                        ui.label("Username");
+                        ui.text_edit_singleline(&mut self.preferences_draft.default_username);
+                        ui.end_row();
+                        ui.label("Password");
+                        ui.add(
+                            egui::TextEdit::singleline(
+                                &mut self.preferences_draft.default_password,
+                            )
+                            .password(true),
+                        );
+                        ui.end_row();
                     });
-                    ui.small("Opened at startup while the file still exists.");
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        if ui.button("Save").clicked() {
-                            self.save_preferences();
+                ui.small("These credentials are saved in the local application settings.");
+                ui.add_space(12.0);
+                ui.separator();
+                ui.label("At startup");
+                ui.radio_value(
+                    &mut self.preferences_draft.startup,
+                    StartupBook::Empty,
+                    "Start with an empty address book",
+                );
+                ui.radio_value(
+                    &mut self.preferences_draft.startup,
+                    StartupBook::MostRecent,
+                    "Reopen the most recent address book",
+                );
+                ui.radio_value(
+                    &mut self.preferences_draft.startup,
+                    StartupBook::Specific,
+                    "Always open a specific address book",
+                );
+                let specific = self.preferences_draft.startup == StartupBook::Specific;
+                let current = self.current_address_book.clone();
+                ui.add_enabled_ui(specific, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        let chosen = &mut self.preferences_draft.default_address_book;
+                        let label = chosen
+                            .as_deref()
+                            .map_or_else(|| "None".to_owned(), file_display_name);
+                        let path = ui.monospace(label);
+                        if let Some(chosen) = chosen.as_deref() {
+                            path.on_hover_text(chosen.display().to_string());
                         }
-                        if ui.button("Cancel").clicked() {
-                            self.preferences_open = false;
+                        if ui.small_button("Choose…").clicked()
+                            && let Some(path) = rfd::FileDialog::new()
+                                .add_filter("JSON", &["json"])
+                                .pick_file()
+                        {
+                            *chosen = Some(path);
+                        }
+                        if ui
+                            .add_enabled(
+                                current.is_some(),
+                                egui::Button::new("Use current").small(),
+                            )
+                            .clicked()
+                        {
+                            *chosen = current;
+                        }
+                        if chosen.is_some() && ui.small_button("Clear").clicked() {
+                            *chosen = None;
                         }
                     });
                 });
-            self.preferences_open &= open;
+                ui.small("Opened at startup while the file still exists.");
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        self.save_preferences();
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.preferences_open = false;
+                    }
+                });
+            });
         }
 
         if self.about_open {
-            egui::Window::new("About Crestron Load Runner")
-                .open(&mut self.about_open)
-                .resizable(false)
-                .show(ctx, |ui| {
+            modal("about").show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(4.0);
+                    mark(ui, 96.0);
+                    ui.add_space(8.0);
                     ui.heading("Crestron Load Runner");
                     ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
                     ui.label("Rust + egui device deployment utility");
+                    ui.add_space(4.0);
+                    ui.separator();
+                    if ui.button("Close").clicked() {
+                        self.about_open = false;
+                    }
                 });
+            });
         }
 
-        self.firmware_editor.show(ctx);
-        self.script_editor.show(ctx);
         if let Some(mut dialog) = self.script_run.take() {
             if let Some(request) = dialog.show(ctx) {
                 self.queue_script(request);
@@ -2185,20 +2278,14 @@ impl LoadRunnerApp {
         }
 
         if let Some(message) = self.notice.clone() {
-            let mut open = true;
-            egui::Window::new("Notice")
-                .collapsible(false)
-                .resizable(false)
-                .open(&mut open)
-                .show(ctx, |ui| {
-                    ui.label(message);
-                    if ui.button("OK").clicked() {
-                        self.notice = None;
-                    }
-                });
-            if !open {
-                self.notice = None;
-            }
+            modal("notice").show(ctx, |ui| {
+                ui.heading("Notice");
+                ui.label(message);
+                ui.separator();
+                if ui.button("OK").clicked() {
+                    self.notice = None;
+                }
+            });
         }
     }
 }
