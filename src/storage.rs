@@ -164,8 +164,24 @@ pub fn save_address_book(path: &Path, entries: &[AddressEntry]) -> io::Result<()
     };
     let data = serde_json::to_vec_pretty(&document).map_err(io::Error::other)?;
     let temporary = path.with_extension("json.tmp");
-    fs::write(&temporary, data)?;
-    fs::rename(temporary, path)
+    // Books can contain API tokens. Create a private temporary file rather
+    // than following or reusing an existing temporary file/symlink.
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary)?;
+    use std::io::Write as _;
+    let written = file.write_all(&data);
+    drop(file);
+    let result = written.and_then(|()| fs::rename(&temporary, path));
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 pub fn load_address_book(path: &Path) -> io::Result<Vec<AddressEntry>> {

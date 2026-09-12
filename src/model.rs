@@ -25,6 +25,7 @@ impl DeviceKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Outcome {
     Succeeded,
+    FirmwareUpToDate,
     Failed,
 }
 
@@ -42,6 +43,8 @@ pub struct Credentials {
 
 #[derive(Clone, Debug, Default)]
 pub struct DeviceDetails {
+    pub disk_free: String,
+    pub ram_free: String,
     pub identity: String,
     pub network: String,
     pub programs: String,
@@ -62,6 +65,8 @@ pub struct Device {
     pub source: DeviceSource,
     pub credentials: Credentials,
     pub ssh_host_key_fingerprint: Option<String>,
+    pub https_certificate: Option<HttpsCertificateTrust>,
+    pub vc4_api_token: Vc4ApiToken,
     pub program_slots: [Option<PathBuf>; 10],
     pub config_slots: [Option<PathBuf>; 10],
     pub touchpanel_project: Option<PathBuf>,
@@ -91,6 +96,8 @@ impl Device {
                 password: String::new(),
             },
             ssh_host_key_fingerprint: entry.ssh_host_key_fingerprint.clone(),
+            https_certificate: entry.https_certificate.clone(),
+            vc4_api_token: entry.vc4_api_token.clone(),
             program_slots: entry.program_slots.clone(),
             config_slots: entry.config_slots.clone(),
             touchpanel_project: entry.touchpanel_project.clone(),
@@ -118,6 +125,8 @@ impl Device {
             port: self.port,
             username: self.credentials.username.clone(),
             ssh_host_key_fingerprint: self.ssh_host_key_fingerprint.clone(),
+            https_certificate: self.https_certificate.clone(),
+            vc4_api_token: self.vc4_api_token.clone(),
             kind: self.kind,
             model: self.model.clone(),
             firmware: self.firmware.clone(),
@@ -152,6 +161,38 @@ impl ConnectionState {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpsCertificateTrust {
+    pub endpoint: String,
+    pub fingerprint: String,
+}
+
+/// Portable address books intentionally serialize this secret; debug output must not.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Vc4ApiToken(String);
+
+impl Vc4ApiToken {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl From<String> for Vc4ApiToken {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl std::fmt::Debug for Vc4ApiToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[REDACTED]")
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AddressEntry {
     pub name: String,
     pub host: String,
@@ -161,6 +202,10 @@ pub struct AddressEntry {
     pub username: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh_host_key_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub https_certificate: Option<HttpsCertificateTrust>,
+    #[serde(default, skip_serializing_if = "Vc4ApiToken::is_empty")]
+    pub vc4_api_token: Vc4ApiToken,
     #[serde(default)]
     pub kind: DeviceKind,
     #[serde(default)]
@@ -185,6 +230,8 @@ impl Default for AddressEntry {
             port: default_ssh_port(),
             username: String::new(),
             ssh_host_key_fingerprint: None,
+            https_certificate: None,
+            vc4_api_token: Vc4ApiToken::default(),
             kind: DeviceKind::Unknown,
             model: String::new(),
             firmware: String::new(),

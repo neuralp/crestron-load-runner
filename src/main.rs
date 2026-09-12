@@ -10,16 +10,19 @@ mod cresnet;
 mod device_log;
 mod discovery;
 mod firmware;
+mod firmware_version;
 mod ip_table;
 /// The application mark, shared with `build.rs` by direct inclusion.
 mod logo;
 mod model;
 mod popout;
 mod puf;
+mod resources;
 mod scripts;
 mod ssh;
 mod storage;
 mod terminal;
+mod vc4;
 
 #[cfg(test)]
 mod test_support;

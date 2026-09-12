@@ -144,6 +144,7 @@ pub struct LoadRunnerApp {
     /// queued operations write to.
     worker_sender: std::sync::mpsc::Sender<WorkerEvent>,
     terminals: BTreeMap<String, crate::terminal::Terminal>,
+    vc4: HashMap<String, crate::vc4::Panel>,
     discovery_events: Receiver<DiscoveryEvent>,
     discovery_sender: std::sync::mpsc::Sender<DiscoveryEvent>,
     discovering: bool,
@@ -259,6 +260,7 @@ impl LoadRunnerApp {
             worker_events,
             worker_sender,
             terminals: BTreeMap::new(),
+            vc4: HashMap::new(),
             discovery_events,
             discovery_sender,
             discovering: false,
@@ -337,6 +339,14 @@ impl LoadRunnerApp {
                     device.last_outcome = None;
                 }
             }
+            WorkerEvent::FirmwareUpToDate { id, message } => {
+                if let Some(device) = self.device_mut(&id) {
+                    device.connection = ConnectionState::Connected;
+                    device.progress = None;
+                    device.last_message = message;
+                    device.last_outcome = Some(Outcome::FirmwareUpToDate);
+                }
+            }
             WorkerEvent::Complete { id, message } => {
                 if let Some(device) = self.device_mut(&id) {
                     device.connection = ConnectionState::Connected;
@@ -357,6 +367,11 @@ impl LoadRunnerApp {
     }
 
     fn process_events(&mut self) {
+        self.vc4.retain(|id, _| {
+            self.devices
+                .iter()
+                .any(|d| d.id == *id && crate::vc4::is_vc4(&d.model))
+        });
         while let Ok(event) = self.worker_events.try_recv() {
             self.apply_worker_event(event);
         }
@@ -397,6 +412,7 @@ impl LoadRunnerApp {
                     return;
                 }
                 self.pending_host_keys.remove(&id);
+                self.vc4.remove(&id);
                 self.devices[index].host = discovered.host.clone();
                 self.devices[index].connection = ConnectionState::Disconnected;
                 self.devices[index].details = None;
@@ -468,6 +484,7 @@ impl LoadRunnerApp {
                 .any(|device| device.source == DeviceSource::AddressBook);
         self.discard_discovery_results = self.discovering;
         self.devices.clear();
+        self.vc4.clear();
         self.selected_id = None;
         self.pending_host_keys.clear();
         self.sync_address_book_from_devices();
@@ -551,6 +568,20 @@ impl LoadRunnerApp {
     }
 
     fn refresh_device(&mut self, id: &str) {
+        if let Some(device) = self
+            .devices
+            .iter()
+            .find(|d| d.id == id && crate::vc4::is_vc4(&d.model))
+        {
+            self.vc4
+                .entry(id.to_owned())
+                .or_insert_with(|| {
+                    crate::vc4::Panel::new(device.https_certificate.clone())
+                        .with_token(&device.vc4_api_token)
+                })
+                .refresh(&device.host);
+            return;
+        }
         let Some(connection) = self.connection_spec(id) else {
             return;
         };
@@ -559,6 +590,96 @@ impl LoadRunnerApp {
             .send(id, WorkerCommand::Refresh(connection))
         {
             self.notice = Some(error);
+        }
+    }
+
+    fn vc4_address_book_target(&mut self, id: &str) -> Option<String> {
+        let device = self.devices.iter().find(|d| d.id == id)?;
+        let mut target = id.to_owned();
+        if device.source == DeviceSource::Discovered {
+            target = endpoint_id(&device.host, device.port);
+            self.add_discovered_to_address_book(id);
+            if !self
+                .devices
+                .iter()
+                .any(|d| d.id == target && d.source == DeviceSource::AddressBook)
+                || self
+                    .devices
+                    .iter()
+                    .any(|d| d.id == id && d.source == DeviceSource::Discovered)
+            {
+                self.notice = Some(
+                    "Could not add the server to the address book; VC-4 connection settings were not saved"
+                        .into(),
+                );
+                return None;
+            }
+            if target != id
+                && let Some(panel) = self.vc4.remove(id)
+            {
+                self.vc4.insert(target.clone(), panel);
+            }
+        }
+        Some(target)
+    }
+
+    fn sync_vc4_token(&mut self, id: &str) {
+        let Some(token) = self.vc4.get(id).map(crate::vc4::Panel::token) else {
+            return;
+        };
+        let Some(device) = self.device_mut(id) else {
+            return;
+        };
+        if device.vc4_api_token != token {
+            device.vc4_api_token = token;
+            if device.source == DeviceSource::AddressBook {
+                self.mark_address_book_dirty();
+            }
+        }
+    }
+
+    fn save_vc4_token(&mut self, id: &str) {
+        let Some(target) = self.vc4_address_book_target(id) else {
+            return;
+        };
+        self.sync_vc4_token(&target);
+        self.mark_address_book_dirty();
+        if !self.save_address_book() {
+            self.notice = Some(format!(
+                "API token change has not been saved. {}",
+                self.status_message
+            ));
+        }
+    }
+
+    fn apply_https_trust(&mut self, id: &str, action: crate::vc4::TrustAction) {
+        let Some(target) = self.vc4_address_book_target(id) else {
+            return;
+        };
+        self.sync_vc4_token(&target);
+        let accepted = matches!(action, crate::vc4::TrustAction::Accept(_));
+        let trust = match action {
+            crate::vc4::TrustAction::Accept(trust) => Some(trust),
+            crate::vc4::TrustAction::Forget => None,
+        };
+        self.device_mut(&target)
+            .expect("server still present")
+            .https_certificate = trust.clone();
+        if let Some(panel) = self.vc4.get_mut(&target) {
+            panel.set_trust(trust);
+        }
+        self.mark_address_book_dirty();
+        // Uses the normal write/read-back path. Untitled books open Save As;
+        // cancellation or an I/O failure remains visibly unsaved.
+        if !self.save_address_book() {
+            self.notice = Some(format!(
+                "HTTPS certificate change is only in memory and has not been saved. {}",
+                self.status_message
+            ));
+            return;
+        }
+        if accepted {
+            self.refresh_device(&target);
         }
     }
 
@@ -693,6 +814,7 @@ impl LoadRunnerApp {
         let jobs: Vec<(String, PathBuf, u8)> = self
             .devices
             .iter()
+            .filter(|device| !crate::vc4::is_vc4(&device.model))
             .filter(|device| {
                 target.map_or(device.selected, |id| device.id == id)
                     && device.source == DeviceSource::AddressBook
@@ -763,6 +885,7 @@ impl LoadRunnerApp {
         let jobs: Vec<(String, PathBuf)> = self
             .devices
             .iter()
+            .filter(|device| !crate::vc4::is_vc4(&device.model))
             .filter(|device| {
                 target.map_or(device.selected, |id| device.id == id)
                     && device.source == DeviceSource::AddressBook
@@ -816,6 +939,7 @@ impl LoadRunnerApp {
         let jobs: Vec<(String, PathBuf)> = self
             .devices
             .iter()
+            .filter(|device| !crate::vc4::is_vc4(&device.model))
             .filter(|device| {
                 target.map_or(device.selected, |id| device.id == id)
                     && device.source == DeviceSource::AddressBook
@@ -864,6 +988,7 @@ impl LoadRunnerApp {
         let jobs: Vec<(String, crate::firmware::FirmwareAssignment)> = self
             .devices
             .iter()
+            .filter(|device| !crate::vc4::is_vc4(&device.model))
             .filter(|device| device.selected && device.source == DeviceSource::AddressBook)
             .filter_map(|device| {
                 self.firmware_editor
@@ -988,6 +1113,7 @@ impl LoadRunnerApp {
         }
         self.devices
             .retain(|device| device.source == DeviceSource::Discovered);
+        self.vc4.clear();
         self.address_book.clear();
         self.pending_host_keys.clear();
         self.selected_id = None;
@@ -1111,6 +1237,7 @@ impl LoadRunnerApp {
                         .cloned(),
                 );
                 self.address_book = entries;
+                self.vc4.clear();
                 self.devices = devices;
                 self.selected_id = None;
                 self.pending_host_keys.clear();
@@ -1145,6 +1272,8 @@ impl LoadRunnerApp {
             port: self.address_draft.port,
             username: self.address_draft.username.trim().to_owned(),
             ssh_host_key_fingerprint: None,
+            https_certificate: None,
+            vc4_api_token: Default::default(),
             kind: self.address_draft.kind,
             model: String::new(),
             firmware: String::new(),
@@ -1265,6 +1394,7 @@ impl LoadRunnerApp {
             return;
         }
         self.devices.retain(|device| device.id != id);
+        self.vc4.remove(&id);
         self.address_book
             .retain(|entry| entry.host != host || entry.port != port);
         self.pending_host_keys.remove(&id);
@@ -1638,10 +1768,10 @@ impl LoadRunnerApp {
                         });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
                             ui.vertical(|ui| {
-                                if in_address_book {
+                                if in_address_book && !crate::vc4::is_vc4(&device.model) {
                                     status_badge(ui, device.connection);
                                 }
-                                if in_address_book {
+                                if in_address_book && !crate::vc4::is_vc4(&device.model) {
                                     match device.kind {
                                         DeviceKind::Processor => {
                                             assignments_changed |= slot_one_assignment(
@@ -1674,7 +1804,9 @@ impl LoadRunnerApp {
                     if in_address_book {
                         // Slot 1 of each kind is shown in the card's slot column;
                         // the rest are listed here.
-                        if device.kind == DeviceKind::Processor {
+                        if device.kind == DeviceKind::Processor
+                            && !crate::vc4::is_vc4(&device.model)
+                        {
                             for (slot, path) in device.program_slots.iter().enumerate().skip(1) {
                                 if let Some(path) = path {
                                     assigned_file_row(ui, "Program", slot + 1, path);
@@ -1724,7 +1856,7 @@ impl LoadRunnerApp {
                 ui.close();
             }
             ui.separator();
-            if !is_discovered {
+            if !is_discovered && !crate::vc4::is_vc4(&self.devices[index].model) {
                 let device = &self.devices[index];
                 let kind = device.kind;
                 let has_program = device.program_slots.iter().any(Option::is_some);
@@ -1836,15 +1968,30 @@ impl LoadRunnerApp {
                 let mut remove = false;
                 let mut open_log = false;
                 let mut address_changed = false;
+                let mut model_changed = false;
                 {
                     let device = &mut self.devices[index];
                     ui.label(RichText::new(device.display_name()).strong().size(20.0));
-                    if !device.model.is_empty() {
+                    if device.source == DeviceSource::AddressBook {
+                        ui.horizontal(|ui| {
+                            ui.label("Device model");
+                            model_changed = ui.add(egui::TextEdit::singleline(&mut device.model).hint_text("e.g. VC-4")).changed();
+                        });
+                        if model_changed {
+                            address_changed = true;
+                            let kind = crate::model::classify_model(&device.model);
+                            if kind != DeviceKind::Unknown { device.kind = kind; }
+                        }
+                    } else if !device.model.is_empty() {
                         ui.label(RichText::new(&device.model).strong().size(18.0));
                     }
                     ui.label(format!("{}:{}", device.host, device.port));
                     ui.horizontal(|ui| {
-                        status_badge(ui, device.connection);
+                        if crate::vc4::is_vc4(&device.model) {
+                            ui.label("HTTPS API");
+                        } else {
+                            status_badge(ui, device.connection);
+                        }
                         if device.source == DeviceSource::AddressBook {
                             let previous_kind = device.kind;
                             egui::ComboBox::from_id_salt(("details_kind", &device.id))
@@ -1924,7 +2071,7 @@ impl LoadRunnerApp {
                             remove = true;
                         }
                     });
-                    if device.source == DeviceSource::AddressBook {
+                    if device.source == DeviceSource::AddressBook && !crate::vc4::is_vc4(&device.model) {
                         ui.add_space(8.0);
                         match device.kind {
                             DeviceKind::Processor => {
@@ -1943,6 +2090,7 @@ impl LoadRunnerApp {
                 if address_changed {
                     self.mark_address_book_dirty();
                 }
+                if model_changed { self.vc4.remove(&id); }
 
                 if open_log {
                     self.log_view_open = true;
@@ -1976,8 +2124,21 @@ impl LoadRunnerApp {
                 }
 
                 ui.add_space(8.0);
+                if crate::vc4::is_vc4(&self.devices[index].model) {
+                    let trust = self.devices[index].https_certificate.clone();
+                    let token = self.devices[index].vc4_api_token.clone();
+                    let panel = self.vc4.entry(id.clone()).or_insert_with(|| crate::vc4::Panel::new(trust).with_token(&token));
+                    panel.show(ui, &id);
+                    let save_token = panel.take_token_save();
+                    let trust_action = panel.take_trust_action();
+                    self.sync_vc4_token(&id);
+                    if let Some(action) = trust_action { self.apply_https_trust(&id, action); }
+                    else if save_token { self.save_vc4_token(&id); }
+                    return;
+                }
                 let details = self.devices[index].details.clone();
                 if let Some(details) = details {
+                    crate::resources::show(ui, &details.disk_free, &details.ram_free);
                     detail_section(ui, "Identity", &details.identity, true);
                     detail_section(ui, "Network", &details.network, true);
                     if self.devices[index].kind == DeviceKind::Processor {
@@ -2590,6 +2751,11 @@ fn assignment_slot(
 fn outcome_indicator(ui: &mut egui::Ui, outcome: Outcome, message: &str) {
     let (glyph, label, color) = match outcome {
         Outcome::Succeeded => ("\u{2714}", "Succeeded", Color32::from_rgb(68, 180, 110)),
+        Outcome::FirmwareUpToDate => (
+            "\u{2714}",
+            "Firmware already up to date.",
+            Color32::from_rgb(68, 180, 110),
+        ),
         Outcome::Failed => ("\u{2716}", "Failed", Color32::from_rgb(226, 96, 96)),
     };
     let response = ui.label(

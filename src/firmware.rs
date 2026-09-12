@@ -549,8 +549,7 @@ impl FirmwareEditor {
         egui::CentralPanel::default().show(ui, |ui| self.detail(ui));
     }
 
-    /// The catalog as a tree: a branch per firmware file, holding every model
-    /// it is assigned to, with unassigned models left at the root.
+    /// A branch per model, with its assigned firmware file as a child.
     fn tree(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical()
             .id_salt("firmware_tree_scroll")
@@ -560,29 +559,24 @@ impl FirmwareEditor {
                     ui.weak("No device models yet — discover devices or add one above.");
                     return;
                 }
-                let mut branches: BTreeMap<String, Vec<String>> = BTreeMap::new();
-                let mut roots = Vec::new();
                 for (model, assignment) in &self.catalog.models {
-                    match assignment {
-                        Some(file) => branches
-                            .entry(file.original_name.clone())
-                            .or_default()
-                            .push(model.clone()),
-                        None => roots.push(model.clone()),
+                    if let Some(file) = assignment {
+                        let response = egui::CollapsingHeader::new(model)
+                            .id_salt(("firmware_model", model))
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.selected_model,
+                                    model.clone(),
+                                    &file.original_name,
+                                );
+                            });
+                        if response.header_response.clicked() {
+                            self.selected_model = model.clone();
+                        }
+                    } else {
+                        ui.selectable_value(&mut self.selected_model, model.clone(), model);
                     }
-                }
-                for (file, models) in &branches {
-                    egui::CollapsingHeader::new(file)
-                        .id_salt(("firmware_file", file))
-                        .default_open(true)
-                        .show(ui, |ui| {
-                            for model in models {
-                                ui.selectable_value(&mut self.selected_model, model.clone(), model);
-                            }
-                        });
-                }
-                for model in &roots {
-                    ui.selectable_value(&mut self.selected_model, model.clone(), model);
                 }
             });
     }
@@ -960,7 +954,7 @@ mod tests {
         for model in ["RMC4", "CP4", "TSW-1070"] {
             editor.observe_model(model);
         }
-        // Two models share the file, so the tree has to gather them under it.
+        // A shared file appears separately beneath each assigned model.
         for model in ["RMC4", "CP4"] {
             editor
                 .catalog
@@ -995,8 +989,7 @@ mod tests {
         for expected in [
             "Firmware Editor",
             "Add model",
-            // The tree: a branch per file, its models under it, unassigned at
-            // the root.
+            // The tree: models at the root, with firmware underneath.
             "device.puf",
             "RMC4",
             "CP4",
@@ -1018,13 +1011,35 @@ mod tests {
         }
         assert!(placed(&crate::archive::human_size(file.bytes)).is_some());
         assert!(
-            placed("CP4").unwrap().left() > placed("device.puf").unwrap().left(),
-            "assigned models are not indented under their file"
+            placed("CP4").unwrap().left() < placed("device.puf").unwrap().left(),
+            "firmware is not indented under its model"
         );
         assert!(
-            placed("TSW-1070").unwrap().left() < placed("CP4").unwrap().left(),
+            placed("TSW-1070").unwrap().left() < placed("device.puf").unwrap().left(),
             "an unassigned model is not at the root"
         );
+        let tree_files: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|clipped| {
+                if let egui::Shape::Text(text) = &clipped.shape
+                    && text.galley.text() == "device.puf"
+                    && text.pos.x < placed("Choose firmware file…").unwrap().left()
+                {
+                    Some(text.pos)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            tree_files.len(),
+            2,
+            "shared firmware must appear under both models"
+        );
+        assert!(tree_files[0].y > placed("CP4").unwrap().top());
+        assert!(tree_files[0].y < placed("RMC4").unwrap().top());
+        assert!(tree_files[1].y > placed("RMC4").unwrap().top());
 
         let remove = placed("Remove assignment").unwrap().center();
         output.drop_without_applying_deltas();

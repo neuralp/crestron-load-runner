@@ -123,6 +123,10 @@ pub enum WorkerEvent {
         id: String,
         message: String,
     },
+    FirmwareUpToDate {
+        id: String,
+        message: String,
+    },
     Error {
         id: String,
         message: String,
@@ -516,10 +520,12 @@ async fn disconnect(session: Handle<TrustOnFirstUse>) {
 async fn refresh(spec: &ConnectionSpec, events: &Sender<WorkerEvent>) -> WorkerResult<()> {
     let session = connect(spec, events).await?;
     let details = DeviceDetails {
+        disk_free: section_result(run_command(spec, &session, "free", SSH_TIMEOUT, events).await),
+        ram_free: section_result(run_command(spec, &session, "ramfree", SSH_TIMEOUT, events).await),
         identity: format!(
             "{}\n\n{}",
             section_result(run_command(spec, &session, "hostname", SSH_TIMEOUT, events).await),
-            section_result(run_command(spec, &session, "ver", SSH_TIMEOUT, events).await)
+            section_result(run_command(spec, &session, "ver -v", SSH_TIMEOUT, events).await)
         ),
         network: section_result(run_command(spec, &session, "ipconfig", SSH_TIMEOUT, events).await),
         programs: section_result(
@@ -811,7 +817,7 @@ async fn upload_staged(
         .ok_or_else(|| message(spec, "The selected file has an unsafe or missing file name"))?;
     let (remote_path, command) = transfer(&file_name);
     let transfer = Transfer::new(local_path, remote_path, file_name);
-    upload_files(spec, vec![transfer], Apply::from(command), events).await
+    upload_files(spec, vec![transfer], Apply::from(command), None, events).await
 }
 
 /// A program is staged with its signature: the processor reads the signature
@@ -848,6 +854,7 @@ async fn upload_program(
         spec,
         transfers,
         Apply::Command(format!("progload -p:{slot}")),
+        None,
         events,
     )
     .await
@@ -895,7 +902,15 @@ async fn upload_firmware(
         ));
     };
     let transfer = Transfer::new(local_path, remote_path, remote_name.to_owned());
-    upload_files(spec, vec![transfer], apply, events).await
+    let archive = crate::archive::read(local_path).map_err(|error| {
+        message(
+            spec,
+            format!("Firmware blocked: cannot read package metadata: {error}"),
+        )
+    })?;
+    let version = crate::firmware_version::Version::from_package(&archive.package)
+        .map_err(|error| message(spec, error))?;
+    upload_files(spec, vec![transfer], apply, Some(version), events).await
 }
 
 /// What to do once the firmware is staged. Only the file name decides: a zip
@@ -1092,6 +1107,7 @@ async fn upload_files(
     spec: &ConnectionSpec,
     transfers: Vec<Transfer>,
     apply: Apply,
+    firmware_version: Option<crate::firmware_version::Version>,
     events: &Sender<WorkerEvent>,
 ) -> WorkerResult<()> {
     // Opened before connecting so a missing file fails without touching the device.
@@ -1121,6 +1137,34 @@ async fn upload_files(
         .join(" + ");
 
     let session = connect(spec, events).await?;
+    // Query on this upload's authenticated session, not cached discovery or
+    // Device Details. No SFTP channel or remote file exists until this passes.
+    if let Some(version) = firmware_version {
+        let check = run_command(spec, &session, "ver -v", SSH_TIMEOUT, events)
+            .await
+            .map_err(|error| {
+                format!("Firmware blocked: could not query device PUF version: {error}")
+            })
+            .and_then(|report| version.check_upgrade(&report));
+        match check {
+            Ok(crate::firmware_version::UpgradeCheck::Needed(summary)) => {
+                log(events, &spec.id, Direction::Note, &summary);
+            }
+            Ok(crate::firmware_version::UpgradeCheck::NotNeeded(summary)) => {
+                log(events, &spec.id, Direction::Note, &summary);
+                disconnect(session).await;
+                let _ = events.send(WorkerEvent::FirmwareUpToDate {
+                    id: spec.id.clone(),
+                    message: summary,
+                });
+                return Ok(());
+            }
+            Err(error) => {
+                disconnect(session).await;
+                return Err(message(spec, error));
+            }
+        }
+    }
     let channel = session
         .channel_open_session()
         .await
@@ -1282,6 +1326,14 @@ fn base64_without_dependency(bytes: &[u8]) -> String {
     }
     output
 }
+
+#[cfg(test)]
+#[path = "firmware_preflight_tests.rs"]
+mod firmware_preflight_tests;
+
+#[cfg(test)]
+#[path = "resource_live_tests.rs"]
+mod resource_live_tests;
 
 #[cfg(test)]
 mod tests {

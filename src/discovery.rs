@@ -199,6 +199,8 @@ pub(crate) fn parse_response(data: &[u8], host: String) -> Option<Device> {
         source: DeviceSource::Discovered,
         credentials: Credentials::default(),
         ssh_host_key_fingerprint: None,
+        https_certificate: None,
+        vc4_api_token: Default::default(),
         program_slots: Default::default(),
         config_slots: Default::default(),
         touchpanel_project: None,

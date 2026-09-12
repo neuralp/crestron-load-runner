@@ -6,6 +6,272 @@ fn app() -> LoadRunnerApp {
     LoadRunnerApp::from_parts(Preferences::default(), None, Vec::new(), None)
 }
 
+#[test]
+fn vc4_details_use_rest_tables_and_refresh_never_queues_processor_ssh_commands() {
+    let mut app = app();
+    let mut device = Device::from_address(&AddressEntry {
+        host: "vc4.example.test".into(),
+        model: "VC-4".into(),
+        kind: DeviceKind::Processor,
+        ..Default::default()
+    });
+    device.selected = true;
+    device.program_slots[0] = Some(PathBuf::from("unused.lpz"));
+    device.config_slots[0] = Some(PathBuf::from("unused.cfg"));
+    let id = device.id.clone();
+    app.devices.push(device);
+    app.selected_id = Some(id.clone());
+    app.refresh_device(&id); // Missing API token fails locally, never resolves this host.
+    assert!(!app.worker_pool.has_pending());
+    assert!(app.vc4.contains_key(&id));
+    app.load_assigned_programs();
+    app.load_assigned_configs();
+    assert!(!app.worker_pool.has_pending());
+    app.notice = None;
+    let ctx = egui::Context::default();
+    for _ in 0..3 {
+        ctx.run_ui(input(), |ui| app.details_panel(ui))
+            .drop_without_applying_deltas();
+    }
+    let output = ctx.run_ui(input(), |ui| app.details_panel(ui));
+    let labels = output
+        .shapes
+        .iter()
+        .filter_map(|shape| {
+            if let egui::Shape::Text(text) = &shape.shape {
+                Some(text.galley.text().to_owned())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    assert!(labels.iter().any(|s| s == "ProgramLibrary"));
+    assert!(labels.iter().any(|s| s == "ProgramInstances"));
+    assert!(
+        !labels
+            .iter()
+            .any(|s| s == "Program info" || s == "Cresnet" || s.contains("SLOT 1"))
+    );
+    output.drop_without_applying_deltas();
+    app.remove_selected_address();
+    assert!(!app.vc4.contains_key(&id));
+}
+
+#[test]
+fn vc4_state_does_not_survive_address_book_replacement_or_clear() {
+    let dir = TestDir::new();
+    let mut app = app_in(&dir);
+    let entry = AddressEntry {
+        host: "vc4.example.test".into(),
+        model: "VC-4".into(),
+        kind: DeviceKind::Processor,
+        ..Default::default()
+    };
+    let device = Device::from_address(&entry);
+    let id = device.id.clone();
+    app.devices.push(device);
+    app.refresh_device(&id);
+    let path = dir.path().join("vc4-book.json");
+    assert!(app.write_address_book_to(&path));
+    app.open_address_book(&path);
+    assert!(app.vc4.is_empty());
+    app.refresh_device(&id);
+    app.new_address_book();
+    assert!(app.vc4.is_empty());
+    app.devices.push(Device::from_address(&entry));
+    app.refresh_device(&id);
+    app.clear_devices();
+    assert!(app.vc4.is_empty());
+}
+
+#[test]
+fn vc4_https_approval_saves_reopens_and_forgets_without_touching_ssh_trust() {
+    let dir = TestDir::new();
+    let mut app = app_in(&dir);
+    let trust = crate::model::HttpsCertificateTrust {
+        endpoint: "https://vc4.example.test:8443/".into(),
+        fingerprint: "synthetic-certificate-fingerprint".into(),
+    };
+    let device = Device::from_address(&AddressEntry {
+        host: "vc4.example.test".into(),
+        model: "VC-4".into(),
+        ssh_host_key_fingerprint: Some("synthetic-ssh-fingerprint".into()),
+        ..Default::default()
+    });
+    let id = device.id.clone();
+    app.devices.push(device);
+    let path = dir.path().join("vc4-book.json");
+    assert!(app.write_address_book_to(&path));
+    app.apply_https_trust(&id, crate::vc4::TrustAction::Accept(trust.clone()));
+    assert!(!app.address_book_dirty);
+    let stored = crate::storage::load_address_book(&path).unwrap();
+    assert_eq!(stored[0].https_certificate.as_ref(), Some(&trust));
+    assert_eq!(
+        stored[0].ssh_host_key_fingerprint.as_deref(),
+        Some("synthetic-ssh-fingerprint")
+    );
+    app.open_address_book(&path);
+    assert_eq!(app.devices[0].https_certificate.as_ref(), Some(&trust));
+    app.apply_https_trust(&id, crate::vc4::TrustAction::Forget);
+    assert!(
+        crate::storage::load_address_book(&path).unwrap()[0]
+            .https_certificate
+            .is_none()
+    );
+    assert!(
+        !std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("https_certificate")
+    );
+    let legacy: AddressEntry =
+        serde_json::from_str(r#"{"name":"Legacy","host":"legacy.example.test"}"#).unwrap();
+    assert!(legacy.https_certificate.is_none());
+}
+
+#[test]
+fn vc4_https_approval_promotes_discovered_device_and_reports_save_failure() {
+    let dir = TestDir::new();
+    let mut app = app_in(&dir);
+    let trust = crate::model::HttpsCertificateTrust {
+        endpoint: "https://vc4.example.test/".into(),
+        fingerprint: "synthetic-certificate-fingerprint".into(),
+    };
+    let mut device = Device::from_address(&AddressEntry {
+        host: "vc4.example.test".into(),
+        model: "VC-4".into(),
+        ..Default::default()
+    });
+    device.id = "discovered-vc4".into();
+    device.source = DeviceSource::Discovered;
+    app.devices.push(device);
+    app.refresh_device("discovered-vc4");
+    let path = dir.path().join("vc4-book.json");
+    assert!(app.write_address_book_to(&path));
+    app.apply_https_trust(
+        "discovered-vc4",
+        crate::vc4::TrustAction::Accept(trust.clone()),
+    );
+    assert_eq!(app.devices[0].source, DeviceSource::AddressBook);
+    assert_eq!(
+        crate::storage::load_address_book(&path).unwrap()[0]
+            .https_certificate
+            .as_ref(),
+        Some(&trust)
+    );
+    assert!(!app.vc4.contains_key("discovered-vc4"));
+    let id = app.devices[0].id.clone();
+    assert!(app.vc4.contains_key(&id));
+    app.current_address_book = Some(dir.path().to_owned()); // A directory cannot be replaced with the book.
+    app.apply_https_trust(&id, crate::vc4::TrustAction::Forget);
+    assert!(app.address_book_dirty);
+    assert!(
+        app.notice
+            .as_deref()
+            .unwrap()
+            .contains("has not been saved")
+    );
+    assert_eq!(
+        crate::storage::load_address_book(&path).unwrap()[0]
+            .https_certificate
+            .as_ref(),
+        Some(&trust)
+    );
+}
+
+#[test]
+fn vc4_token_round_trips_without_debug_leaks_and_forgetting_removes_it() {
+    let dir = TestDir::new();
+    let mut app = app_in(&dir);
+    let device = Device::from_address(&AddressEntry {
+        host: "vc4.example.test".into(),
+        model: "VC-4".into(),
+        ..Default::default()
+    });
+    let id = device.id.clone();
+    app.devices.push(device);
+    app.selected_id = Some(id.clone());
+    let token: crate::model::Vc4ApiToken = "synthetic-persisted-token".to_owned().into();
+    app.vc4
+        .insert(id.clone(), crate::vc4::Panel::new(None).with_token(&token));
+    app.sync_vc4_token(&id);
+    assert!(app.address_book_dirty);
+    assert!(!format!("{:?}", app.devices[0]).contains(token.as_str()));
+    let path = dir.path().join("vc4-book.json");
+    assert!(app.write_address_book_to(&path));
+    assert_eq!(
+        crate::storage::load_address_book(&path).unwrap()[0].vc4_api_token,
+        token
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    app.open_address_book(&path);
+    app.selected_id = Some(id.clone());
+    let ctx = egui::Context::default();
+    ctx.run_ui(input(), |ui| app.details_panel(ui))
+        .drop_without_applying_deltas();
+    assert_eq!(app.vc4[&id].token(), token);
+    app.vc4.insert(id.clone(), crate::vc4::Panel::new(None));
+    app.save_vc4_token(&id);
+    assert!(!app.address_book_dirty);
+    assert!(
+        crate::storage::load_address_book(&path).unwrap()[0]
+            .vc4_api_token
+            .is_empty()
+    );
+    assert!(
+        !std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("vc4_api_token")
+    );
+    let legacy: AddressEntry =
+        serde_json::from_str(r#"{"name":"Legacy","host":"legacy.example.test"}"#).unwrap();
+    assert!(legacy.vc4_api_token.is_empty());
+    app.current_address_book = Some(dir.path().to_owned());
+    app.vc4
+        .insert(id.clone(), crate::vc4::Panel::new(None).with_token(&token));
+    app.save_vc4_token(&id);
+    assert!(app.address_book_dirty);
+    assert!(
+        app.notice
+            .as_deref()
+            .unwrap()
+            .contains("token change has not been saved")
+    );
+}
+
+#[test]
+fn vc4_save_token_promotes_discovered_device() {
+    let dir = TestDir::new();
+    let mut app = app_in(&dir);
+    let mut device = Device::from_address(&AddressEntry {
+        host: "vc4.example.test".into(),
+        model: "VC-4".into(),
+        ..Default::default()
+    });
+    device.source = DeviceSource::Discovered;
+    device.id = "discovered-vc4".into();
+    app.devices.push(device);
+    let token: crate::model::Vc4ApiToken = "synthetic-token".to_owned().into();
+    app.vc4.insert(
+        "discovered-vc4".into(),
+        crate::vc4::Panel::new(None).with_token(&token),
+    );
+    let path = dir.path().join("vc4-book.json");
+    assert!(app.write_address_book_to(&path));
+    app.save_vc4_token("discovered-vc4");
+    assert_eq!(
+        crate::storage::load_address_book(&path).unwrap()[0].vc4_api_token,
+        token
+    );
+    assert_eq!(app.devices[0].source, DeviceSource::AddressBook);
+}
+
 /// An app whose preference writes land in `dir` instead of the real
 /// configuration directory, which no test can relocate.
 fn app_in(dir: &TestDir) -> LoadRunnerApp {
@@ -287,6 +553,14 @@ fn quitting_saves_or_abandons_unsaved_scripts() {
 
 #[test]
 fn program_and_cresnet_reports_are_visible_only_for_processors() {
+    // Include the resource gauges and the lower report tables without scrolling.
+    let input = || egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1200.0, 1400.0),
+        )),
+        ..Default::default()
+    };
     let mut app = app();
     let mut device = Device::from_address(&AddressEntry {
         host: "192.0.2.1".into(),
@@ -1086,6 +1360,20 @@ fn load_results_become_an_indicator_and_the_text_goes_to_the_log() {
     // The card shows the indicator, not the load's output text.
     let texts = rendered_texts(&mut app);
     assert!(texts.iter().any(|text| text.contains("Succeeded")));
+    app.apply_worker_event(WorkerEvent::FirmwareUpToDate {
+        id: id.clone(),
+        message: "Firmware upgrade not needed: package matches device PUF".into(),
+    });
+    assert_eq!(app.devices[0].last_outcome, Some(Outcome::FirmwareUpToDate));
+    assert_eq!(app.devices[0].connection, ConnectionState::Connected);
+    assert!(app.devices[0].progress.is_none());
+    let texts = rendered_texts(&mut app);
+    assert!(
+        texts
+            .iter()
+            .any(|text| text == "\u{2714} Firmware already up to date.")
+    );
+    assert!(!texts.iter().any(|text| text.contains("Succeeded")));
     assert!(
         !texts
             .iter()

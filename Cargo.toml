@@ -9,6 +9,8 @@ flate2 = "1.1.10"
 eframe = { version = "0.36.1", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 if-addrs = "0.15.0"
 rfd = "0.17.2"
+reqwest = { version = "0.12.28", default-features = false, features = ["blocking", "rustls-tls-manual-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 russh = { version = "0.63", default-features = false, features = ["ring", "rsa", "flate2"] }
 russh-sftp = "3"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -19,6 +21,7 @@ tokio = { version = "1", features = ["rt", "net", "io-util", "time", "fs", "sync
 
 [build-dependencies]
 flate2 = "1.1.10"
-
-[target."cfg(windows)".build-dependencies]
 winresource = "0.1"
+
+[dev-dependencies]
+rcgen = "0.14"
