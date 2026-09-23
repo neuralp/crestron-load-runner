@@ -8,7 +8,7 @@
 
 use eframe::egui;
 
-use crate::ssh::{ConnectionSpec, TerminalEvent, WorkerEvent};
+use crate::ssh::TerminalEvent;
 
 /// Scrollback kept per session. A device that talks continuously must not grow
 /// the process without limit.
@@ -20,10 +20,13 @@ const RECONNECTING: &str = "-- reconnecting --\n";
 pub struct Terminal {
     pub open: bool,
     title: String,
-    /// Kept so that a window whose session has ended can open another without
-    /// being closed and asked for again.
-    spec: ConnectionSpec,
-    events: std::sync::mpsc::Sender<WorkerEvent>,
+    /// The ends of a session this window has asked for and not yet been given.
+    /// Sessions are opened by whoever holds the device's connection, which is
+    /// the application rather than a window, so asking is all a window does.
+    pending_session: Option<(
+        tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+        std::sync::mpsc::Sender<TerminalEvent>,
+    )>,
     input: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
     output: std::sync::mpsc::Receiver<TerminalEvent>,
     received: String,
@@ -47,20 +50,15 @@ pub struct Terminal {
 
 impl Terminal {
     /// Starts connecting at once: the window opening is the request.
-    pub fn open(
-        name: &str,
-        spec: ConnectionSpec,
-        events: std::sync::mpsc::Sender<WorkerEvent>,
-    ) -> Self {
+    pub fn open(name: &str, host: &str, port: u16) -> Self {
         // Fixed when the window opens: the title is also what tells one
         // window from another, so a later rename must not move it.
-        let title = format!("SSH — {name} ({}:{})", spec.host, spec.port);
+        let title = format!("SSH — {name} ({host}:{port})");
         let (_, output) = std::sync::mpsc::channel();
         let mut terminal = Self {
             open: true,
             title,
-            spec,
-            events,
+            pending_session: None,
             input: None,
             output,
             received: String::new(),
@@ -103,15 +101,29 @@ impl Terminal {
         self.status = "Connecting…".to_owned();
         self.focus_entry = true;
         self.follow = true;
-        if let Err(error) = crate::ssh::open_terminal(
-            self.spec.clone(),
-            from_window,
-            to_window,
-            self.events.clone(),
-        ) {
-            self.status = error;
-            self.input = None;
-        }
+        // Left for the application to pick up: the connection a session runs on
+        // belongs to the device, and the settings it needs are looked up when
+        // the session is started rather than when this window was opened.
+        self.pending_session = Some((from_window, to_window));
+    }
+
+    /// Whether this window is still waiting for a session to be started for
+    /// it. Asked before taking one, so that a window whose device has no
+    /// credentials yet keeps waiting instead of being handed a connection
+    /// that cannot be made.
+    pub fn has_pending_session(&self) -> bool {
+        self.pending_session.is_some()
+    }
+
+    /// Hands over the ends of a session this window is waiting for, to whoever
+    /// can start one.
+    pub fn take_pending_session(
+        &mut self,
+    ) -> Option<(
+        tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+        std::sync::mpsc::Sender<TerminalEvent>,
+    )> {
+        self.pending_session.take()
     }
 
     pub fn show(&mut self, ctx: &egui::Context) {
@@ -136,7 +148,27 @@ impl Terminal {
     }
 
     fn drain(&mut self) {
-        while let Ok(event) = self.output.try_recv() {
+        loop {
+            let event = match self.output.try_recv() {
+                Ok(event) => event,
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                // The session ended without saying so, because whatever was
+                // holding the other end went with it. A window that still
+                // believes it has one has to be told, or it sits reading
+                // "Connected" at nothing.
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    if self.input.is_some() {
+                        self.connected = false;
+                        self.input = None;
+                        self.status = if self.disconnecting {
+                            "Disconnected".to_owned()
+                        } else {
+                            "The session has ended".to_owned()
+                        };
+                    }
+                    break;
+                }
+            };
             match event {
                 TerminalEvent::Opened => {
                     self.connected = true;
@@ -364,14 +396,7 @@ mod tests {
         Terminal {
             open: true,
             title: "SSH — test".to_owned(),
-            spec: ConnectionSpec {
-                id: "192.0.2.1:22".to_owned(),
-                host: "192.0.2.1".to_owned(),
-                port: 22,
-                credentials: Default::default(),
-                trusted_fingerprint: None,
-            },
-            events: std::sync::mpsc::channel().0,
+            pending_session: None,
             input: None,
             output,
             received: String::new(),
@@ -492,6 +517,40 @@ mod tests {
         terminal.connect();
         assert!(!terminal.received.contains(RECONNECTING));
         assert!(terminal.received.is_empty());
+    }
+
+    #[test]
+    fn asking_for_a_session_leaves_its_ends_for_somebody_to_pick_up() {
+        let mut terminal = idle();
+        assert!(terminal.take_pending_session().is_none());
+        terminal.connect();
+        assert!(
+            terminal.take_pending_session().is_some(),
+            "nothing was left for the application to start a session with"
+        );
+        assert!(
+            terminal.take_pending_session().is_none(),
+            "the same session was handed out twice"
+        );
+    }
+
+    /// A session can end without saying so, when whatever was holding the other
+    /// end went with it. The window has to notice, or it sits reading
+    /// "Connected" at nothing and swallows what is typed into it.
+    #[test]
+    fn a_window_whose_session_vanished_stops_saying_it_is_connected() {
+        let mut terminal = idle();
+        terminal.connect();
+        // Taken and dropped, the way a worker that has stopped would.
+        drop(terminal.take_pending_session());
+        terminal.connected = true;
+        terminal.drain();
+        assert!(!terminal.connected);
+        assert!(
+            terminal.input.is_none(),
+            "the window still offers Disconnect"
+        );
+        assert_eq!(terminal.status, "The session has ended");
     }
 
     /// A terminal with more output than fits, so there is something to scroll.

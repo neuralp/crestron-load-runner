@@ -9,7 +9,8 @@ use eframe::egui::{self, Color32, RichText};
 use crate::{
     discovery::{self, DiscoveryEvent},
     model::{
-        AddressEntry, ConnectionState, Device, DeviceKind, DeviceSource, Outcome, endpoint_id,
+        AddressEntry, ConnectionState, Credentials, Device, DeviceKind, DeviceSource, Outcome,
+        endpoint_id,
     },
     ssh::{ConnectionSpec, WorkerCommand, WorkerEvent, WorkerPool},
     storage::{Preferences, StartupBook},
@@ -126,6 +127,38 @@ enum PendingAction {
     Quit,
 }
 
+/// A connection the session-credential prompt interrupted. Re-run rather than
+/// resumed: nothing had been sent yet, so issuing the same request again once
+/// the prompt is answered is the whole of it.
+///
+/// Console windows are absent deliberately. One asks to be put on a connection
+/// every frame until it is, so leaving its session pending is already the
+/// resume, and there is nothing here to remember.
+enum CredentialGate {
+    Refresh(String),
+    RunScript(crate::scripts::RunRequest),
+    LoadPrograms(Option<String>),
+    LoadConfigs(Option<String>),
+    LoadTouchpanels(Option<String>),
+    LoadFirmware,
+}
+
+/// The session-credential prompt while it is up.
+///
+/// No `Debug`: it holds a password, and `Credentials` derives one.
+struct CredentialPrompt {
+    /// What the prompt says it is asking on behalf of.
+    target: String,
+    username: String,
+    password: String,
+    /// Why the prompt came back, when it did.
+    error: Option<String>,
+    /// What to run once it is answered. A console window retries by itself and
+    /// a rejected connection has already reported its failure on the card, so
+    /// both leave this empty.
+    resume: Option<CredentialGate>,
+}
+
 pub struct LoadRunnerApp {
     preferences: Preferences,
     /// Where the preferences are written. The configuration directory is a
@@ -140,9 +173,6 @@ pub struct LoadRunnerApp {
     search: String,
     worker_pool: WorkerPool,
     worker_events: Receiver<WorkerEvent>,
-    /// Kept so an interactive session can log to the same device log the
-    /// queued operations write to.
-    worker_sender: std::sync::mpsc::Sender<WorkerEvent>,
     terminals: BTreeMap<String, crate::terminal::Terminal>,
     vc4: HashMap<String, crate::vc4::Panel>,
     discovery_events: Receiver<DiscoveryEvent>,
@@ -168,6 +198,12 @@ pub struct LoadRunnerApp {
     firmware_editor: crate::firmware::FirmwareEditor,
     script_editor: crate::scripts::ScriptEditor,
     script_run: Option<crate::scripts::RunDialog>,
+    /// Typed into the prompt that appears when neither the device nor the
+    /// preferences supply a credential. Deliberately not part of
+    /// `Preferences`: it lives no longer than the process, and survives
+    /// opening another address book, which drops every per-device password.
+    session_credentials: Credentials,
+    credential_prompt: Option<CredentialPrompt>,
     notice: Option<String>,
 }
 
@@ -256,9 +292,8 @@ impl LoadRunnerApp {
             filter: DeviceFilter::All,
             view: DeviceView::All,
             search: String::new(),
-            worker_pool: WorkerPool::new(worker_sender.clone()),
+            worker_pool: WorkerPool::new(worker_sender),
             worker_events,
-            worker_sender,
             terminals: BTreeMap::new(),
             vc4: HashMap::new(),
             discovery_events,
@@ -284,6 +319,8 @@ impl LoadRunnerApp {
             preferences_open: false,
             preferences_draft,
             firmware_editor: Default::default(),
+            session_credentials: Credentials::default(),
+            credential_prompt: None,
             notice: None,
         }
     }
@@ -361,6 +398,23 @@ impl LoadRunnerApp {
                     device.progress = None;
                     device.last_message = message;
                     device.last_outcome = Some(Outcome::Failed);
+                }
+            }
+            // Says nothing about the device itself: whether the card reports
+            // the failure was already decided by the worker, which sends an
+            // ordinary error alongside this when it is the card's business.
+            //
+            // Only worth asking about when the prompt is what supplies the
+            // credential: a device with a password of its own, or one the
+            // saved defaults cover, is corrected where that is kept.
+            //
+            // Nothing is resumed. The operation has already reported its
+            // failure, and silently loading firmware again on the strength of
+            // a corrected password is not what the button was clicked for.
+            WorkerEvent::CredentialsRejected { id, message } => {
+                if self.prompt_supplies_credentials(&id) {
+                    let target = self.device_name(&id);
+                    self.open_credential_prompt(target, None, Some(message));
                 }
             }
         }
@@ -449,14 +503,24 @@ impl LoadRunnerApp {
         self.devices.iter_mut().find(|device| device.id == id)
     }
 
+    /// What the device will be connected as: its own credentials, then the
+    /// saved defaults, then whatever the session-credential prompt was
+    /// answered with. Each field falls back on its own, so a device that
+    /// carries a username but no password keeps its username.
     fn connection_spec(&self, id: &str) -> Option<ConnectionSpec> {
         let device = self.devices.iter().find(|device| device.id == id)?;
         let mut credentials = device.credentials.clone();
         if credentials.username.trim().is_empty() {
             credentials.username = self.preferences.default_username.clone();
         }
+        if credentials.username.trim().is_empty() {
+            credentials.username = self.session_credentials.username.clone();
+        }
         if credentials.password.is_empty() {
             credentials.password = self.preferences.default_password.clone();
+        }
+        if credentials.password.is_empty() {
+            credentials.password = self.session_credentials.password.clone();
         }
         Some(ConnectionSpec {
             id: device.id.clone(),
@@ -465,6 +529,136 @@ impl LoadRunnerApp {
             credentials,
             trusted_fingerprint: device.ssh_host_key_fingerprint.clone(),
         })
+    }
+
+    /// Whether this device would be connected to without a username or a
+    /// password. A device that is no longer listed answers `false`: it has its
+    /// own handling at each call site, and asking for credentials would not
+    /// bring it back.
+    fn connection_needs_credentials(&self, id: &str) -> bool {
+        self.connection_spec(id).is_some_and(|connection| {
+            connection.credentials.username.trim().is_empty()
+                || connection.credentials.password.is_empty()
+        })
+    }
+
+    /// Whether the prompt is what supplies one of this device's credentials,
+    /// and so whether asking again could change what is sent. A device with a
+    /// password of its own, or one covered by the saved defaults, is not the
+    /// prompt's business however it failed.
+    fn prompt_supplies_credentials(&self, id: &str) -> bool {
+        let Some(device) = self.devices.iter().find(|device| device.id == id) else {
+            return false;
+        };
+        (device.credentials.username.trim().is_empty()
+            && self.preferences.default_username.trim().is_empty())
+            || (device.credentials.password.is_empty()
+                && self.preferences.default_password.is_empty())
+    }
+
+    /// Raises the session-credential prompt when any of these devices would
+    /// connect without a username or a password, and answers whether the
+    /// caller should stand down rather than queue anything.
+    ///
+    /// `resume` is run again once the prompt is answered, so the operation the
+    /// user asked for happens without a second click.
+    fn needs_session_credentials(&mut self, targets: &[String], resume: CredentialGate) -> bool {
+        let Some(target) = self.credential_prompt_target(targets.iter().map(String::as_str)) else {
+            return false;
+        };
+        self.open_credential_prompt(target, Some(resume), None);
+        true
+    }
+
+    /// How the prompt names what it is asking on behalf of, or `None` when
+    /// every one of these devices already has credentials.
+    fn credential_prompt_target<'a>(
+        &self,
+        targets: impl IntoIterator<Item = &'a str>,
+    ) -> Option<String> {
+        let wanting = targets
+            .into_iter()
+            .filter(|id| self.connection_needs_credentials(id))
+            .collect::<Vec<_>>();
+        let first = wanting.first()?;
+        Some(match wanting.len() {
+            1 => self.device_name(first),
+            more => format!("{} and {} more", self.device_name(first), more - 1),
+        })
+    }
+
+    /// One prompt at a time: a selection of ten devices with no credentials
+    /// asks once, not ten times.
+    fn open_credential_prompt(
+        &mut self,
+        target: String,
+        resume: Option<CredentialGate>,
+        error: Option<String>,
+    ) {
+        // The unsaved-changes confirmation owns the window and suppresses every
+        // other dialog, so a prompt raised under it would be set but never
+        // drawn, and whatever was waiting on it would wait for ever.
+        if self.credential_prompt.is_some() || self.pending_action.is_some() {
+            return;
+        }
+        self.credential_prompt = Some(CredentialPrompt {
+            target,
+            username: self.session_credentials.username.clone(),
+            password: self.session_credentials.password.clone(),
+            error,
+            resume,
+        });
+    }
+
+    fn answer_credential_prompt(&mut self, prompt: CredentialPrompt) {
+        self.session_credentials = Credentials {
+            username: prompt.username.trim().to_owned(),
+            password: prompt.password,
+        };
+        if let Some(resume) = prompt.resume {
+            match resume {
+                CredentialGate::Refresh(id) => self.refresh_device(&id),
+                CredentialGate::RunScript(request) => self.queue_script(request),
+                CredentialGate::LoadPrograms(target) => {
+                    self.load_assigned_programs_for(target.as_deref());
+                }
+                CredentialGate::LoadConfigs(target) => {
+                    self.load_assigned_configs_for(target.as_deref());
+                }
+                CredentialGate::LoadTouchpanels(target) => {
+                    self.load_assigned_touchpanels_for(target.as_deref());
+                }
+                CredentialGate::LoadFirmware => self.load_assigned_firmware(),
+            }
+        }
+    }
+
+    /// Ends the console-window sessions the prompt was holding up. They ask
+    /// again every frame, so without this the prompt reappears the instant it
+    /// is dismissed.
+    fn cancel_credential_prompt(&mut self) {
+        self.credential_prompt = None;
+        for id in self.terminals_awaiting_credentials() {
+            if let Some(terminal) = self.terminals.get_mut(&id)
+                && let Some((_, output)) = terminal.take_pending_session()
+            {
+                let _ = output.send(crate::ssh::TerminalEvent::Closed(
+                    "No username or password for this device".to_owned(),
+                ));
+            }
+        }
+    }
+
+    /// Console windows waiting on a connection that has no credentials to make
+    /// it with. Gathered before the windows are borrowed for writing, which is
+    /// what resolving a connection alongside them would not allow.
+    fn terminals_awaiting_credentials(&self) -> Vec<String> {
+        self.terminals
+            .iter()
+            .filter(|(_, terminal)| terminal.open && terminal.has_pending_session())
+            .map(|(id, _)| id.clone())
+            .filter(|id| self.connection_needs_credentials(id))
+            .collect()
     }
 
     fn start_discovery(&mut self) {
@@ -484,9 +678,11 @@ impl LoadRunnerApp {
                 .any(|device| device.source == DeviceSource::AddressBook);
         self.discard_discovery_results = self.discovering;
         self.devices.clear();
+        self.retain_listed_terminals();
         self.vc4.clear();
         self.selected_id = None;
         self.pending_host_keys.clear();
+        self.credential_prompt = None;
         self.sync_address_book_from_devices();
         self.address_book_dirty |= address_book_changed;
         self.status_message = format!("Cleared {removed} device(s)");
@@ -580,6 +776,10 @@ impl LoadRunnerApp {
                         .with_token(&device.vc4_api_token)
                 })
                 .refresh(&device.host);
+            return;
+        }
+        if let Some(target) = self.credential_prompt_target([id]) {
+            self.open_credential_prompt(target, Some(CredentialGate::Refresh(id.to_owned())), None);
             return;
         }
         let Some(connection) = self.connection_spec(id) else {
@@ -690,14 +890,63 @@ impl LoadRunnerApp {
             terminal.ensure_connected();
             return;
         }
-        let Some(connection) = self.connection_spec(id) else {
+        let Some(device) = self.devices.iter().find(|device| device.id == id) else {
             return;
         };
+        let (host, port) = (device.host.clone(), device.port);
         let name = self.device_name(id);
         self.terminals.insert(
             id.to_owned(),
-            crate::terminal::Terminal::open(&name, connection, self.worker_sender.clone()),
+            crate::terminal::Terminal::open(&name, &host, port),
         );
+    }
+
+    /// Closes the console windows of devices that are no longer listed. Their
+    /// sessions have gone with the worker that held them, and a window with no
+    /// device behind it has nothing left to reconnect to.
+    fn retain_listed_terminals(&mut self) {
+        let devices = &self.devices;
+        self.terminals
+            .retain(|id, _| devices.iter().any(|device| &device.id == id));
+    }
+
+    /// Puts every window that is waiting for one onto its device's connection.
+    ///
+    /// The settings are looked up now rather than when the window opened, so
+    /// that a password or a host key accepted since then is the one the session
+    /// uses. A window whose device has gone is told, rather than left waiting.
+    fn start_pending_terminal_sessions(&mut self) {
+        // A window with nothing to connect as keeps waiting rather than being
+        // handed a connection that cannot be made. It asks again next frame,
+        // which is what resumes it once the prompt has been answered.
+        let blocked = self.terminals_awaiting_credentials();
+        if let Some(target) = self.credential_prompt_target(blocked.iter().map(String::as_str)) {
+            self.open_credential_prompt(target, None, None);
+        }
+        let waiting = self
+            .terminals
+            .iter_mut()
+            .filter(|(id, terminal)| terminal.open && !blocked.contains(id))
+            .filter_map(|(id, terminal)| {
+                terminal
+                    .take_pending_session()
+                    .map(|ends| (id.clone(), ends))
+            })
+            .collect::<Vec<_>>();
+        for (id, (input, output)) in waiting {
+            let Some(connection) = self.connection_spec(&id) else {
+                let _ = output.send(crate::ssh::TerminalEvent::Closed(
+                    "This device is no longer listed".to_owned(),
+                ));
+                continue;
+            };
+            if let Err(error) = self
+                .worker_pool
+                .open_terminal(&id, connection, input, output)
+            {
+                self.notice = Some(error);
+            }
+        }
     }
 
     fn open_script_run(&mut self, target: Option<&str>) {
@@ -724,6 +973,14 @@ impl LoadRunnerApp {
     }
 
     fn queue_script(&mut self, request: crate::scripts::RunRequest) {
+        // Asked before the request is consumed, so that the whole of it can be
+        // put aside and run again once the prompt is answered.
+        if let Some(target) =
+            self.credential_prompt_target(request.jobs.iter().map(|(id, _)| id.as_str()))
+        {
+            self.open_credential_prompt(target, Some(CredentialGate::RunScript(request)), None);
+            return;
+        }
         // Validate the complete target set before queueing anything. The dialog
         // snapshots targets, so a later selection change cannot broaden a run.
         let jobs = request
@@ -848,6 +1105,14 @@ impl LoadRunnerApp {
             return;
         }
 
+        let targets = jobs.iter().map(|(id, ..)| id.clone()).collect::<Vec<_>>();
+        if self.needs_session_credentials(
+            &targets,
+            CredentialGate::LoadPrograms(target.map(str::to_owned)),
+        ) {
+            return;
+        }
+
         for (id, path, slot) in jobs {
             let Some(connection) = self.connection_spec(&id) else {
                 continue;
@@ -915,6 +1180,14 @@ impl LoadRunnerApp {
             return;
         }
 
+        let targets = jobs.iter().map(|(id, ..)| id.clone()).collect::<Vec<_>>();
+        if self.needs_session_credentials(
+            &targets,
+            CredentialGate::LoadConfigs(target.map(str::to_owned)),
+        ) {
+            return;
+        }
+
         for (id, path) in jobs {
             let Some(connection) = self.connection_spec(&id) else {
                 continue;
@@ -968,6 +1241,14 @@ impl LoadRunnerApp {
             return;
         }
 
+        let targets = jobs.iter().map(|(id, ..)| id.clone()).collect::<Vec<_>>();
+        if self.needs_session_credentials(
+            &targets,
+            CredentialGate::LoadTouchpanels(target.map(str::to_owned)),
+        ) {
+            return;
+        }
+
         for (id, path) in jobs {
             let Some(connection) = self.connection_spec(&id) else {
                 continue;
@@ -1009,6 +1290,11 @@ impl LoadRunnerApp {
                 "Stored firmware file is missing: {}",
                 assignment.local_path.display()
             ));
+            return;
+        }
+
+        let targets = jobs.iter().map(|(id, ..)| id.clone()).collect::<Vec<_>>();
+        if self.needs_session_credentials(&targets, CredentialGate::LoadFirmware) {
             return;
         }
 
@@ -1113,9 +1399,11 @@ impl LoadRunnerApp {
         }
         self.devices
             .retain(|device| device.source == DeviceSource::Discovered);
+        self.retain_listed_terminals();
         self.vc4.clear();
         self.address_book.clear();
         self.pending_host_keys.clear();
+        self.credential_prompt = None;
         self.selected_id = None;
         self.current_address_book = None;
         self.address_book_dirty = false;
@@ -1239,8 +1527,10 @@ impl LoadRunnerApp {
                 self.address_book = entries;
                 self.vc4.clear();
                 self.devices = devices;
+                self.retain_listed_terminals();
                 self.selected_id = None;
                 self.pending_host_keys.clear();
+                self.credential_prompt = None;
                 self.current_address_book = Some(path.to_owned());
                 self.address_book_dirty = false;
                 self.status_message = format!("Loaded {}", path.display());
@@ -1355,6 +1645,13 @@ impl LoadRunnerApp {
             let fingerprint = self.devices[index].ssh_host_key_fingerprint.clone();
             self.devices.remove(index);
             self.pending_host_keys.remove(&old_id);
+            // The device this window was for has been merged into one already
+            // listed, so the window goes with it rather than being orphaned.
+            if let Some(terminal) = self.terminals.remove(&old_id)
+                && !self.terminals.contains_key(&existing)
+            {
+                self.terminals.insert(existing.clone(), terminal);
+            }
             self.selected_id = Some(existing.clone());
             if let Some(device) = self.device_mut(&existing) {
                 device.selected = true;
@@ -1371,6 +1668,12 @@ impl LoadRunnerApp {
         self.devices[index].last_message = "Added to address book".into();
         if let Some(fingerprint) = self.pending_host_keys.remove(&old_id) {
             self.pending_host_keys.insert(new_id.clone(), fingerprint);
+        }
+        // The console window is keyed by the device's id, which has just
+        // changed, so it moves with it rather than being left behind pointing
+        // at a device that no longer exists.
+        if let Some(terminal) = self.terminals.remove(&old_id) {
+            self.terminals.insert(new_id.clone(), terminal);
         }
         self.selected_id = Some(new_id);
         self.mark_address_book_dirty();
@@ -1395,6 +1698,7 @@ impl LoadRunnerApp {
         }
         self.devices.retain(|device| device.id != id);
         self.vc4.remove(&id);
+        self.terminals.remove(&id);
         self.address_book
             .retain(|entry| entry.host != host || entry.port != port);
         self.pending_host_keys.remove(&id);
@@ -2260,6 +2564,7 @@ impl LoadRunnerApp {
             || self.preferences_open
             || self.about_open
             || self.script_run.is_some()
+            || self.credential_prompt.is_some()
             || self.notice.is_some()
     }
 
@@ -2271,6 +2576,7 @@ impl LoadRunnerApp {
         for terminal in self.terminals.values_mut() {
             terminal.show(ctx);
         }
+        self.start_pending_terminal_sessions();
         // A closed window keeps nothing: its session has already ended.
         self.terminals.retain(|_, terminal| terminal.open);
         if self.modal_open() {
@@ -2394,6 +2700,27 @@ impl LoadRunnerApp {
                 ui.small("These credentials are saved in the local application settings.");
                 ui.add_space(12.0);
                 ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Session credentials");
+                    if self.session_credentials.username.trim().is_empty()
+                        && self.session_credentials.password.is_empty()
+                    {
+                        ui.weak("Not set");
+                    } else {
+                        ui.monospace(self.session_credentials.username.clone());
+                        // Cleared on the spot rather than through the draft:
+                        // nothing about it is written to disk, so tying the
+                        // reset to Save would tie it to a file write.
+                        if ui.small_button("Clear").clicked() {
+                            self.session_credentials = Credentials::default();
+                        }
+                    }
+                });
+                ui.small(
+                    "Asked for when a device and the defaults above are both blank. Kept in memory only, and Clear takes effect at once rather than on Save.",
+                );
+                ui.add_space(12.0);
+                ui.separator();
                 ui.label("At startup");
                 ui.radio_value(
                     &mut self.preferences_draft.startup,
@@ -2480,6 +2807,62 @@ impl LoadRunnerApp {
             }
             if dialog.open {
                 self.script_run = Some(dialog);
+            }
+        }
+
+        // Taken and put back, so the closure can hold the entry fields while
+        // answering it still reaches the rest of the application.
+        if let Some(mut prompt) = self.credential_prompt.take() {
+            let mut answered = false;
+            let mut cancelled = false;
+            modal("session_credentials").show(ctx, |ui| {
+                ui.heading("Session SSH credentials");
+                ui.label(format!(
+                    "{} cannot be connected to: no username or password is set on the device or in Preferences.",
+                    prompt.target
+                ));
+                if let Some(error) = &prompt.error {
+                    ui.add_space(4.0);
+                    ui.colored_label(ui.visuals().error_fg_color, error);
+                }
+                ui.add_space(8.0);
+                egui::Grid::new("session_credentials_form")
+                    .num_columns(2)
+                    .spacing([12.0, 8.0])
+                    .show(ui, |ui| {
+                        ui.label("Username");
+                        ui.text_edit_singleline(&mut prompt.username);
+                        ui.end_row();
+                        ui.label("Password");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut prompt.password).password(true),
+                        );
+                        ui.end_row();
+                    });
+                ui.small(
+                    "Used for every device this session that has none of its own. Not saved to disk.",
+                );
+                ui.separator();
+                let complete =
+                    !prompt.username.trim().is_empty() && !prompt.password.is_empty();
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(complete, egui::Button::new("Connect"))
+                        .clicked()
+                    {
+                        answered = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancelled = true;
+                    }
+                });
+            });
+            if answered {
+                self.answer_credential_prompt(prompt);
+            } else if cancelled {
+                self.cancel_credential_prompt();
+            } else {
+                self.credential_prompt = Some(prompt);
             }
         }
 

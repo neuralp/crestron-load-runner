@@ -32,9 +32,11 @@ fn read_rmc3_resources() {
     };
     let (events, _receiver) = mpsc::channel();
     tokio::runtime::Runtime::new().unwrap().block_on(async {
-        let session = connect(&spec, &events).await.unwrap_or_else(|_| {
-            panic!("SSH connection failed; check connectivity and saved host-key trust")
-        });
+        let session = connect(&spec, Announce::OnTheCard, &events)
+            .await
+            .unwrap_or_else(|_| {
+                panic!("SSH connection failed; check connectivity and saved host-key trust")
+            });
         for command in ["free", "ramfree"] {
             let report = run_command(&spec, &session, command, SSH_TIMEOUT, &events)
                 .await
@@ -48,6 +50,6 @@ fn read_rmc3_resources() {
                 crate::archive::human_size(capacity.total)
             );
         }
-        disconnect(session).await;
+        disconnect(&session).await;
     });
 }

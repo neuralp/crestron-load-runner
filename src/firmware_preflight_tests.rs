@@ -108,7 +108,7 @@ fn firmware_preflight_blocks_before_sftp_unless_strictly_newer() {
             let spec = ConnectionSpec { id: "test".into(), host: "127.0.0.1".into(), port,
                 credentials: crate::model::Credentials { username: "test".into(), password: "synthetic".into() }, trusted_fingerprint: Some(fingerprint) };
             let (events, receiver) = mpsc::channel();
-            let result = tokio::time::timeout(Duration::from_secs(5), upload_firmware(&spec, &path, "firmware.puf", &events)).await.unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(5), upload_firmware(&spec, &path, "firmware.puf", &SharedSession::default(), &events)).await.unwrap();
             let not_needed = matches!(expected, "older than" | "same version");
             if not_needed {
                 assert!(result.is_ok(), "older/equal firmware should complete without uploading");

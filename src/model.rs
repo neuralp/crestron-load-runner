@@ -35,10 +35,22 @@ pub enum DeviceSource {
     AddressBook,
 }
 
-#[derive(Clone, Debug, Default)]
+/// Held in memory only; the password is never serialized. Debug output must
+/// not carry it either, the way an API token's does not: it is reached through
+/// `Device`, `ConnectionSpec` and every `WorkerCommand`.
+#[derive(Clone, Default)]
 pub struct Credentials {
     pub username: String,
     pub password: String,
+}
+
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Default)]

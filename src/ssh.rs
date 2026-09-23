@@ -1,14 +1,15 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     net::{TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
-    sync::{
-        Arc, Mutex,
-        mpsc::{self, Receiver, Sender},
-    },
+    sync::{Arc, Mutex, mpsc::Sender},
     thread,
     time::Duration,
 };
+
+/// The tests build their own event channels; the worker's own are handed to it.
+#[cfg(test)]
+use std::sync::mpsc;
 
 use russh::{
     ChannelMsg, Disconnect,
@@ -24,9 +25,30 @@ use crate::{
     model::{Credentials, DeviceDetails},
 };
 
+/// Long enough for a processor on a slow link, short enough that an
+/// unreachable device fails in seconds rather than waiting out the platform's
+/// own. The test build cuts it right down: its devices are deliberately
+/// unroutable, and the suite should not spend seconds waiting for that.
+#[cfg(not(test))]
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(6);
+#[cfg(test)]
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(50);
 const SSH_TIMEOUT: Duration = Duration::from_secs(20);
 const LOAD_TIMEOUT: Duration = Duration::from_secs(300);
+/// How long a held connection may sit unused before the device is allowed to
+/// have it back. A device permits only a few SSH sessions at once, shared with
+/// every other tool on site, so one this application is not using is one
+/// nobody else can have either.
+const IDLE_LIMIT: Duration = Duration::from_secs(20 * 60);
+/// How long the thread waits, as it ends, for a goodbye to reach the device.
+/// Best effort: the process may go first.
+const FAREWELL: Duration = Duration::from_millis(250);
+/// Transport-level liveness for a held connection. This is the operating
+/// system's own probing, not an SSH message, so an idle session stays silent as
+/// far as the device's console and its own idle timer are concerned, while a
+/// peer that has gone away without saying so is still noticed.
+const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
+const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 /// How a PUF update is applied and how its outcome is asked for.
 const PUF_COMMAND: &str = "puf";
 const PUF_RESULTS_COMMAND: &str = "puf -results";
@@ -92,6 +114,14 @@ pub enum WorkerCommand {
         local_path: PathBuf,
         remote_name: String,
     },
+    /// A console window asking to be put on this device's connection. Taken off
+    /// the queue as it arrives rather than waited for in turn, so that a window
+    /// opens while a load is running instead of after it.
+    OpenTerminal {
+        connection: ConnectionSpec,
+        input: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+        output: Sender<TerminalEvent>,
+    },
     Stop,
 }
 
@@ -103,6 +133,12 @@ pub enum WorkerEvent {
     HostKeyUnknown {
         id: String,
         fingerprint: String,
+    },
+    /// The device refused the username and password, or there was none to
+    /// send. Announced so the application can ask for them again.
+    CredentialsRejected {
+        id: String,
+        message: String,
     },
     Details {
         id: String,
@@ -142,7 +178,7 @@ pub enum WorkerEvent {
 }
 
 pub struct WorkerPool {
-    senders: HashMap<String, Sender<WorkerCommand>>,
+    senders: HashMap<String, tokio::sync::mpsc::UnboundedSender<WorkerCommand>>,
     pending: HashMap<String, usize>,
     event_sender: Sender<WorkerEvent>,
 }
@@ -156,20 +192,57 @@ impl WorkerPool {
         }
     }
 
+    /// The device's worker, started if this is the first thing to want it.
+    fn worker(
+        &mut self,
+        id: &str,
+    ) -> Result<&tokio::sync::mpsc::UnboundedSender<WorkerCommand>, String> {
+        if !self.senders.contains_key(id) {
+            let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+            spawn_worker(id.to_owned(), receiver, self.event_sender.clone())?;
+            self.senders.insert(id.to_owned(), sender);
+        }
+        Ok(&self.senders[id])
+    }
+
     pub fn send(&mut self, id: &str, command: WorkerCommand) -> Result<(), String> {
         if matches!(command, WorkerCommand::Stop) {
             return self.retire(id);
         }
-        if !self.senders.contains_key(id) {
-            let (sender, receiver) = mpsc::channel();
-            spawn_worker(id.to_owned(), receiver, self.event_sender.clone())?;
-            self.senders.insert(id.to_owned(), sender);
-        }
-        self.senders[id]
+        self.worker(id)?
             .send(command)
             .map_err(|_| "device worker stopped unexpectedly".to_owned())?;
         *self.pending.entry(id.to_owned()).or_default() += 1;
         Ok(())
+    }
+
+    /// Puts a console window on this device's connection.
+    ///
+    /// Deliberately not `send`: a console is not one of the queued operations,
+    /// and counting it as one would mean the application could never be closed,
+    /// nor its address book changed, while a window was open.
+    pub fn open_terminal(
+        &mut self,
+        id: &str,
+        connection: ConnectionSpec,
+        input: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+        output: Sender<TerminalEvent>,
+    ) -> Result<(), String> {
+        // Kept back so the window is told whichever way this fails.
+        let reply = output.clone();
+        let result = self.worker(id).and_then(|sender| {
+            sender
+                .send(WorkerCommand::OpenTerminal {
+                    connection,
+                    input,
+                    output,
+                })
+                .map_err(|_| "device worker stopped unexpectedly".to_owned())
+        });
+        if let Err(error) = &result {
+            let _ = reply.send(TerminalEvent::Closed(error.clone()));
+        }
+        result
     }
 
     pub fn is_busy(&self, id: &str) -> bool {
@@ -216,12 +289,16 @@ impl Drop for WorkerPool {
     }
 }
 
-/// Each device keeps its own thread, and each thread its own single-threaded
-/// runtime: the command queue stays blocking and per-device, while the SSH
-/// session that thread drives is asynchronous.
+/// Each device keeps its own thread, its own single-threaded runtime, and the
+/// one SSH connection that runtime holds open.
+///
+/// The runtime has to keep running between commands rather than be entered for
+/// each one: russh drives a session on a task of its own, and a task on a
+/// current-thread runtime only makes progress while that runtime does. A
+/// connection left behind by a finished `block_on` would simply stop reading.
 fn spawn_worker(
     id: String,
-    receiver: Receiver<WorkerCommand>,
+    receiver: tokio::sync::mpsc::UnboundedReceiver<WorkerCommand>,
     events: Sender<WorkerEvent>,
 ) -> Result<(), String> {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -230,65 +307,296 @@ fn spawn_worker(
         .map_err(|error| format!("Could not start the SSH runtime: {error}"))?;
     thread::Builder::new()
         .name(format!("ssh-{id}"))
-        .spawn(move || {
-            while let Ok(command) = receiver.recv() {
-                if matches!(command, WorkerCommand::Stop) {
-                    break;
-                }
-                if let Err(error) = runtime.block_on(dispatch(command, &events)) {
-                    match error {
-                        ConnectError::UnknownHostKey { id, fingerprint } => {
-                            log(&events, &id, Direction::Note, "Host key is not trusted");
-                            let _ = events.send(WorkerEvent::HostKeyUnknown { id, fingerprint });
-                        }
-                        ConnectError::Message { id, message } => {
-                            log(&events, &id, Direction::Note, &message);
-                            let _ = events.send(WorkerEvent::Error { id, message });
-                        }
-                    }
-                }
-                let _ = events.send(WorkerEvent::JobFinished { id: id.clone() });
-            }
-        })
+        .spawn(move || runtime.block_on(worker_loop(id, receiver, events)))
         .map(|_| ())
         .map_err(|error| error.to_string())
 }
 
-async fn dispatch(command: WorkerCommand, events: &Sender<WorkerEvent>) -> WorkerResult<()> {
+/// A console window's end of a session, kept so that the window can be told
+/// when the connection underneath it goes.
+struct Console {
+    task: tokio::task::JoinHandle<()>,
+    reply: Sender<TerminalEvent>,
+    /// Which of the device's connections it was put on.
+    generation: u64,
+}
+
+/// Runs one device: its queue, its console window, and the connection they
+/// share.
+///
+/// Queued operations are done one at a time and in order, as they always have
+/// been, but each is run as a task rather than awaited here, so that a console
+/// window can still be opened while a firmware load is running. A console that
+/// had to wait its turn would be useless at exactly the moment it is wanted.
+async fn worker_loop(
+    id: String,
+    mut receiver: tokio::sync::mpsc::UnboundedReceiver<WorkerCommand>,
+    events: Sender<WorkerEvent>,
+) {
+    let device = SharedSession::default();
+    let mut queue: VecDeque<WorkerCommand> = VecDeque::new();
+    let mut running: Option<tokio::task::JoinHandle<()>> = None;
+    let mut console: Option<Console> = None;
+    // Set once this worker has been told to stop. What is still queued is
+    // abandoned, but whatever is already running is waited for: a firmware
+    // transfer cut off partway through would leave the device half written.
+    let mut stopping = false;
+    loop {
+        if stopping && running.is_none() {
+            break;
+        }
+        tokio::select! {
+            command = receiver.recv(), if !stopping => match command {
+                None | Some(WorkerCommand::Stop) => {
+                    stopping = true;
+                    queue.clear();
+                }
+                Some(WorkerCommand::OpenTerminal { connection, input, output }) => {
+                    // One window per device: the application only asks for a
+                    // second once the first has gone.
+                    end_console(&mut console, None).await;
+                    open_console(&device, &mut console, connection, input, output, &events).await;
+                }
+                Some(command) => queue.push_back(command),
+            },
+            Some(()) = finished(&mut running) => {
+                running = None;
+                let _ = events.send(WorkerEvent::JobFinished { id: id.clone() });
+                // A connection replaced while that ran is not the one the window
+                // is on, and two connections to one device is what this is all
+                // meant to avoid.
+                if let Some(open) = &console
+                    && open.generation != device.generation().await
+                {
+                    end_console(
+                        &mut console,
+                        Some("The connection was reopened. Connect again."),
+                    )
+                    .await;
+                }
+            }
+        }
+        if !stopping
+            && running.is_none()
+            && let Some(command) = queue.pop_front()
+        {
+            let _ = events.send(WorkerEvent::Status {
+                id: id.clone(),
+                message: starting(&command),
+                progress: None,
+            });
+            let (queued, reporter) = (device.clone(), events.clone());
+            running = Some(tokio::spawn(async move {
+                if let Err(error) = dispatch(command, &queued, &reporter).await {
+                    report(&reporter, error, Announce::OnTheCard);
+                }
+            }));
+        }
+    }
+    // All of this has to happen while the runtime is still running: closing a
+    // channel and saying goodbye are both work, and there is nowhere left to do
+    // it once `block_on` has returned.
+    end_console(&mut console, Some("The device session was closed")).await;
+    device.close().await;
+}
+
+/// What the device card says as an operation starts.
+///
+/// The card used to learn this from a connection being opened for every
+/// operation. Now that one connection serves them all, there is usually nothing
+/// to open, so the operation says what it is instead, which is more use anyway.
+fn starting(command: &WorkerCommand) -> String {
     match command {
-        WorkerCommand::Refresh(connection) => refresh(&connection, events).await,
+        WorkerCommand::Refresh(_) => "Reading device information".to_owned(),
+        WorkerCommand::RunScript { name, .. } => format!("Running script {name}"),
+        WorkerCommand::UploadProgram { slot, .. } => format!("Loading program slot {slot}"),
+        WorkerCommand::UploadTouchpanel { .. } => "Loading touchpanel project".to_owned(),
+        WorkerCommand::UploadConfig { .. } => "Loading configuration file".to_owned(),
+        WorkerCommand::UploadFirmware { .. } => "Loading firmware".to_owned(),
+        // Neither is ever queued.
+        WorkerCommand::OpenTerminal { .. } | WorkerCommand::Stop => String::new(),
+    }
+}
+
+/// Waits for the running job, or forever when there is none, so that the loop
+/// can select on it either way.
+async fn finished(running: &mut Option<tokio::task::JoinHandle<()>>) -> Option<()> {
+    match running {
+        Some(task) => {
+            let _ = task.await;
+            Some(())
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// Ends a console session and, unless it is only being replaced, says why.
+async fn end_console(console: &mut Option<Console>, reason: Option<&str>) {
+    let Some(console) = console.take() else {
+        return;
+    };
+    console.task.abort();
+    // Waited for, so that the connection it was holding is actually let go
+    // before anything tries to close that connection.
+    let _ = console.task.await;
+    if let Some(reason) = reason {
+        let _ = console.reply.send(TerminalEvent::Closed(reason.to_owned()));
+    }
+}
+
+/// Puts a window on the device's connection, opening one if it has none.
+async fn open_console(
+    device: &SharedSession,
+    console: &mut Option<Console>,
+    connection: ConnectionSpec,
+    input: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    output: Sender<TerminalEvent>,
+    events: &Sender<WorkerEvent>,
+) {
+    // Quietly: the device card belongs to the queued operations, and a console
+    // window is not one of them.
+    let (session, _) = match device.acquire(&connection, Announce::Quietly, events).await {
+        Ok(ready) => ready,
+        Err(error) => {
+            let reason = report(events, error, Announce::Quietly);
+            let _ = output.send(TerminalEvent::Closed(reason));
+            return;
+        }
+    };
+    let generation = device.generation().await;
+    let reply = output.clone();
+    let events = events.clone();
+    let task = tokio::spawn(async move {
+        let reason = match terminal_session(&connection, session, input, &output, &events).await {
+            Ok(()) => String::new(),
+            Err(error) => report(&events, error, Announce::Quietly),
+        };
+        let _ = output.send(TerminalEvent::Closed(reason));
+    });
+    *console = Some(Console {
+        task,
+        reply,
+        generation,
+    });
+}
+
+/// Says what went wrong, and answers with what the window or the card should
+/// show.
+///
+/// An untrusted host key is always announced: offering to accept it is the only
+/// way past it. A plain failure from a console window stays in the device log
+/// and in that window, rather than restating the state of a device whose queued
+/// operations have nothing to do with it.
+fn report(events: &Sender<WorkerEvent>, error: ConnectError, announce: Announce) -> String {
+    match error {
+        ConnectError::UnknownHostKey { id, fingerprint } => {
+            log(events, &id, Direction::Note, "Host key is not trusted");
+            let _ = events.send(WorkerEvent::HostKeyUnknown { id, fingerprint });
+            "The host key is not trusted yet. Accept it, then connect again.".to_owned()
+        }
+        ConnectError::CredentialsRejected { id, message } => {
+            log(events, &id, Direction::Note, &message);
+            // The card is told only when it is the card's business, exactly as
+            // for a plain failure. The prompt, though, is raised whichever way
+            // the connection was asked for: a console window's refusal is as
+            // good a reason to ask for a password as a queued operation's.
+            if announce == Announce::OnTheCard {
+                let _ = events.send(WorkerEvent::Error {
+                    id: id.clone(),
+                    message: message.clone(),
+                });
+            }
+            let _ = events.send(WorkerEvent::CredentialsRejected {
+                id,
+                message: message.clone(),
+            });
+            message
+        }
+        ConnectError::Message { id, message } => {
+            log(events, &id, Direction::Note, &message);
+            if announce == Announce::OnTheCard {
+                let _ = events.send(WorkerEvent::Error {
+                    id,
+                    message: message.clone(),
+                });
+            }
+            message
+        }
+    }
+}
+
+async fn dispatch(
+    command: WorkerCommand,
+    device: &SharedSession,
+    events: &Sender<WorkerEvent>,
+) -> WorkerResult<()> {
+    match command {
+        WorkerCommand::Refresh(connection) => refresh(&connection, device, events).await,
         WorkerCommand::RunScript {
             connection,
             name,
             commands,
-        } => run_script(&connection, &name, &commands, events).await,
+        } => run_script(&connection, &name, &commands, device, events).await,
         WorkerCommand::UploadProgram {
             connection,
             local_path,
             signature,
             slot,
-        } => upload_program(&connection, &local_path, signature.as_deref(), slot, events).await,
+        } => {
+            upload_program(
+                &connection,
+                &local_path,
+                signature.as_deref(),
+                slot,
+                device,
+                events,
+            )
+            .await
+        }
         WorkerCommand::UploadTouchpanel {
             connection,
             local_path,
-        } => upload_staged(&connection, &local_path, touchpanel_transfer, events).await,
+        } => {
+            upload_staged(
+                &connection,
+                &local_path,
+                touchpanel_transfer,
+                device,
+                events,
+            )
+            .await
+        }
         WorkerCommand::UploadConfig {
             connection,
             local_path,
-        } => upload_staged(&connection, &local_path, config_transfer, events).await,
+        } => upload_staged(&connection, &local_path, config_transfer, device, events).await,
         WorkerCommand::UploadFirmware {
             connection,
             local_path,
             remote_name,
-        } => upload_firmware(&connection, &local_path, &remote_name, events).await,
-        WorkerCommand::Stop => Ok(()),
+        } => upload_firmware(&connection, &local_path, &remote_name, device, events).await,
+        // Neither reaches here: the loop takes both before anything is queued.
+        WorkerCommand::Stop | WorkerCommand::OpenTerminal { .. } => Ok(()),
     }
 }
 
 #[derive(Debug)]
 enum ConnectError {
-    UnknownHostKey { id: String, fingerprint: String },
-    Message { id: String, message: String },
+    UnknownHostKey {
+        id: String,
+        fingerprint: String,
+    },
+    /// The device would not take the username and password it was sent, or
+    /// there was none to send. Reported apart from a plain failure so that the
+    /// application can ask for them again, the way it asks about a host key.
+    CredentialsRejected {
+        id: String,
+        message: String,
+    },
+    Message {
+        id: String,
+        message: String,
+    },
 }
 
 type WorkerResult<T> = Result<T, ConnectError>;
@@ -303,6 +611,13 @@ fn log(events: &Sender<WorkerEvent>, id: &str, direction: Direction, text: &str)
 
 fn message(spec: &ConnectionSpec, message: impl Into<String>) -> ConnectError {
     ConnectError::Message {
+        id: spec.id.clone(),
+        message: message.into(),
+    }
+}
+
+fn rejected(spec: &ConnectionSpec, message: impl Into<String>) -> ConnectError {
+    ConnectError::CredentialsRejected {
         id: spec.id.clone(),
         message: message.into(),
     }
@@ -356,25 +671,30 @@ fn host_fingerprint(key: &PublicKey) -> Option<String> {
         .map(|blob| sha256_fingerprint(blob.as_ref()))
 }
 
-async fn connect(
-    spec: &ConnectionSpec,
-    events: &Sender<WorkerEvent>,
-) -> WorkerResult<Handle<TrustOnFirstUse>> {
-    let _ = events.send(WorkerEvent::Connecting {
-        id: spec.id.clone(),
-    });
-    open_connection(spec, events).await
+/// Whether opening a connection is the device card's business. A queued
+/// operation announces itself there; a console window is not one of the queue's
+/// operations and says nothing about the device's state.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Announce {
+    OnTheCard,
+    Quietly,
 }
 
-async fn open_connection(
+async fn connect(
     spec: &ConnectionSpec,
+    announce: Announce,
     events: &Sender<WorkerEvent>,
 ) -> WorkerResult<Handle<TrustOnFirstUse>> {
+    if announce == Announce::OnTheCard {
+        let _ = events.send(WorkerEvent::Connecting {
+            id: spec.id.clone(),
+        });
+    }
     if spec.credentials.username.trim().is_empty() {
-        return Err(message(spec, "Enter an SSH username before connecting"));
+        return Err(rejected(spec, "No SSH username for this device"));
     }
     if spec.credentials.password.is_empty() {
-        return Err(message(spec, "Enter the SSH password for this session"));
+        return Err(rejected(spec, "No SSH password for this device"));
     }
 
     log(
@@ -383,46 +703,65 @@ async fn open_connection(
         Direction::Note,
         &format!("Connecting to {}:{}", spec.host, spec.port),
     );
-    let stream = tcp_connect(spec)?;
+    let stream = tcp_connect(spec).await?;
     let seen = SeenFingerprint::default();
     let session = open_session(spec, stream, SSH_TIMEOUT, &seen).await?;
     authenticate(spec, session).await
 }
 
-/// Connected synchronously so an unreachable device fails in seconds rather
-/// than waiting out the platform's own connect timeout.
-fn tcp_connect(spec: &ConnectionSpec) -> WorkerResult<tokio::net::TcpStream> {
-    let addresses = (spec.host.as_str(), spec.port)
-        .to_socket_addrs()
-        .map_err(|error| message(spec, format!("Could not resolve {}: {error}", spec.host)))?;
-    let mut last_error = None;
-    let mut stream = None;
-    for address in addresses {
-        match TcpStream::connect_timeout(&address, CONNECT_TIMEOUT) {
-            Ok(value) => {
-                stream = Some(value);
-                break;
-            }
-            Err(error) => last_error = Some(error),
-        }
-    }
-    let stream = stream.ok_or_else(|| {
-        message(
-            spec,
-            format!(
-                "Could not connect to {}:{}: {}",
-                spec.host,
-                spec.port,
-                last_error
-                    .map(|error| error.to_string())
-                    .unwrap_or_else(|| "no address found".into())
-            ),
-        )
-    })?;
+/// Opens the socket a session will be held on.
+///
+/// Resolving and connecting are both blocking, and the runtime they would block
+/// now carries the device's held session and any console window on it, so they
+/// are done away from it. Connecting with an explicit timeout is still what
+/// makes an unreachable device fail in seconds rather than waiting out the
+/// platform's own.
+async fn tcp_connect(spec: &ConnectionSpec) -> WorkerResult<tokio::net::TcpStream> {
+    let (host, port) = (spec.host.clone(), spec.port);
+    let stream = tokio::task::spawn_blocking(move || resolve_and_connect(&host, port))
+        .await
+        .map_err(|error| message(spec, format!("Could not connect to {}: {error}", spec.host)))?
+        .map_err(|reason| message(spec, reason))?;
+    // A held connection is silent for as long as nothing is asked of it, so the
+    // operating system is left to notice a peer that has gone away without
+    // saying so. This is not an SSH message: the device's console sees nothing.
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(TCP_KEEPALIVE_IDLE)
+        .with_interval(TCP_KEEPALIVE_INTERVAL);
+    socket2::SockRef::from(&stream)
+        .set_tcp_keepalive(&keepalive)
+        .map_err(|error| message(spec, error.to_string()))?;
+    // Russh only applies its own `nodelay` when it opens the socket itself, and
+    // this one is handed to it already open. It matters here because a console
+    // somebody is typing into shares the socket with bulk file transfers.
+    stream
+        .set_nodelay(true)
+        .map_err(|error| message(spec, error.to_string()))?;
     stream
         .set_nonblocking(true)
         .map_err(|error| message(spec, error.to_string()))?;
     tokio::net::TcpStream::from_std(stream).map_err(|error| message(spec, error.to_string()))
+}
+
+/// Tries every address the name resolves to, and reports the last failure if
+/// none of them answer.
+fn resolve_and_connect(host: &str, port: u16) -> Result<TcpStream, String> {
+    let addresses = (host, port)
+        .to_socket_addrs()
+        .map_err(|error| format!("Could not resolve {host}: {error}"))?;
+    let mut last_error = None;
+    for address in addresses {
+        match TcpStream::connect_timeout(&address, CONNECT_TIMEOUT) {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(format!(
+        "Could not connect to {host}:{port}: {}",
+        last_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "no address found".into())
+    ))
 }
 
 fn ssh_preferences() -> russh::Preferred {
@@ -447,17 +786,33 @@ fn ssh_preferences() -> russh::Preferred {
     preferred
 }
 
+/// How every connection to a device is configured.
+///
+/// A connection is held open between operations and shared with the console
+/// window, so it spends most of its life saying nothing. Russh must not read
+/// that silence as a fault, and no keepalive is sent to break it: the device is
+/// left free to close an idle session on its own schedule.
+///
+/// `inactivity_timeout` is what bounds that silence. It is deliberately not
+/// `None`: russh selects the socket flush against this same timer, so without
+/// it a device that stopped reading would wedge the session with no timeout
+/// anywhere. As a long idle limit it does both jobs at once.
+fn client_config() -> Arc<client::Config> {
+    Arc::new(client::Config {
+        inactivity_timeout: Some(IDLE_LIMIT),
+        keepalive_interval: None,
+        preferred: ssh_preferences(),
+        ..Default::default()
+    })
+}
+
 async fn open_session(
     spec: &ConnectionSpec,
     stream: tokio::net::TcpStream,
     timeout: Duration,
     seen: &SeenFingerprint,
 ) -> WorkerResult<Handle<TrustOnFirstUse>> {
-    let config = Arc::new(client::Config {
-        inactivity_timeout: Some(timeout),
-        preferred: ssh_preferences(),
-        ..Default::default()
-    });
+    let config = client_config();
     let handler = TrustOnFirstUse {
         trusted: spec.trusted_fingerprint.clone(),
         seen: seen.clone(),
@@ -505,22 +860,166 @@ async fn authenticate(
     );
     match tokio::time::timeout(SSH_TIMEOUT, attempt).await {
         Ok(Ok(result)) if result.success() => Ok(session),
-        Ok(Ok(_)) => Err(message(spec, "SSH authentication was not accepted")),
+        // Only an answered refusal is the password's fault. A transport
+        // failure during the exchange, or a timeout, says nothing about it and
+        // must not send the application back to ask for it again.
+        Ok(Ok(_)) => Err(rejected(spec, "SSH authentication was not accepted")),
         Ok(Err(error)) => Err(message(spec, format!("SSH authentication failed: {error}"))),
         Err(_) => Err(message(spec, "Timed out authenticating over SSH")),
     }
 }
 
-async fn disconnect(session: Handle<TrustOnFirstUse>) {
+async fn disconnect(session: &Handle<TrustOnFirstUse>) {
     let _ = session
         .disconnect(Disconnect::ByApplication, "", "English")
         .await;
 }
 
-async fn refresh(spec: &ConnectionSpec, events: &Sender<WorkerEvent>) -> WorkerResult<()> {
-    let session = connect(spec, events).await?;
+/// Whether a connection was already open when it was asked for. Only an
+/// operation working on one that was can start again on a new one: a
+/// connection just made cannot have been dropped before it was used, so a
+/// failure on one is the operation's own.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Reuse {
+    Held,
+    Fresh,
+}
+
+/// The one SSH connection a device gets.
+///
+/// Every queued operation and the console window share it: it is opened the
+/// first time something needs it and held afterwards, so that a refresh, a
+/// script and ten program slots are one conversation with the device rather
+/// than twelve. It is replaced only when the device has dropped it or the
+/// settings it was opened with have stopped matching.
+#[derive(Default)]
+struct DeviceSession {
+    open: Option<(ConnectionSpec, Arc<Handle<TrustOnFirstUse>>)>,
+    /// Counts the connections this device has had. Anything still holding an
+    /// older number is holding a connection that has since been replaced.
+    generation: u64,
+}
+
+impl DeviceSession {
+    async fn acquire(
+        &mut self,
+        spec: &ConnectionSpec,
+        announce: Announce,
+        events: &Sender<WorkerEvent>,
+    ) -> WorkerResult<(Arc<Handle<TrustOnFirstUse>>, Reuse)> {
+        if let Some((open_for, session)) = &self.open {
+            if same_connection(open_for, spec) && !session.is_closed() {
+                return Ok((session.clone(), Reuse::Held));
+            }
+            self.close().await;
+        }
+        let session = Arc::new(connect(spec, announce, events).await?);
+        self.remember(spec, session.clone());
+        Ok((session, Reuse::Fresh))
+    }
+
+    fn remember(&mut self, spec: &ConnectionSpec, session: Arc<Handle<TrustOnFirstUse>>) {
+        self.generation = self.generation.wrapping_add(1);
+        self.open = Some((spec.clone(), session));
+    }
+
+    /// Lets go of the connection without saying goodbye on it: either the
+    /// device is restarting, or it has already taken the connection away.
+    fn forget(&mut self) {
+        if self.open.take().is_some() {
+            self.generation = self.generation.wrapping_add(1);
+        }
+    }
+
+    /// Says goodbye, so that the device frees the session for whoever wants it
+    /// next rather than waiting out its own timeout.
+    async fn close(&mut self) {
+        let Some((_, session)) = self.open.take() else {
+            return;
+        };
+        self.generation = self.generation.wrapping_add(1);
+        disconnect(&session).await;
+        // The goodbye is only written while this runtime is running, and
+        // closing is often the last thing it does. Waiting for the session to
+        // end is what gets it onto the wire. A console window still holding the
+        // connection means there is nothing to wait for here.
+        if let Some(session) = Arc::into_inner(session) {
+            let _ = tokio::time::timeout(FAREWELL, session).await;
+        }
+    }
+}
+
+/// The device's one connection, as its queue and its console window share it.
+/// The lock is held while a connection is made or let go, never while an
+/// operation runs, so that opening a console does not wait out a firmware load.
+#[derive(Clone, Default)]
+struct SharedSession(Arc<tokio::sync::Mutex<DeviceSession>>);
+
+impl SharedSession {
+    async fn acquire(
+        &self,
+        spec: &ConnectionSpec,
+        announce: Announce,
+        events: &Sender<WorkerEvent>,
+    ) -> WorkerResult<(Arc<Handle<TrustOnFirstUse>>, Reuse)> {
+        self.0.lock().await.acquire(spec, announce, events).await
+    }
+
+    async fn forget(&self) {
+        self.0.lock().await.forget();
+    }
+
+    async fn remember(&self, spec: &ConnectionSpec, session: Arc<Handle<TrustOnFirstUse>>) {
+        self.0.lock().await.remember(spec, session);
+    }
+
+    async fn close(&self) {
+        self.0.lock().await.close().await;
+    }
+
+    async fn generation(&self) -> u64 {
+        self.0.lock().await.generation
+    }
+}
+
+/// What has to still be true for an open connection to be the one an operation
+/// wants. The device's id is deliberately not compared: a discovered device
+/// keeps its id when its address changes, and the address is what decides the
+/// connection. The trusted fingerprint is compared because forgetting a host
+/// key promises that the next connection asks about it again, and a held
+/// connection would otherwise sail straight past the question.
+fn same_connection(open_for: &ConnectionSpec, wanted: &ConnectionSpec) -> bool {
+    open_for.host == wanted.host
+        && open_for.port == wanted.port
+        && open_for.credentials.username == wanted.credentials.username
+        && open_for.credentials.password == wanted.credentials.password
+        && open_for.trusted_fingerprint == wanted.trusted_fingerprint
+}
+
+async fn refresh(
+    spec: &ConnectionSpec,
+    device: &SharedSession,
+    events: &Sender<WorkerEvent>,
+) -> WorkerResult<()> {
+    let (mut session, reuse) = device.acquire(spec, Announce::OnTheCard, events).await?;
+    // A connection the device dropped while nothing was being asked of it looks
+    // open until something is. The first query is where that shows, and every
+    // query here is a question rather than a change, so a held connection that
+    // turns out to have gone is replaced and the report simply asked for again.
+    let mut disk_free = run_command(spec, &session, "free", SSH_TIMEOUT, events).await;
+    if disk_free.is_err() && reuse == Reuse::Held {
+        log(
+            events,
+            &spec.id,
+            Direction::Note,
+            "The open connection had gone; opening another",
+        );
+        device.forget().await;
+        (session, _) = device.acquire(spec, Announce::OnTheCard, events).await?;
+        disk_free = run_command(spec, &session, "free", SSH_TIMEOUT, events).await;
+    }
     let details = DeviceDetails {
-        disk_free: section_result(run_command(spec, &session, "free", SSH_TIMEOUT, events).await),
+        disk_free: section_result(disk_free),
         ram_free: section_result(run_command(spec, &session, "ramfree", SSH_TIMEOUT, events).await),
         identity: format!(
             "{}\n\n{}",
@@ -536,7 +1035,6 @@ async fn refresh(spec: &ConnectionSpec, events: &Sender<WorkerEvent>) -> WorkerR
             run_command(spec, &session, "REPORTCRESNET", SSH_TIMEOUT, events).await,
         ),
     };
-    disconnect(session).await;
     events
         .send(WorkerEvent::Details {
             id: spec.id.clone(),
@@ -569,6 +1067,7 @@ async fn run_script(
     spec: &ConnectionSpec,
     name: &str,
     commands: &[String],
+    device: &SharedSession,
     events: &Sender<WorkerEvent>,
 ) -> WorkerResult<()> {
     if commands.is_empty()
@@ -581,7 +1080,10 @@ async fn run_script(
             "A script must contain nonempty, single-line commands",
         ));
     }
-    let session = connect(spec, events).await?;
+    // Deliberately not started again on a new connection if it fails: a script
+    // is whatever somebody wrote, and running part of one twice is worse than
+    // reporting that it stopped.
+    let (session, _) = device.acquire(spec, Announce::OnTheCard, events).await?;
     log(
         events,
         &spec.id,
@@ -598,7 +1100,6 @@ async fn run_script(
             break;
         }
     }
-    disconnect(session).await;
     result?;
     let _ = events.send(WorkerEvent::Complete {
         id: spec.id.clone(),
@@ -678,52 +1179,22 @@ pub enum TerminalEvent {
     Closed(String),
 }
 
-/// Opens an interactive shell on its own thread, outside the command queue: a
-/// session a person is typing into lasts as long as they want it to, and must
-/// not hold up the queued operations or stop the application closing.
+/// Carries an interactive shell between the device and its window.
+///
+/// This runs as a task beside the device's queue rather than in it: a session
+/// somebody is typing into lasts as long as they want it to, and must not hold
+/// up the queued operations or stop the application closing. It is a channel on
+/// the device's one connection, not a connection of its own.
 ///
 /// Everything typed and everything received also reaches the device log, so a
 /// terminal leaves the same record as any other operation.
-pub fn open_terminal(
-    spec: ConnectionSpec,
-    input: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
-    output: Sender<TerminalEvent>,
-    events: Sender<WorkerEvent>,
-) -> Result<(), String> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| format!("Could not start the SSH runtime: {error}"))?;
-    thread::Builder::new()
-        .name(format!("terminal-{}", spec.id))
-        .spawn(move || {
-            let reason = match runtime.block_on(terminal_session(&spec, input, &output, &events)) {
-                Ok(()) => String::new(),
-                Err(ConnectError::UnknownHostKey { id, fingerprint }) => {
-                    log(&events, &id, Direction::Note, "Host key is not trusted");
-                    let _ = events.send(WorkerEvent::HostKeyUnknown { id, fingerprint });
-                    "The host key is not trusted yet. Accept it, then connect again.".to_owned()
-                }
-                Err(ConnectError::Message { message, .. }) => message,
-            };
-            if !reason.is_empty() {
-                log(&events, &spec.id, Direction::Note, &reason);
-            }
-            let _ = output.send(TerminalEvent::Closed(reason));
-        })
-        .map(|_| ())
-        .map_err(|error| error.to_string())
-}
-
 async fn terminal_session(
     spec: &ConnectionSpec,
+    session: Arc<Handle<TrustOnFirstUse>>,
     mut input: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     output: &Sender<TerminalEvent>,
     events: &Sender<WorkerEvent>,
 ) -> WorkerResult<()> {
-    // Without announcing it: the device card belongs to the queued operations,
-    // and a terminal is not one of them.
-    let session = open_connection(spec, events).await?;
     let mut channel = session
         .channel_open_session()
         .await
@@ -774,8 +1245,9 @@ async fn terminal_session(
         );
     }
     log(events, &spec.id, Direction::Note, "Terminal closed");
+    // Only the shell channel is given back. The connection under it belongs to
+    // the device, and whatever else is using it goes on doing so.
     let _ = channel.close().await;
-    disconnect(session).await;
     Ok(())
 }
 
@@ -811,13 +1283,22 @@ async fn upload_staged(
     spec: &ConnectionSpec,
     local_path: &Path,
     transfer: impl FnOnce(&str) -> (String, Option<String>),
+    device: &SharedSession,
     events: &Sender<WorkerEvent>,
 ) -> WorkerResult<()> {
     let file_name = safe_remote_file_name(local_path)
         .ok_or_else(|| message(spec, "The selected file has an unsafe or missing file name"))?;
     let (remote_path, command) = transfer(&file_name);
     let transfer = Transfer::new(local_path, remote_path, file_name);
-    upload_files(spec, vec![transfer], Apply::from(command), None, events).await
+    upload_files(
+        spec,
+        vec![transfer],
+        Apply::from(command),
+        None,
+        device,
+        events,
+    )
+    .await
 }
 
 /// A program is staged with its signature: the processor reads the signature
@@ -827,6 +1308,7 @@ async fn upload_program(
     local_path: &Path,
     signature: Option<&Path>,
     slot: u8,
+    device: &SharedSession,
     events: &Sender<WorkerEvent>,
 ) -> WorkerResult<()> {
     let file_name = safe_remote_file_name(local_path)
@@ -855,6 +1337,7 @@ async fn upload_program(
         transfers,
         Apply::Command(format!("progload -p:{slot}")),
         None,
+        device,
         events,
     )
     .await
@@ -893,6 +1376,7 @@ async fn upload_firmware(
     spec: &ConnectionSpec,
     local_path: &Path,
     remote_name: &str,
+    device: &SharedSession,
     events: &Sender<WorkerEvent>,
 ) -> WorkerResult<()> {
     let Some((remote_path, apply)) = firmware_transfer(remote_name) else {
@@ -902,15 +1386,21 @@ async fn upload_firmware(
         ));
     };
     let transfer = Transfer::new(local_path, remote_path, remote_name.to_owned());
-    let archive = crate::archive::read(local_path).map_err(|error| {
-        message(
-            spec,
-            format!("Firmware blocked: cannot read package metadata: {error}"),
-        )
-    })?;
+    // Reading and unpacking the file blocks, and the runtime it would block now
+    // carries the device's held connection and any console window on it.
+    let package = local_path.to_owned();
+    let archive = tokio::task::spawn_blocking(move || crate::archive::read(&package))
+        .await
+        .map_err(|error| message(spec, format!("Firmware blocked: {error}")))?
+        .map_err(|error| {
+            message(
+                spec,
+                format!("Firmware blocked: cannot read package metadata: {error}"),
+            )
+        })?;
     let version = crate::firmware_version::Version::from_package(&archive.package)
         .map_err(|error| message(spec, error))?;
-    upload_files(spec, vec![transfer], apply, Some(version), events).await
+    upload_files(spec, vec![transfer], apply, Some(version), device, events).await
 }
 
 /// What to do once the firmware is staged. Only the file name decides: a zip
@@ -954,7 +1444,8 @@ fn firmware_transfer(remote_name: &str) -> Option<(String, Apply)> {
 /// wait is a repeated login and the results query is retried after it.
 async fn apply_puf(
     spec: &ConnectionSpec,
-    session: Handle<TrustOnFirstUse>,
+    session: Arc<Handle<TrustOnFirstUse>>,
+    device: &SharedSession,
     timings: Timings,
     events: &Sender<WorkerEvent>,
 ) -> WorkerResult<String> {
@@ -968,11 +1459,20 @@ async fn apply_puf(
             Err(_) => format!("({PUF_COMMAND} was still running after {LOAD_TIMEOUT:?})"),
         };
     log(events, &spec.id, Direction::Received, &report);
-    disconnect(session).await;
+    // Let go of it before saying goodbye, so that nothing waiting on this
+    // device is handed a connection to a processor that is about to restart.
+    device.forget().await;
+    disconnect(&session).await;
+    drop(session);
 
-    let session = await_restart(spec, timings, events).await?;
-    let results = read_puf_results(spec, &session, timings, events).await;
-    disconnect(session).await;
+    // Asked for directly rather than through the device's held connection:
+    // there is deliberately nothing held at this point, and every attempt is
+    // expected to fail until the device answers.
+    let restored = Arc::new(await_restart(spec, timings, events).await?);
+    // The connection it came back on is the one it keeps, so a refresh after a
+    // firmware load does not have to log in again.
+    device.remember(spec, restored.clone()).await;
+    let results = read_puf_results(spec, &restored, timings, events).await;
     let Some(results) = crate::puf::parse(&results) else {
         return Ok("the device did not report component results".to_owned());
     };
@@ -1003,7 +1503,7 @@ async fn await_restart(
     loop {
         tokio::time::sleep(timings.poll).await;
         let waited = started.elapsed();
-        match connect(spec, events).await {
+        match connect(spec, Announce::OnTheCard, events).await {
             Ok(session) => {
                 log(
                     events,
@@ -1014,9 +1514,18 @@ async fn await_restart(
                 return Ok(session);
             }
             Err(error @ ConnectError::UnknownHostKey { .. }) => return Err(error),
-            Err(ConnectError::Message {
-                message: reason, ..
-            }) => {
+            // A device part-way through its restart can answer before it will
+            // take a password, so a refusal here is waited out like any other
+            // failure rather than given up on. The credentials themselves were
+            // good enough to start this load.
+            Err(
+                ConnectError::Message {
+                    message: reason, ..
+                }
+                | ConnectError::CredentialsRejected {
+                    message: reason, ..
+                },
+            ) => {
                 log(
                     events,
                     &spec.id,
@@ -1100,14 +1609,65 @@ fn clock(duration: Duration) -> String {
     format!("{}:{:02}", seconds / 60, seconds % 60)
 }
 
-/// Stages every file over one connection and one SFTP session, then runs the
-/// load command once, so a multi-file load is a single conversation with the
-/// device and reports a single progress bar.
+/// How far the preparation for a transfer got. A firmware package the device
+/// already has calls the whole load off before anything is sent.
+enum Staged {
+    Ready(SftpSession),
+    UpToDate(String),
+}
+
+/// Everything a transfer needs before its first byte: the firmware check, when
+/// there is one, and the SFTP session to write through. Nothing here changes
+/// anything on the device, which is what makes it safe to do twice.
+async fn stage(
+    spec: &ConnectionSpec,
+    session: &Handle<TrustOnFirstUse>,
+    firmware_version: Option<&crate::firmware_version::Version>,
+    events: &Sender<WorkerEvent>,
+) -> WorkerResult<Staged> {
+    // Query on this upload's authenticated session, not cached discovery or
+    // Device Details. No SFTP channel or remote file exists until this passes.
+    if let Some(version) = firmware_version {
+        let check = run_command(spec, session, "ver -v", SSH_TIMEOUT, events)
+            .await
+            .map_err(|error| {
+                format!("Firmware blocked: could not query device PUF version: {error}")
+            })
+            .and_then(|report| version.check_upgrade(&report));
+        match check {
+            Ok(crate::firmware_version::UpgradeCheck::Needed(summary)) => {
+                log(events, &spec.id, Direction::Note, &summary);
+            }
+            Ok(crate::firmware_version::UpgradeCheck::NotNeeded(summary)) => {
+                log(events, &spec.id, Direction::Note, &summary);
+                return Ok(Staged::UpToDate(summary));
+            }
+            Err(error) => return Err(message(spec, error)),
+        }
+    }
+    let channel = session
+        .channel_open_session()
+        .await
+        .map_err(|error| message(spec, format!("Could not open an SSH channel: {error}")))?;
+    channel
+        .request_subsystem(true, "sftp")
+        .await
+        .map_err(|error| message(spec, format!("Could not start SFTP: {error}")))?;
+    let sftp = SftpSession::new(channel.into_stream())
+        .await
+        .map_err(|error| message(spec, format!("Could not start SFTP: {error}")))?;
+    Ok(Staged::Ready(sftp))
+}
+
+/// Stages every file over one SFTP session and then runs the load command once,
+/// so a multi-file load is a single conversation with the device and reports a
+/// single progress bar.
 async fn upload_files(
     spec: &ConnectionSpec,
     transfers: Vec<Transfer>,
     apply: Apply,
     firmware_version: Option<crate::firmware_version::Version>,
+    device: &SharedSession,
     events: &Sender<WorkerEvent>,
 ) -> WorkerResult<()> {
     // Opened before connecting so a missing file fails without touching the device.
@@ -1136,46 +1696,33 @@ async fn upload_files(
         .collect::<Vec<_>>()
         .join(" + ");
 
-    let session = connect(spec, events).await?;
-    // Query on this upload's authenticated session, not cached discovery or
-    // Device Details. No SFTP channel or remote file exists until this passes.
-    if let Some(version) = firmware_version {
-        let check = run_command(spec, &session, "ver -v", SSH_TIMEOUT, events)
-            .await
-            .map_err(|error| {
-                format!("Firmware blocked: could not query device PUF version: {error}")
-            })
-            .and_then(|report| version.check_upgrade(&report));
-        match check {
-            Ok(crate::firmware_version::UpgradeCheck::Needed(summary)) => {
-                log(events, &spec.id, Direction::Note, &summary);
-            }
-            Ok(crate::firmware_version::UpgradeCheck::NotNeeded(summary)) => {
-                log(events, &spec.id, Direction::Note, &summary);
-                disconnect(session).await;
-                let _ = events.send(WorkerEvent::FirmwareUpToDate {
-                    id: spec.id.clone(),
-                    message: summary,
-                });
-                return Ok(());
-            }
-            Err(error) => {
-                disconnect(session).await;
-                return Err(message(spec, error));
-            }
-        }
+    let (mut session, reuse) = device.acquire(spec, Announce::OnTheCard, events).await?;
+    // Everything up to the first byte written can be done again: the firmware
+    // check only asks a question, and no remote file exists until the transfer
+    // starts. So a held connection that turns out to have gone costs another
+    // login here rather than a failed load.
+    let mut staged = stage(spec, &session, firmware_version.as_ref(), events).await;
+    if staged.is_err() && reuse == Reuse::Held {
+        log(
+            events,
+            &spec.id,
+            Direction::Note,
+            "The open connection had gone; opening another",
+        );
+        device.forget().await;
+        (session, _) = device.acquire(spec, Announce::OnTheCard, events).await?;
+        staged = stage(spec, &session, firmware_version.as_ref(), events).await;
     }
-    let channel = session
-        .channel_open_session()
-        .await
-        .map_err(|error| message(spec, format!("Could not open an SSH channel: {error}")))?;
-    channel
-        .request_subsystem(true, "sftp")
-        .await
-        .map_err(|error| message(spec, format!("Could not start SFTP: {error}")))?;
-    let sftp = SftpSession::new(channel.into_stream())
-        .await
-        .map_err(|error| message(spec, format!("Could not start SFTP: {error}")))?;
+    let sftp = match staged? {
+        Staged::Ready(sftp) => sftp,
+        Staged::UpToDate(summary) => {
+            let _ = events.send(WorkerEvent::FirmwareUpToDate {
+                id: spec.id.clone(),
+                message: summary,
+            });
+            return Ok(());
+        }
+    };
 
     let mut buffer = vec![0_u8; CHUNK];
     let mut sent = 0_u64;
@@ -1225,25 +1772,21 @@ async fn upload_files(
     let _ = sftp.close().await;
 
     let completion = match apply {
-        Apply::Nothing => {
-            disconnect(session).await;
-            format!("Uploaded {display_name}")
-        }
+        Apply::Nothing => format!("Uploaded {display_name}"),
         Apply::Command(command) => {
             let output = run_command(spec, &session, &command, LOAD_TIMEOUT, events)
                 .await
                 .map_err(|error| message(spec, format!("Load command failed: {error}")))?;
-            disconnect(session).await;
             if output.trim().is_empty() {
                 format!("Uploaded {display_name}; command completed")
             } else {
                 format!("Uploaded {display_name}: {}", output.trim())
             }
         }
-        // Takes over the session: the device restarts partway through and is
+        // Takes over the connection: the device restarts partway through and is
         // reconnected to before it will say how the update went.
         Apply::Puf => {
-            let summary = apply_puf(spec, session, Timings::DEVICE, events).await?;
+            let summary = apply_puf(spec, session, device, Timings::DEVICE, events).await?;
             format!("Updated firmware from {display_name}: {summary}")
         }
     };
@@ -1359,6 +1902,467 @@ mod tests {
         }
     }
 
+    /// A loopback console that answers commands and counts the connections it
+    /// is given, so that a test can tell one login from several.
+    #[derive(Clone)]
+    struct CountingServer {
+        received: Arc<Mutex<Vec<String>>>,
+        /// Whether to drop the connection once a command has been answered,
+        /// standing for a device that lets an idle session go.
+        close_when_answered: bool,
+    }
+
+    impl russh::server::Handler for CountingServer {
+        type Error = russh::Error;
+
+        async fn auth_password(
+            &mut self,
+            _user: &str,
+            _password: &str,
+        ) -> Result<russh::server::Auth, Self::Error> {
+            Ok(russh::server::Auth::Accept)
+        }
+
+        async fn channel_open_session(
+            &mut self,
+            _channel: russh::Channel<russh::server::Msg>,
+            reply: russh::server::ChannelOpenHandle,
+            _session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            reply.accept().await;
+            Ok(())
+        }
+
+        async fn pty_request(
+            &mut self,
+            channel: russh::ChannelId,
+            _term: &str,
+            _col_width: u32,
+            _row_height: u32,
+            _pix_width: u32,
+            _pix_height: u32,
+            _modes: &[(russh::Pty, u32)],
+            session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            session.channel_success(channel)?;
+            Ok(())
+        }
+
+        async fn shell_request(
+            &mut self,
+            channel: russh::ChannelId,
+            session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            session.channel_success(channel)?;
+            session.data(channel, "console>".to_owned())?;
+            Ok(())
+        }
+
+        async fn data(
+            &mut self,
+            channel: russh::ChannelId,
+            data: &[u8],
+            session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            let typed = String::from_utf8_lossy(data).into_owned();
+            self.received.lock().unwrap().push(format!("typed:{typed}"));
+            session.data(channel, format!("{typed}\nconsole>"))?;
+            Ok(())
+        }
+
+        async fn exec_request(
+            &mut self,
+            channel: russh::ChannelId,
+            data: &[u8],
+            session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            let command = String::from_utf8_lossy(data).into_owned();
+            self.received.lock().unwrap().push(command.clone());
+            session.channel_success(channel)?;
+            session.data(channel, format!("output for {command}"))?;
+            session.exit_status_request(channel, 0)?;
+            session.eof(channel)?;
+            session.close(channel)?;
+            if self.close_when_answered {
+                session.disconnect(Disconnect::ByApplication, "idle", "")?;
+            }
+            Ok(())
+        }
+    }
+
+    /// A running loopback server and what it has seen.
+    struct Loopback {
+        port: u16,
+        fingerprint: String,
+        connections: Arc<std::sync::atomic::AtomicUsize>,
+        received: Arc<Mutex<Vec<String>>>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl Loopback {
+        /// Accepts in a loop and counts, so that a second connection is
+        /// something a test can see rather than merely fail to observe.
+        async fn start(seed: u8, close_when_answered: bool) -> Self {
+            let key = russh::keys::PrivateKey::from(
+                russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&[seed; 32]),
+            );
+            let fingerprint = host_fingerprint(key.public_key()).unwrap();
+            let config = Arc::new(russh::server::Config {
+                keys: vec![key],
+                auth_rejection_time: Duration::ZERO,
+                ..Default::default()
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let received = Arc::new(Mutex::new(Vec::new()));
+            let server = tokio::spawn({
+                let (connections, received) = (connections.clone(), received.clone());
+                async move {
+                    while let Ok((stream, _)) = listener.accept().await {
+                        connections.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let config = config.clone();
+                        let handler = CountingServer {
+                            received: received.clone(),
+                            close_when_answered,
+                        };
+                        tokio::spawn(async move {
+                            if let Ok(session) =
+                                russh::server::run_stream(config, stream, handler).await
+                            {
+                                let _ = session.await;
+                            }
+                        });
+                    }
+                }
+            });
+            Self {
+                port,
+                fingerprint,
+                connections,
+                received,
+                server,
+            }
+        }
+
+        fn spec(&self) -> ConnectionSpec {
+            let mut spec = spec();
+            spec.port = self.port;
+            spec.trusted_fingerprint = Some(self.fingerprint.clone());
+            spec
+        }
+
+        fn connections(&self) -> usize {
+            self.connections.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn received(&self) -> Vec<String> {
+            self.received.lock().unwrap().clone()
+        }
+    }
+
+    /// The point of the whole arrangement: a device is logged in to once, and
+    /// everything afterwards goes over that one connection.
+    #[test]
+    fn operations_after_the_first_reuse_the_one_connection() {
+        runtime().block_on(async {
+            let device_server = Loopback::start(21, false).await;
+            let spec = device_server.spec();
+            let (events, _receiver) = mpsc::channel();
+            let device = SharedSession::default();
+
+            for _ in 0..3 {
+                run_script(&spec, "Test", &["hostname".into()], &device, &events)
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                device_server.connections(),
+                1,
+                "each operation logged in again instead of reusing the connection"
+            );
+
+            refresh(&spec, &device, &events).await.unwrap();
+            assert_eq!(
+                device_server.connections(),
+                1,
+                "a refresh after a script opened a second connection"
+            );
+            assert_eq!(
+                device_server
+                    .received()
+                    .iter()
+                    .filter(|command| *command == "hostname")
+                    .count(),
+                4,
+                "the script ran three times and the refresh asks for the hostname once"
+            );
+            device_server.server.abort();
+        });
+    }
+
+    /// Settings that decide the connection are what decide whether it can be
+    /// kept. Forgetting a host key promises that the next connection asks about
+    /// it again, and a held one would otherwise sail straight past the question.
+    #[test]
+    fn a_connection_is_not_reused_once_its_settings_change() {
+        let base = ConnectionSpec {
+            id: "kept".into(),
+            host: "192.0.2.1".into(),
+            port: 22,
+            credentials: Credentials {
+                username: "admin".into(),
+                password: "secret".into(),
+            },
+            trusted_fingerprint: Some("SHA256:aaa".into()),
+        };
+        assert!(same_connection(&base, &base.clone()));
+        // The id is deliberately not compared: a discovered device keeps its id
+        // when its address changes, and the address is what decides this.
+        let mut renamed = base.clone();
+        renamed.id = "something else".into();
+        assert!(same_connection(&base, &renamed));
+        for changed in [
+            ConnectionSpec {
+                host: "192.0.2.2".into(),
+                ..base.clone()
+            },
+            ConnectionSpec {
+                port: 2222,
+                ..base.clone()
+            },
+            ConnectionSpec {
+                credentials: Credentials {
+                    username: "other".into(),
+                    password: "secret".into(),
+                },
+                ..base.clone()
+            },
+            ConnectionSpec {
+                credentials: Credentials {
+                    username: "admin".into(),
+                    password: "changed".into(),
+                },
+                ..base.clone()
+            },
+            ConnectionSpec {
+                trusted_fingerprint: None,
+                ..base.clone()
+            },
+        ] {
+            assert!(
+                !same_connection(&base, &changed),
+                "{changed:?} should have needed a new connection"
+            );
+        }
+    }
+
+    /// And over the wire: an edited password is a different connection.
+    #[test]
+    fn an_edited_password_opens_another_connection() {
+        runtime().block_on(async {
+            let device_server = Loopback::start(22, false).await;
+            let mut spec = device_server.spec();
+            let (events, _receiver) = mpsc::channel();
+            let device = SharedSession::default();
+
+            run_script(&spec, "Test", &["hostname".into()], &device, &events)
+                .await
+                .unwrap();
+            spec.credentials.password.push('!');
+            run_script(&spec, "Test", &["hostname".into()], &device, &events)
+                .await
+                .unwrap();
+            assert_eq!(
+                device_server.connections(),
+                2,
+                "the connection was kept even though the password had changed"
+            );
+            device_server.server.abort();
+        });
+    }
+
+    /// A device that lets an idle session go is reconnected to rather than
+    /// reported as a failure.
+    #[test]
+    fn a_connection_the_device_dropped_is_replaced() {
+        runtime().block_on(async {
+            let device_server = Loopback::start(23, true).await;
+            let spec = device_server.spec();
+            let (events, _receiver) = mpsc::channel();
+            let device = SharedSession::default();
+
+            refresh(&spec, &device, &events).await.unwrap();
+            // The goodbye has to be read before the next operation asks for the
+            // connection, which is what makes it visibly closed rather than
+            // merely dead.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            refresh(&spec, &device, &events).await.unwrap();
+            assert_eq!(
+                device_server.connections(),
+                2,
+                "a dropped connection has to be replaced, not reused"
+            );
+            device_server.server.abort();
+        });
+    }
+
+    /// A console window and the queued operations share the device's one
+    /// connection, and the window never counts as a queued operation.
+    #[test]
+    fn a_console_window_shares_the_connection_and_never_holds_up_quitting() {
+        // The window side is blocking, so the server needs a thread of its own.
+        let (ready, started) = mpsc::channel();
+        let (finish, finished) = mpsc::channel::<()>();
+        thread::spawn(move || {
+            runtime().block_on(async move {
+                let device_server = Loopback::start(24, false).await;
+                ready
+                    .send((
+                        device_server.port,
+                        device_server.fingerprint.clone(),
+                        device_server.connections.clone(),
+                        device_server.received.clone(),
+                    ))
+                    .unwrap();
+                // Kept answering until the test says it is done.
+                let _ = tokio::task::spawn_blocking(move || finished.recv()).await;
+                device_server.server.abort();
+            });
+        });
+        let (port, fingerprint, connections, received) = started.recv().unwrap();
+
+        let mut spec = spec();
+        spec.port = port;
+        spec.trusted_fingerprint = Some(fingerprint);
+        let (events, worker_events) = mpsc::channel();
+        let (input, from_window) = tokio::sync::mpsc::unbounded_channel();
+        let (to_window, output) = mpsc::channel();
+        let mut pool = WorkerPool::new(events);
+        let id = spec.id.clone();
+
+        pool.open_terminal(&id, spec.clone(), from_window, to_window)
+            .unwrap();
+        assert!(matches!(
+            output.recv_timeout(Duration::from_secs(10)).unwrap(),
+            TerminalEvent::Opened
+        ));
+        assert!(
+            !pool.has_pending(),
+            "a console window must not hold up quitting"
+        );
+
+        // A queued operation, while that window is open.
+        pool.send(
+            &id,
+            WorkerCommand::RunScript {
+                connection: spec,
+                name: "Test".into(),
+                commands: vec!["hostname".into()],
+            },
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match worker_events.recv_timeout(Duration::from_secs(10)).unwrap() {
+                WorkerEvent::JobFinished { .. } => break,
+                _ if std::time::Instant::now() > deadline => panic!("the script never finished"),
+                _ => continue,
+            }
+        }
+        assert_eq!(
+            connections.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the console and the script have to be on one connection"
+        );
+
+        // And the window still works afterwards.
+        input.send(b"hostname\r".to_vec()).unwrap();
+        let mut shown = String::new();
+        while !shown.contains("hostname") {
+            match output.recv_timeout(Duration::from_secs(10)).unwrap() {
+                TerminalEvent::Output(data) => shown.push_str(&String::from_utf8_lossy(&data)),
+                other => panic!("{other:?}"),
+            }
+        }
+        assert!(
+            received
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|seen| seen == "hostname"),
+            "the queued script did not reach the device"
+        );
+        let _ = finish.send(());
+    }
+
+    /// Retiring a device closes its connection and does not leave the window
+    /// believing it still has one.
+    #[test]
+    fn retiring_a_device_tells_its_console_window() {
+        let (ready, started) = mpsc::channel();
+        let (finish, finished) = mpsc::channel::<()>();
+        thread::spawn(move || {
+            runtime().block_on(async move {
+                let device_server = Loopback::start(25, false).await;
+                ready
+                    .send((device_server.port, device_server.fingerprint.clone()))
+                    .unwrap();
+                let _ = tokio::task::spawn_blocking(move || finished.recv()).await;
+                device_server.server.abort();
+            });
+        });
+        let (port, fingerprint) = started.recv().unwrap();
+
+        let mut spec = spec();
+        spec.port = port;
+        spec.trusted_fingerprint = Some(fingerprint);
+        let (events, _worker_events) = mpsc::channel();
+        let (_input, from_window) = tokio::sync::mpsc::unbounded_channel();
+        let (to_window, output) = mpsc::channel();
+        let mut pool = WorkerPool::new(events);
+        let id = spec.id.clone();
+
+        pool.open_terminal(&id, spec, from_window, to_window)
+            .unwrap();
+        assert!(matches!(
+            output.recv_timeout(Duration::from_secs(10)).unwrap(),
+            TerminalEvent::Opened
+        ));
+        pool.retire(&id).unwrap();
+
+        let closed = loop {
+            match output.recv_timeout(Duration::from_secs(10)).unwrap() {
+                TerminalEvent::Closed(reason) => break reason,
+                TerminalEvent::Output(_) | TerminalEvent::Opened => continue,
+            }
+        };
+        assert!(
+            !closed.is_empty(),
+            "a window whose device was retired has to be told why"
+        );
+        let _ = finish.send(());
+    }
+
+    /// The one setting the whole arrangement depends on. A connection that is
+    /// held open is silent, and russh must not read that silence as a fault,
+    /// but the timer cannot simply be removed: it is also the only bound on a
+    /// write to a device that has stopped reading.
+    #[test]
+    fn a_held_connection_is_silent_but_not_kept_forever() {
+        let config = client_config();
+        assert_eq!(config.inactivity_timeout, Some(IDLE_LIMIT));
+        assert!(
+            config.keepalive_interval.is_none(),
+            "a held connection sends nothing while it is idle"
+        );
+        assert!(
+            IDLE_LIMIT > SSH_TIMEOUT,
+            "an idle limit is not an operation timeout"
+        );
+    }
+
     #[test]
     fn scripts_execute_over_ssh_in_order_stop_on_failure_and_require_trust() {
         struct ScriptServer {
@@ -1430,7 +2434,7 @@ mod tests {
                 spec.trusted_fingerprint = trusted.then_some(fingerprint);
                 let commands = vec!["first".into(), if fail { "fail".into() } else { "second".into() }, "third".into()];
                 let (events, receiver) = mpsc::channel();
-                let result = tokio::time::timeout(Duration::from_secs(5), run_script(&spec, "Test", &commands, &events)).await.unwrap();
+                let result = tokio::time::timeout(Duration::from_secs(5), run_script(&spec, "Test", &commands, &SharedSession::default(), &events)).await.unwrap();
                 if !trusted {
                     assert!(matches!(result, Err(ConnectError::UnknownHostKey { .. })));
                     assert!(received.lock().unwrap().is_empty());
@@ -1480,11 +2484,11 @@ mod tests {
         spec.trusted_fingerprint = std::env::var("CRESTRON_SSH_PROBE_FINGERPRINT").ok();
         runtime().block_on(async {
             let seen = SeenFingerprint::default();
-            let stream = tcp_connect(&spec).unwrap();
+            let stream = tcp_connect(&spec).await.unwrap();
             match open_session(&spec, stream, SSH_TIMEOUT, &seen).await {
                 Ok(session) => {
                     println!("Handshake completed; fingerprint: {:?}", seen.get());
-                    disconnect(session).await;
+                    disconnect(&session).await;
                 }
                 Err(ConnectError::UnknownHostKey { fingerprint, .. })
                     if spec.trusted_fingerprint.is_none() =>
@@ -1530,13 +2534,13 @@ mod tests {
         let mut blank = spec();
         blank.credentials.password.clear();
         let error = runtime().block_on(async {
-            match connect(&blank, &events).await {
+            match connect(&blank, Announce::OnTheCard, &events).await {
                 Ok(_) => panic!("a blank password cannot connect"),
                 Err(error) => error,
             }
         });
-        let ConnectError::Message { message, .. } = error else {
-            panic!("expected a plain error");
+        let ConnectError::CredentialsRejected { message, .. } = error else {
+            panic!("expected a rejection the application can ask about");
         };
         assert!(message.contains("password"), "{message}");
     }
@@ -1749,7 +2753,16 @@ mod tests {
             let (events, worker_events) = mpsc::channel();
             let (input, from_window) = tokio::sync::mpsc::unbounded_channel();
             let (to_window, output) = mpsc::channel();
-            open_terminal(spec, from_window, to_window, events).unwrap();
+            // Opened through the pool, on the connection the device's queued
+            // operations would use, rather than on one of its own.
+            let mut pool = WorkerPool::new(events);
+            let id = spec.id.clone();
+            pool.open_terminal(&id, spec, from_window, to_window)
+                .unwrap();
+            assert!(
+                !pool.has_pending(),
+                "a console window must not count as a queued operation"
+            );
 
             // The session opens on its own; the window does not ask it to.
             let next = |output: &mpsc::Receiver<TerminalEvent>| {
@@ -1919,10 +2932,14 @@ mod tests {
                 attempts: 4,
             };
             let (events, receiver) = mpsc::channel();
-            let session = connect(&spec, &events).await.unwrap();
+            let device = SharedSession::default();
+            let (session, _) = device
+                .acquire(&spec, Announce::OnTheCard, &events)
+                .await
+                .unwrap();
             let summary = tokio::time::timeout(
                 Duration::from_secs(20),
-                apply_puf(&spec, session, timings, &events),
+                apply_puf(&spec, session, &device, timings, &events),
             )
             .await
             .unwrap()

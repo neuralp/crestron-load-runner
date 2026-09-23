@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     fs, io,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::OnceLock,
 };
 
@@ -158,9 +158,18 @@ enum AddressBookImport {
 pub fn save_address_book(path: &Path, entries: &[AddressEntry]) -> io::Result<()> {
     validate_portable_path(path)?;
     validate_entries(entries)?;
+    // The file is written with its assignments relative to itself where they
+    // can be, so that a book and the files it names move together. The caller's
+    // entries keep the absolute paths everything else works in.
+    let devices = match book_directory(path) {
+        Some(book_dir) => map_assignments(entries.to_vec(), |file| {
+            portable_assignment(&book_dir, file)
+        }),
+        None => entries.to_vec(),
+    };
     let document = AddressBookDocument {
         version: address_book_version(),
-        devices: entries.to_vec(),
+        devices,
     };
     let data = serde_json::to_vec_pretty(&document).map_err(io::Error::other)?;
     let temporary = path.with_extension("json.tmp");
@@ -197,7 +206,148 @@ pub fn load_address_book(path: &Path) -> io::Result<Vec<AddressEntry>> {
         AddressBookImport::Entries(entries) => entries,
     };
     validate_entries(&entries)?;
-    Ok(entries)
+    // Undoes what saving did, so that nothing above this line ever sees a path
+    // it would have to resolve for itself.
+    Ok(match book_directory(path) {
+        Some(book_dir) => map_assignments(entries, |stored| resolved_assignment(&book_dir, stored)),
+        None => entries,
+    })
+}
+
+/// How an assigned program, configuration or touchpanel file is written into
+/// the book: relative to the book itself when it sits at or below it, and the
+/// absolute path otherwise.
+///
+/// Only plain names travel. A component that is anything else means the result
+/// would not actually be relative to the book, and so would not come back as
+/// the path it went in as — which the save's own read-back would then reject.
+/// That covers a book named without a directory, whose parent is `""` and which
+/// `strip_prefix` therefore matches against the whole absolute path, and a book
+/// sitting at the root of a filesystem.
+///
+/// Separators are written as `/` whatever the platform, so that a book written
+/// on Windows still finds its files on anything else. Windows takes `/` as a
+/// separator too, so nothing has to be undone when it is read back.
+/// Where a book's assignments are reckoned from.
+///
+/// Absolute, always. Everything downstream — `is_file`, opening the file,
+/// looking beside it for a signature — resolves a relative path against
+/// whatever directory the process happens to be running in, so a book named
+/// relatively must still give its files an absolute home. Reckoning from the
+/// book rather than from the process is the whole point of storing them
+/// relative in the first place.
+///
+/// This is also what keeps an assignment held in memory absolute, which is the
+/// invariant the save's read-back check rests on: a relative one could not
+/// survive a round trip, because reading joins it to the book and so hands
+/// back something different from what was held.
+fn book_directory(path: &Path) -> Option<PathBuf> {
+    let directory = path.parent()?;
+    if directory.is_absolute() {
+        return Some(directory.to_path_buf());
+    }
+    // A book named by nothing but a file name has an empty parent, which means
+    // the directory the process is running in; `absolute` will not take it.
+    let directory = if directory.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        directory
+    };
+    // Only ever reached for a book named relatively, so the ordinary case
+    // pays nothing and keeps the exact spelling it was opened with.
+    std::path::absolute(directory).ok()
+}
+
+fn portable_assignment(book_dir: &Path, file: &Path) -> PathBuf {
+    let Ok(relative) = file.strip_prefix(book_dir) else {
+        return file.to_path_buf();
+    };
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            return file.to_path_buf();
+        };
+        let Some(name) = name.to_str() else {
+            return file.to_path_buf();
+        };
+        parts.push(name);
+    }
+    if parts.is_empty() {
+        return file.to_path_buf();
+    }
+    PathBuf::from(parts.join("/"))
+}
+
+/// The absolute path a stored assignment names. A relative one is reached from
+/// the book that named it, rather than from wherever the process happens to be
+/// running, which is what everything downstream of here assumes: the files are
+/// opened, checked with `is_file`, and looked beside for a signature.
+///
+/// Pushing the parts one at a time is what makes this the exact inverse of
+/// [`portable_assignment`]: the components that were stripped off go back on in
+/// the same order, so the path is the one the book was saved from. Equal by
+/// components rather than by spelling — which is how paths compare — so this
+/// cannot be shortened into joining the stored text on to the directory.
+fn resolved_assignment(book_dir: &Path, stored: &Path) -> PathBuf {
+    // `has_root` as well as `is_absolute`, because a Unix path like
+    // `/srv/room.lpz` is not absolute on Windows. It will not be found there
+    // either way, but it is left saying what it says rather than being turned
+    // into a plausible-looking path under the book that was never meant.
+    if stored.is_absolute() || stored.has_root() {
+        return stored.to_path_buf();
+    }
+    let mut resolved = book_dir.to_path_buf();
+    match stored.to_str() {
+        Some(text) => {
+            for part in text.split('/').filter(|part| !part.is_empty()) {
+                resolved.push(part);
+            }
+        }
+        // Not valid UTF-8, so it cannot have been written by this application
+        // and cannot be split on anything meaningful. Joined whole.
+        None => resolved.push(stored),
+    }
+    resolved
+}
+
+/// Rewrites every assigned file on every entry.
+///
+/// Spelled out field by field rather than with `..`, so that a path field added
+/// to an entry later stops the build here instead of quietly travelling in
+/// whatever spelling it was given. A missed field would still round-trip
+/// cleanly, so no test would catch it.
+fn map_assignments(
+    entries: Vec<AddressEntry>,
+    rewrite: impl Fn(&Path) -> PathBuf,
+) -> Vec<AddressEntry> {
+    let mut rewritten = entries;
+    for entry in &mut rewritten {
+        let AddressEntry {
+            name: _,
+            host: _,
+            port: _,
+            username: _,
+            ssh_host_key_fingerprint: _,
+            https_certificate: _,
+            vc4_api_token: _,
+            kind: _,
+            model: _,
+            firmware: _,
+            mac: _,
+            program_slots,
+            config_slots,
+            touchpanel_project,
+        } = entry;
+        for path in program_slots
+            .iter_mut()
+            .chain(config_slots.iter_mut())
+            .chain(std::iter::once(touchpanel_project))
+            .flatten()
+        {
+            *path = rewrite(path);
+        }
+    }
+    rewritten
 }
 
 fn validate_entries(entries: &[AddressEntry]) -> io::Result<()> {
@@ -607,6 +757,8 @@ mod tests {
 
     #[test]
     fn json_file_round_trip_preserves_assignments_and_host_key() {
+        let dir = TestDir::new();
+        let path = dir.path().join("book.json");
         let mut entry = AddressEntry {
             name: "Control Room".into(),
             host: "192.0.2.2".into(),
@@ -615,29 +767,201 @@ mod tests {
             kind: DeviceKind::Processor,
             ..Default::default()
         };
-        entry.program_slots[2] = Some(PathBuf::from("programs/control-room.lpz"));
-        entry.config_slots[4] = Some(PathBuf::from("config/control-room.json"));
-        let path = std::env::temp_dir().join(format!(
-            "crestron-load-runner-address-book-{}.json",
-            std::process::id()
-        ));
+        entry.program_slots[2] = Some(dir.path().join("programs").join("control-room.lpz"));
+        entry.config_slots[4] = Some(dir.path().join("config").join("control-room.json"));
+        entry.touchpanel_project = Some(dir.path().join("lobby.vtz"));
 
-        save_address_book(&path, &[entry]).unwrap();
+        save_address_book(&path, std::slice::from_ref(&entry)).unwrap();
         let loaded = load_address_book(&path).unwrap();
-        let _ = fs::remove_file(path);
 
         assert_eq!(loaded.len(), 1);
         assert_eq!(
-            loaded[0].program_slots[2].as_deref(),
-            Some(Path::new("programs/control-room.lpz"))
-        );
-        assert_eq!(
-            loaded[0].config_slots[4].as_deref(),
-            Some(Path::new("config/control-room.json"))
+            loaded[0], entry,
+            "the entry did not come back as it went in"
         );
         assert_eq!(
             loaded[0].ssh_host_key_fingerprint.as_deref(),
             Some("SHA256:known-host-key")
         );
+    }
+
+    /// The point of the whole exercise: a book and the files it names can be
+    /// moved together, so what is written names them from the book rather than
+    /// from the machine that made it.
+    #[test]
+    fn assignments_at_or_below_the_book_are_written_relative_to_it() {
+        let dir = TestDir::new();
+        let path = dir.path().join("book.json");
+        let mut entry = AddressEntry {
+            host: "192.0.2.2".into(),
+            ..Default::default()
+        };
+        entry.program_slots[0] = Some(dir.path().join("beside.lpz"));
+        entry.program_slots[1] = Some(dir.path().join("programs").join("nested.lpz"));
+        entry.touchpanel_project = Some(dir.path().join("panels").join("lobby.vtz"));
+
+        save_address_book(&path, std::slice::from_ref(&entry)).unwrap();
+
+        let written = fs::read_to_string(&path).unwrap();
+        let document: serde_json::Value = serde_json::from_str(&written).unwrap();
+        let device = &document["devices"][0];
+        assert_eq!(device["program_slots"][0], "beside.lpz");
+        assert_eq!(device["program_slots"][1], "programs/nested.lpz");
+        assert_eq!(device["touchpanel_project"], "panels/lobby.vtz");
+        assert!(
+            !written.contains(&dir.path().display().to_string()),
+            "the book still names the machine it was written on: {written}"
+        );
+
+        // And back to the absolute paths everything downstream works in.
+        assert_eq!(load_address_book(&path).unwrap()[0], entry);
+    }
+
+    /// Nothing can be said relative to the book about a file kept somewhere
+    /// else entirely, so its full path is what travels.
+    #[test]
+    fn an_assignment_outside_the_book_keeps_its_full_path() {
+        let dir = TestDir::new();
+        let elsewhere = TestDir::new();
+        let path = dir.path().join("book.json");
+        let outside = elsewhere.path().join("shared.lpz");
+        let mut entry = AddressEntry {
+            host: "192.0.2.2".into(),
+            ..Default::default()
+        };
+        entry.program_slots[0] = Some(outside.clone());
+        entry.program_slots[1] = Some(dir.path().join("beside.lpz"));
+
+        save_address_book(&path, std::slice::from_ref(&entry)).unwrap();
+
+        let document: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            document["devices"][0]["program_slots"][0],
+            serde_json::Value::from(outside.to_str().unwrap()),
+            "a file outside the book was written as though it were inside it"
+        );
+        assert_eq!(document["devices"][0]["program_slots"][1], "beside.lpz");
+        assert_eq!(load_address_book(&path).unwrap()[0], entry);
+    }
+
+    /// A relative path in a book names a file from the book, not from wherever
+    /// the application happens to have been started.
+    #[test]
+    fn a_relative_assignment_is_read_from_the_book_rather_than_the_working_directory() {
+        let dir = TestDir::new();
+        let path = dir.path().join("book.json");
+        fs::write(
+            &path,
+            r#"{"version":1,"devices":[{"name":"Room","host":"192.0.2.2","port":22,
+               "program_slots":["programs/room.lpz",null,null,null,null,null,null,null,null,null],
+               "touchpanel_project":"panels\\lobby.vtz"}]}"#,
+        )
+        .unwrap();
+
+        let loaded = load_address_book(&path).unwrap();
+        assert_eq!(
+            loaded[0].program_slots[0].as_deref(),
+            Some(dir.path().join("programs").join("room.lpz").as_path())
+        );
+        // A book written by an earlier build, or by hand on Windows, spells its
+        // separators the other way round and still has to resolve.
+        #[cfg(windows)]
+        assert_eq!(
+            loaded[0].touchpanel_project.as_deref(),
+            Some(dir.path().join("panels").join("lobby.vtz").as_path())
+        );
+    }
+
+    /// A book named without a full path of its own still has to give its files
+    /// an absolute home, or what is held in memory comes back relative — and a
+    /// relative assignment cannot survive the round trip the save verifies
+    /// itself with, so the book could never be saved again.
+    #[test]
+    fn a_book_named_relatively_still_resolves_its_files_absolutely() {
+        let dir = TestDir::new();
+        let path = dir.path().join("book.json");
+        fs::write(
+            &path,
+            r#"{"version":1,"devices":[{"name":"Room","host":"192.0.2.2","port":22,
+               "program_slots":["room.lpz",null,null,null,null,null,null,null,null,null]}]}"#,
+        )
+        .unwrap();
+
+        // Named the way a hand-edited preference might name one. The working
+        // directory is process-wide and these tests run in parallel, so it is
+        // the reckoning that is checked here rather than a load performed from
+        // somewhere else.
+        for named in ["book.json", "./book.json", "books/site.json"] {
+            let book_dir = book_directory(Path::new(named))
+                .unwrap_or_else(|| panic!("{named} gave nothing to reckon from"));
+            assert!(
+                book_dir.is_absolute(),
+                "{named} would leave the application resolving {} for itself",
+                book_dir.display()
+            );
+            let assigned = resolved_assignment(&book_dir, Path::new("room.lpz"));
+            assert!(assigned.is_absolute());
+            assert_eq!(assigned.file_name().unwrap(), "room.lpz");
+            // Exact inverses, which is what the save's read-back rests on.
+            assert_eq!(
+                resolved_assignment(&book_dir, &portable_assignment(&book_dir, &assigned)),
+                assigned
+            );
+        }
+
+        // And end to end, from a book that does name its own directory.
+        let loaded = load_address_book(&path).unwrap();
+        assert_eq!(
+            loaded[0].program_slots[0].as_deref(),
+            Some(dir.path().join("room.lpz").as_path())
+        );
+    }
+
+    /// A path that says it starts at a filesystem root is left saying so. It is
+    /// not absolute on Windows, but turning it into a path under the book would
+    /// invent one that was never meant.
+    #[test]
+    fn an_assignment_rooted_elsewhere_is_not_reinterpreted_under_the_book() {
+        let dir = TestDir::new();
+        let path = dir.path().join("book.json");
+        fs::write(
+            &path,
+            r#"{"version":1,"devices":[{"name":"Room","host":"192.0.2.2","port":22,
+               "program_slots":["/srv/programs/room.lpz",null,null,null,null,null,null,null,null,null]}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            load_address_book(&path).unwrap()[0].program_slots[0].as_deref(),
+            Some(Path::new("/srv/programs/room.lpz"))
+        );
+    }
+
+    /// Books written before this change name their files in full, and go on
+    /// working untouched.
+    #[test]
+    fn absolute_assignments_in_older_books_are_left_alone_in_both_formats() {
+        let dir = TestDir::new();
+        let path = dir.path().join("book.json");
+        let outside = TestDir::new();
+        let file = outside.path().join("room.lpz");
+        let mut entry = AddressEntry {
+            name: "Room".into(),
+            host: "192.0.2.2".into(),
+            ..Default::default()
+        };
+        entry.program_slots[0] = Some(file.clone());
+
+        for document in [
+            serde_json::json!({"version": 1, "devices": [&entry]}),
+            serde_json::json!([&entry]),
+        ] {
+            fs::write(&path, document.to_string()).unwrap();
+            assert_eq!(
+                load_address_book(&path).unwrap()[0].program_slots[0].as_deref(),
+                Some(file.as_path())
+            );
+        }
     }
 }

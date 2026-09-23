@@ -8,7 +8,7 @@ A native Rust/egui utility for discovering Crestron devices, keeping an address 
 - Manual and autodiscovery-to-address-book workflows with processor/touchpanel classification
 - Device-list text search across model, hostname, IP address, MAC address, and firmware
 - The address book is an ordinary JSON file you name and own: **New**, **Open**, **Save**, **Save as…**, and an **Open Recent** list of the five most recent books
-- Dedicated background worker thread per SSH device, each driving an asynchronous `russh` session
+- Dedicated background worker thread per SSH device, each holding one `russh` session open and shared by everything that device does
 - App-specific trust-on-first-use SSH host-key verification, with **Forget SSH host key** on a device's right-click menu to ask again
 - `--config-dir` for an isolated preferences and firmware profile
 - Persistent `.lpz` processor assignments for program slots 1–10
@@ -26,7 +26,7 @@ A native Rust/egui utility for discovering Crestron devices, keeping an address 
 - Script and firmware editors open as separate operating-system windows, so they stay usable beside the main one
 - Dialogs that block the main window frost and dim what is behind them
 - A drawn application mark, used in **Help → About**, on the window, and as the executable's icon
-- Saved default SSH credentials, with per-device credentials taking precedence, and a choice of what to open at startup
+- Saved default SSH credentials, with per-device credentials taking precedence, a session-only prompt when neither supplies one, and a choice of what to open at startup
 - Firmware editor with a persistent per-model catalog, managed local firmware copies, and `.puf` package details read from the file
 
 ## Build and run
@@ -50,9 +50,11 @@ Attaching an icon to the executable needs a resource compiler from the Windows S
 
 The address book is a JSON file you choose. Nothing about it is kept in the configuration directory: **File → New address book**, **Open address book…**, **Save address book**, and **Save address book as…** behave as they do in any editor, and saving a book that has never been written asks where to put it. **File → Open Recent** lists the five most recently opened or saved books, newest first; an entry that no longer exists is reported and dropped from the list, while one that is merely malformed stays so it can be repaired.
 
-Each device's trusted SSH host-key fingerprint is stored on that device's entry, so it travels with the file alongside assigned program, configuration, and touchpanel file paths. Changes stay in memory until saved; the status bar names the current file, shows `Untitled` before there is one, appends `*` while there are unsaved changes, and reports load/save results without opening a notice dialog. Per-device passwords are held in memory only.
+Each device's trusted SSH host-key fingerprint is stored on that device's entry, so it travels with the file alongside assigned program, configuration, and touchpanel file paths. An assigned file that sits in the book's own folder, or below it, is stored as a path relative to the book and spelled with forward slashes, so a book and the files it names can be moved together — onto another machine, another drive letter, or a memory stick — and still find them. A file kept anywhere else can only be named in full, so its complete path is what travels. Reading does the reverse: a relative path in a book is resolved against the book's own folder rather than against whatever directory the application happens to have been started in, so an existing book that already held relative paths is now read the way it reads. Saving always names the files from whichever book is being written, so **Save address book as…** into another folder rewrites them for their new home; what the application is working with stays absolute throughout. Changes stay in memory until saved; the status bar names the current file, shows `Untitled` before there is one, appends `*` while there are unsaved changes, and reports load/save results without opening a notice dialog. Per-device passwords are held in memory only.
 
 **File → Preferences** holds a default username and password, used when the corresponding per-device credential is blank, and a choice of what to open at startup: start with an empty address book, reopen the most recent one, or always open a specific file. A specific file that has gone missing is reported in the status bar and left set as the preference, because it may be on a share that is offline rather than deleted.
+
+When a device has no username or password of its own and the defaults above are blank, connecting asks for a **session username and password** rather than failing. They are used for every device that has none of its own, for as long as the application is running: they are never written to disk, and they survive opening another address book, which does discard per-device passwords. The operation that raised the prompt runs as soon as it is answered. A device that refuses what was sent asks again, but only when the prompt is what supplied it — a wrong per-device or default password is corrected where it is kept. **Preferences** shows whether session credentials are set and clears them, which makes the next connection ask again.
 
 Preferences live in `preferences.json` in the platform user configuration directory, or in `--config-dir` when that is given.
 
@@ -111,7 +113,7 @@ The library is `scripts.json` beside `preferences.json`, so `--config-dir` also 
 
 A line is sent when it is entered, and the up and down arrows walk back through what has been entered before. **Auto-scroll** keeps the newest line in view and can be turned off to read back through the output while the device is still talking. Everything typed and everything received also reaches the device log, so a console session leaves the same record as a script or a load. Closing the window, or **Disconnect**, ends the session. A window whose session has ended — by either hand — offers **Reconnect** in the same place, which opens another and keeps what the last one said above a line marking where the new one begins. Choosing **Connect SSH…** again for a device whose window is already open does the same.
 
-The session is asked for a terminal, so a device echoes what is typed the way it would to any terminal program. This is a line console rather than a terminal emulator: colour and cursor-movement sequences are removed rather than acted on, and the scrollback is plain text that can be selected and copied. A console does not queue behind the device's other operations and does not hold up exiting, since it lasts as long as it is wanted rather than as long as a command takes.
+The session is asked for a terminal, so a device echoes what is typed the way it would to any terminal program. This is a line console rather than a terminal emulator: colour and cursor-movement sequences are removed rather than acted on, and the scrollback is plain text that can be selected and copied. A console does not queue behind the device's other operations and does not hold up exiting, since it lasts as long as it is wanted rather than as long as a command takes. It is a channel on the device's one connection rather than a connection of its own, so it opens without a second login and can be used while a load is running. It ends when the device it belongs to does: removing the device, opening another address book, or closing the application leaves the window in place, saying so, with **Reconnect** ready.
 
 ## VC-4 virtual servers
 
@@ -165,8 +167,12 @@ Because the negotiated host key depends on which algorithms the client supports,
 
 The client explicitly enables NIST ECDH key exchange ahead of DH group exchange, while retaining the modern default algorithms first. Russh 0.63 supports NIST ECDH but does not enable it by default; the default group-exchange path failed against an RMC3 with `Key exchange init failed`, while ECDH completed successfully. This compatibility setting does not enable SHA-1 key exchange or change host-key verification.
 
+Each device is connected to once rather than once per operation. The connection is opened the first time something needs it and then held, so a refresh, a script and ten program slots are one conversation with the device instead of twelve logins; the console window shares it too. It is reopened only when the device has dropped it or when the settings that decide it — address, port, credentials, or trusted host key — have changed, which is what keeps **Forget SSH host key** honest.
+
+A held connection sends nothing while it is idle, leaving the device free to close it on its own schedule. Two things bound that silence. The operating system's own TCP keepalive notices a device that has gone away without saying so, which SSH keepalives would otherwise be needed for and which the device's console never sees. And the connection is given up after twenty minutes unused, because a device permits only a few SSH sessions at once and shares them with every other tool on site: one this application is not using is one nobody else can have. The next operation simply opens another.
+
 For a handshake-only diagnostic (no authentication or device commands), run `CRESTRON_SSH_PROBE_HOST=<host> cargo test live_ssh_handshake -- --ignored --nocapture`. With no trusted fingerprint it stops at host-key verification and prints the offered fingerprint. Set `CRESTRON_SSH_PROBE_FINGERPRINT` to a verified fingerprint to exercise the complete handshake. The probe does not save trust or change the address book.
 
 ## Security
 
-The first connection presents the device's SHA-256 host-key fingerprint. Trust it only after comparing it with a known-good fingerprint. A changed key is rejected. Per-device passwords are never written to an address-book file; the optional default password is stored in `preferences.json` as plain text.
+The first connection presents the device's SHA-256 host-key fingerprint. Trust it only after comparing it with a known-good fingerprint. A changed key is rejected. Per-device passwords are never written to an address-book file; the optional default password is stored in `preferences.json` as plain text. Session credentials entered at the prompt are held in memory only — they are not written anywhere, and are redacted from debug output.

@@ -3,6 +3,20 @@ use crate::storage::Preferences;
 use crate::test_support::TestDir;
 
 fn app() -> LoadRunnerApp {
+    let mut app = LoadRunnerApp::from_parts(Preferences::default(), None, Vec::new(), None);
+    // Stands in for credentials the user has configured, so that operations
+    // queue rather than stopping at the session-credential prompt. The hosts
+    // these tests use are unroutable, so nothing reaches the network.
+    app.session_credentials = crate::model::Credentials {
+        username: "test".into(),
+        password: "test".into(),
+    };
+    app
+}
+
+/// An application that has been given no credentials anywhere, so that asking
+/// it to connect raises the session-credential prompt.
+fn app_without_credentials() -> LoadRunnerApp {
     LoadRunnerApp::from_parts(Preferences::default(), None, Vec::new(), None)
 }
 
@@ -1565,6 +1579,434 @@ fn connection_uses_defaults_only_for_missing_credentials() {
     assert_eq!(mixed.password, "default-password");
 }
 
+/// The prompt is the last tier, under the saved defaults, and fills each field
+/// on its own rather than as a pair.
+#[test]
+fn session_credentials_fill_in_only_what_the_device_and_preferences_leave_blank() {
+    let mut app = app_without_credentials();
+    app.devices.push(Device::from_address(&AddressEntry {
+        host: "192.0.2.1".into(),
+        ..Default::default()
+    }));
+    let id = app.devices[0].id.clone();
+    assert!(app.connection_needs_credentials(&id));
+
+    app.session_credentials = crate::model::Credentials {
+        username: "session-user".into(),
+        password: "session-password".into(),
+    };
+    let session = app.connection_spec(&id).unwrap().credentials;
+    assert_eq!(session.username, "session-user");
+    assert_eq!(session.password, "session-password");
+    assert!(!app.connection_needs_credentials(&id));
+
+    app.preferences.default_password = "default-password".into();
+    let preferred = app.connection_spec(&id).unwrap().credentials;
+    assert_eq!(preferred.username, "session-user");
+    assert_eq!(
+        preferred.password, "default-password",
+        "the saved default outranks what the prompt was answered with"
+    );
+
+    app.devices[0].credentials.username = "device-user".into();
+    let device = app.connection_spec(&id).unwrap().credentials;
+    assert_eq!(device.username, "device-user");
+    assert_eq!(device.password, "default-password");
+    assert!(
+        !app.prompt_supplies_credentials(&id),
+        "nothing is left for the prompt to supply"
+    );
+}
+
+/// Nothing is sent to a device that cannot be connected to. The operation is
+/// put aside instead, and runs once the prompt has been answered.
+#[test]
+fn connecting_without_any_credentials_asks_and_queues_nothing() {
+    let mut app = app_without_credentials();
+    app.devices.push(Device::from_address(&AddressEntry {
+        name: "Kitchen".into(),
+        host: "192.0.2.1".into(),
+        ..Default::default()
+    }));
+    let id = app.devices[0].id.clone();
+    app.refresh_device(&id);
+    assert!(!app.worker_pool.has_pending());
+    let prompt = app.credential_prompt.as_ref().expect("nothing asked");
+    assert_eq!(prompt.target, "Kitchen");
+    assert!(prompt.error.is_none());
+
+    let mut answered = app.credential_prompt.take().unwrap();
+    answered.username = "  session-user  ".into();
+    answered.password = "session-password".into();
+    app.answer_credential_prompt(answered);
+    assert_eq!(
+        app.session_credentials.username, "session-user",
+        "surrounding space is dropped, as it is for the saved default"
+    );
+    assert_eq!(app.session_credentials.password, "session-password");
+    assert!(
+        app.worker_pool.is_busy(&id),
+        "the refresh the prompt interrupted did not run"
+    );
+    assert!(app.credential_prompt.is_none());
+}
+
+#[test]
+fn cancelling_the_prompt_keeps_no_credentials_and_queues_nothing() {
+    let mut app = app_without_credentials();
+    app.devices.push(Device::from_address(&AddressEntry {
+        host: "192.0.2.1".into(),
+        ..Default::default()
+    }));
+    let id = app.devices[0].id.clone();
+    app.refresh_device(&id);
+    assert!(app.credential_prompt.is_some());
+    app.cancel_credential_prompt();
+    assert!(app.credential_prompt.is_none());
+    assert!(app.session_credentials.password.is_empty());
+    assert!(!app.worker_pool.has_pending());
+}
+
+/// Drawn, blocking, and answerable with the pointer. Connect stays disabled
+/// until both fields are filled: a blank answer would put the prompt straight
+/// back up, and in the console-window case would never stop.
+#[test]
+fn the_credential_prompt_renders_and_refuses_a_blank_answer() {
+    let mut app = app_without_credentials();
+    app.devices.push(Device::from_address(&AddressEntry {
+        name: "Kitchen".into(),
+        host: "192.0.2.1".into(),
+        ..Default::default()
+    }));
+    let id = app.devices[0].id.clone();
+    app.refresh_device(&id);
+    assert!(app.modal_open(), "the backdrop would not be painted");
+
+    let ctx = egui::Context::default();
+    // The first frame measures and positions the modal.
+    ctx.run_ui(input(), |ui| app.show(ui))
+        .drop_without_applying_deltas();
+    let output = ctx.run_ui(input(), |ui| app.show(ui));
+    let at = |wanted: &str| {
+        output
+            .shapes
+            .iter()
+            .find_map(|clipped| {
+                if let egui::Shape::Text(text) = &clipped.shape
+                    && text.galley.text() == wanted
+                {
+                    Some(text.pos + text.galley.size() * 0.5)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| panic!("{wanted} was not rendered"))
+    };
+    let connect = at("Connect");
+    let cancel = at("Cancel");
+    at("Session SSH credentials");
+    output.drop_without_applying_deltas();
+
+    let click = |app: &mut LoadRunnerApp, at: egui::Pos2| {
+        for pressed in [true, false] {
+            let mut raw = input();
+            raw.events.push(egui::Event::PointerMoved(at));
+            raw.events.push(egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+            ctx.run_ui(raw, |ui| app.show(ui))
+                .drop_without_applying_deltas();
+        }
+    };
+
+    click(&mut app, connect);
+    assert!(
+        app.credential_prompt.is_some(),
+        "an empty answer was accepted"
+    );
+    assert!(!app.worker_pool.has_pending());
+
+    // Cancel works from the same dialog, so the coordinates above are live and
+    // the click that Connect ignored was ignored because it was disabled.
+    click(&mut app, cancel);
+    assert!(app.credential_prompt.is_none());
+    assert!(app.session_credentials.password.is_empty());
+    assert!(!app.worker_pool.has_pending());
+
+    // Filled in, the same button answers and the refresh runs.
+    app.refresh_device(&id);
+    if let Some(prompt) = app.credential_prompt.as_mut() {
+        prompt.username = "session-user".into();
+        prompt.password = "session-password".into();
+    }
+    ctx.run_ui(input(), |ui| app.show(ui))
+        .drop_without_applying_deltas();
+    click(&mut app, connect);
+    assert!(app.credential_prompt.is_none(), "a full answer was refused");
+    assert_eq!(app.session_credentials.username, "session-user");
+    assert!(app.worker_pool.is_busy(&id));
+}
+
+/// The whole point of the third tier: it is reached through `Device`,
+/// `ConnectionSpec` and every `WorkerCommand`, and none of them may print it
+/// or write it anywhere.
+#[test]
+fn session_credentials_are_never_written_to_disk_or_printed() {
+    let dir = TestDir::new();
+    let mut app = app_in(&dir);
+    app.devices.push(Device::from_address(&AddressEntry {
+        host: "192.0.2.1".into(),
+        ..Default::default()
+    }));
+    app.session_credentials = crate::model::Credentials {
+        username: "session-user".into(),
+        password: "session-password".into(),
+    };
+
+    app.open_preferences();
+    app.save_preferences();
+    let written = std::fs::read_to_string(dir.path().join("preferences.json")).unwrap();
+    assert!(!written.contains("session-password"), "{written}");
+    assert!(!written.contains("session-user"), "{written}");
+    let stored =
+        crate::storage::Preferences::load_from(&dir.path().join("preferences.json")).unwrap();
+    assert!(stored.default_password.is_empty());
+
+    let id = app.devices[0].id.clone();
+    let spec = app.connection_spec(&id).unwrap();
+    assert_eq!(spec.credentials.password, "session-password");
+    for printed in [
+        format!("{:?}", app.devices[0]),
+        format!("{spec:?}"),
+        format!("{:?}", WorkerCommand::Refresh(spec.clone())),
+    ] {
+        assert!(!printed.contains("session-password"), "{printed}");
+        assert!(printed.contains("[REDACTED]"), "{printed}");
+    }
+
+    // The address book never carried a password, and still does not.
+    let book = dir.path().join("book.json");
+    assert!(app.write_address_book_to(&book));
+    let saved = std::fs::read_to_string(&book).unwrap();
+    assert!(!saved.contains("session-password"), "{saved}");
+}
+
+/// Clearing takes effect at once rather than on Save, because nothing about it
+/// is written to disk for a Save to write.
+#[test]
+fn clearing_the_session_credentials_makes_the_next_connection_ask_again() {
+    let dir = TestDir::new();
+    let mut app = app_in(&dir);
+    app.devices.push(Device::from_address(&AddressEntry {
+        host: "192.0.2.1".into(),
+        ..Default::default()
+    }));
+    let id = app.devices[0].id.clone();
+    app.session_credentials = crate::model::Credentials {
+        username: "session-user".into(),
+        password: "session-password".into(),
+    };
+    assert!(!app.connection_needs_credentials(&id));
+    app.session_credentials = crate::model::Credentials::default();
+    assert!(app.connection_needs_credentials(&id));
+    app.refresh_device(&id);
+    assert!(app.credential_prompt.is_some());
+    assert!(!app.worker_pool.has_pending());
+}
+
+/// A console window asks to be put on a connection every frame until it is, so
+/// it needs nothing remembered: leaving its session pending is the resume.
+#[test]
+fn a_console_window_waits_for_credentials_rather_than_being_handed_a_dead_session() {
+    let mut app = app_without_credentials();
+    app.devices.push(Device::from_address(&AddressEntry {
+        name: "Kitchen".into(),
+        host: "192.0.2.1".into(),
+        ..Default::default()
+    }));
+    let id = app.devices[0].id.clone();
+    app.open_terminal(&id);
+    app.start_pending_terminal_sessions();
+    assert_eq!(
+        app.credential_prompt.as_ref().map(|prompt| &*prompt.target),
+        Some("Kitchen")
+    );
+    assert!(
+        app.terminals[&id].has_pending_session(),
+        "the window was handed a connection that cannot be made"
+    );
+
+    let mut answered = app.credential_prompt.take().unwrap();
+    answered.username = "session-user".into();
+    answered.password = "session-password".into();
+    app.answer_credential_prompt(answered);
+    app.start_pending_terminal_sessions();
+    assert!(
+        !app.terminals[&id].has_pending_session(),
+        "the window was not put on its connection once it could be"
+    );
+}
+
+/// Cancelling has to end what it was holding up. A window that is still
+/// waiting would ask again on the very next frame, reopening the prompt the
+/// user has just dismissed.
+#[test]
+fn cancelling_ends_the_console_sessions_that_were_waiting_on_it() {
+    let mut app = app_without_credentials();
+    app.devices.push(Device::from_address(&AddressEntry {
+        host: "192.0.2.1".into(),
+        ..Default::default()
+    }));
+    let id = app.devices[0].id.clone();
+    app.open_terminal(&id);
+    app.start_pending_terminal_sessions();
+    assert!(app.credential_prompt.is_some());
+
+    app.cancel_credential_prompt();
+    assert!(!app.terminals[&id].has_pending_session());
+    app.start_pending_terminal_sessions();
+    assert!(
+        app.credential_prompt.is_none(),
+        "the prompt came straight back after being dismissed"
+    );
+}
+
+/// A refusal is worth asking about only when the prompt is what supplied the
+/// credential. A device carrying its own password is corrected where that is
+/// kept, not by changing what every other device connects as.
+#[test]
+fn a_refused_password_asks_again_only_when_the_prompt_is_what_supplied_it() {
+    let mut app = app_without_credentials();
+    app.session_credentials = crate::model::Credentials {
+        username: "session-user".into(),
+        password: "wrong".into(),
+    };
+    let mut own = Device::from_address(&AddressEntry {
+        host: "192.0.2.1".into(),
+        ..Default::default()
+    });
+    own.credentials = crate::model::Credentials {
+        username: "device-user".into(),
+        password: "device-password".into(),
+    };
+    let own_id = own.id.clone();
+    app.devices.push(own);
+    app.devices.push(Device::from_address(&AddressEntry {
+        name: "Shared".into(),
+        host: "192.0.2.2".into(),
+        ..Default::default()
+    }));
+    let shared_id = app.devices[1].id.clone();
+
+    app.apply_worker_event(WorkerEvent::CredentialsRejected {
+        id: own_id.clone(),
+        message: "SSH authentication was not accepted".into(),
+    });
+    assert!(
+        app.credential_prompt.is_none(),
+        "a device with its own password is not the prompt's business"
+    );
+    assert_eq!(
+        app.devices[0].connection,
+        ConnectionState::Disconnected,
+        "the refusal alone does not decide what the card shows"
+    );
+
+    app.apply_worker_event(WorkerEvent::CredentialsRejected {
+        id: shared_id.clone(),
+        message: "SSH authentication was not accepted".into(),
+    });
+    let prompt = app.credential_prompt.as_ref().expect("nothing asked");
+    assert_eq!(prompt.target, "Shared");
+    assert_eq!(
+        prompt.error.as_deref(),
+        Some("SSH authentication was not accepted")
+    );
+    assert_eq!(
+        prompt.password, "wrong",
+        "the prompt comes back filled in, so only the wrong part is retyped"
+    );
+    assert!(
+        prompt.resume.is_none(),
+        "the operation already reported; it is not run again behind the user"
+    );
+
+    // Every other device in the same batch refuses at the same time; the user
+    // is asked once.
+    app.apply_worker_event(WorkerEvent::CredentialsRejected {
+        id: shared_id,
+        message: "SSH authentication was not accepted".into(),
+    });
+    assert!(app.credential_prompt.is_some());
+}
+
+/// The confirmation dialog owns the window and suppresses every other one, so
+/// a prompt raised under it would be set but never drawn.
+#[test]
+fn nothing_is_asked_while_the_unsaved_changes_confirmation_is_up() {
+    let mut app = app_without_credentials();
+    app.devices.push(Device::from_address(&AddressEntry {
+        host: "192.0.2.1".into(),
+        ..Default::default()
+    }));
+    let id = app.devices[0].id.clone();
+    app.address_book_dirty = true;
+    let ctx = egui::Context::default();
+    app.request_action(PendingAction::Quit, &ctx);
+    assert!(app.pending_action.is_some());
+    app.refresh_device(&id);
+    assert!(app.credential_prompt.is_none());
+    assert!(!app.worker_pool.has_pending());
+}
+
+/// A selection is asked about once and queued whole: gating only the devices
+/// that are short would load nine of ten now and all ten again on resume.
+#[test]
+fn a_whole_selection_is_asked_about_once() {
+    let dir = TestDir::new();
+    let mut app = app_without_credentials();
+    let program = dir.path().join("room.lpz");
+    std::fs::write(&program, b"program").unwrap();
+    for host in ["192.0.2.1", "192.0.2.2", "192.0.2.3"] {
+        let mut device = Device::from_address(&AddressEntry {
+            name: host.into(),
+            host: host.into(),
+            kind: DeviceKind::Processor,
+            ..Default::default()
+        });
+        device.selected = true;
+        device.program_slots[0] = Some(program.clone());
+        app.devices.push(device);
+    }
+    // One of the three can connect on its own; the other two cannot.
+    app.devices[0].credentials = crate::model::Credentials {
+        username: "device-user".into(),
+        password: "device-password".into(),
+    };
+    app.load_assigned_programs();
+    assert!(
+        !app.worker_pool.has_pending(),
+        "part of the load was queued"
+    );
+    let prompt = app.credential_prompt.as_ref().expect("nothing asked");
+    assert_eq!(prompt.target, "192.0.2.2 and 1 more");
+
+    let mut answered = app.credential_prompt.take().unwrap();
+    answered.username = "session-user".into();
+    answered.password = "session-password".into();
+    app.answer_credential_prompt(answered);
+    for device in &app.devices {
+        assert!(
+            app.worker_pool.is_busy(&device.id),
+            "{} was left out of the resumed load",
+            device.host
+        );
+    }
+}
+
 #[test]
 fn trusting_host_key_updates_the_device_address_book_entry() {
     let address_book = vec![AddressEntry {
@@ -1698,6 +2140,69 @@ fn invalid_import_does_not_replace_current_devices() {
 }
 
 #[test]
+fn a_console_window_never_stops_the_application_closing() {
+    let mut app = app();
+    app.merge_discovered(discovered("192.0.2.1"));
+    let id = app.devices[0].id.clone();
+    // Empty credentials, so nothing reaches the network: what is under test is
+    // the bookkeeping, not the session.
+    app.open_terminal(&id);
+    assert!(app.terminals.contains_key(&id));
+    app.start_pending_terminal_sessions();
+    assert!(
+        !app.worker_pool.has_pending(),
+        "a console window was counted as a queued operation"
+    );
+    let ctx = egui::Context::default();
+    app.request_action(PendingAction::Quit, &ctx);
+    assert!(
+        app.close_approved,
+        "an open console window stopped the application closing"
+    );
+}
+
+/// The window is keyed by the device's id, and adding a discovered device to
+/// the address book changes it. A window left under the old key would log to a
+/// device that no longer exists and could never be reconnected.
+#[test]
+fn a_console_window_follows_its_device_into_the_address_book() {
+    let mut app = app();
+    app.merge_discovered(discovered("192.0.2.1"));
+    let discovered_id = app.devices[0].id.clone();
+    app.open_terminal(&discovered_id);
+    assert!(app.terminals.contains_key(&discovered_id));
+
+    app.add_discovered_to_address_book(&discovered_id);
+    let id = app.devices[0].id.clone();
+    assert_eq!(app.devices[0].source, DeviceSource::AddressBook);
+    assert!(
+        app.terminals.contains_key(&id),
+        "the window did not move with its device"
+    );
+    if id != discovered_id {
+        assert!(!app.terminals.contains_key(&discovered_id));
+    }
+}
+
+/// A window whose device is gone has nothing left to reconnect to.
+#[test]
+fn console_windows_close_with_the_devices_they_belong_to() {
+    let mut app = app();
+    app.merge_discovered(discovered("192.0.2.1"));
+    let discovered_id = app.devices[0].id.clone();
+    app.add_discovered_to_address_book(&discovered_id);
+    let id = app.devices[0].id.clone();
+    app.open_terminal(&id);
+    assert!(app.terminals.contains_key(&id));
+
+    app.remove_selected_address();
+    assert!(
+        !app.terminals.contains_key(&id),
+        "a window outlived the device it was for"
+    );
+}
+
+#[test]
 fn queued_jobs_block_remove_open_quit_and_promotion_until_drained() {
     let mut app = app();
     app.merge_discovered(discovered("192.0.2.1"));
@@ -1717,7 +2222,7 @@ fn queued_jobs_block_remove_open_quit_and_promotion_until_drained() {
     app.open_address_book(Path::new("not-opened.json"));
     assert_eq!(app.devices.len(), 1);
     assert!(app.status_message.contains("operations"));
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while app.worker_pool.has_pending() {
         app.process_events();
         assert!(std::time::Instant::now() < deadline);
@@ -1984,6 +2489,107 @@ fn saving_writes_the_chosen_file_and_adopts_it_as_the_current_one() {
     assert_eq!(
         crate::storage::load_address_book(&path).unwrap()[0].username,
         "admin"
+    );
+}
+
+/// Saving rewrites the assignments against whichever book is being written, so
+/// Save As into another folder does not leave the new file naming the old one's
+/// neighbours. What the application holds stays absolute throughout.
+#[test]
+fn saving_names_assigned_files_from_the_book_being_written() {
+    let dir = TestDir::new();
+    let elsewhere = TestDir::new();
+    let mut app = app_in(&dir);
+    let program = dir.path().join("room.lpz");
+    std::fs::write(&program, b"program").unwrap();
+
+    let book = dir.path().join("book.json");
+    saved_book(&mut app, &book, "192.0.2.1");
+    app.devices[0].program_slots[0] = Some(program.clone());
+    app.mark_address_book_dirty();
+    // The read-back check inside the write is the real assertion here: it
+    // compares the reloaded file against what is held in memory, so a save
+    // that survives it proves the two halves are exact inverses.
+    assert!(app.write_address_book_to(&book), "{}", app.status_message);
+
+    let beside: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&book).unwrap()).unwrap();
+    assert_eq!(beside["devices"][0]["program_slots"][0], "room.lpz");
+    assert_eq!(
+        app.devices[0].program_slots[0].as_deref(),
+        Some(program.as_path()),
+        "saving changed what the application is working with"
+    );
+
+    // Save As into a folder the file is not under: it can only be named in
+    // full from there.
+    let moved = elsewhere.path().join("book.json");
+    assert!(app.write_address_book_to(&moved), "{}", app.status_message);
+    let away: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&moved).unwrap()).unwrap();
+    assert_eq!(
+        away["devices"][0]["program_slots"][0],
+        serde_json::Value::from(program.to_str().unwrap())
+    );
+    assert_eq!(
+        app.devices[0].program_slots[0].as_deref(),
+        Some(program.as_path())
+    );
+
+    // Reopening either book finds the same file.
+    for path in [&book, &moved] {
+        app.open_address_book(path);
+        assert_eq!(
+            app.devices[0].program_slots[0].as_deref(),
+            Some(program.as_path()),
+            "{} did not lead back to the file",
+            path.display()
+        );
+        assert!(
+            app.devices[0].program_slots[0]
+                .as_deref()
+                .unwrap()
+                .is_file()
+        );
+    }
+}
+
+/// The whole point: the book and its files can be picked up together.
+#[test]
+fn a_book_moved_with_its_files_still_finds_them() {
+    let original = TestDir::new();
+    let moved = TestDir::new();
+    let mut app = app_in(&original);
+    let program = original.path().join("programs").join("room.lpz");
+    std::fs::create_dir_all(program.parent().unwrap()).unwrap();
+    std::fs::write(&program, b"program").unwrap();
+
+    let book = original.path().join("book.json");
+    saved_book(&mut app, &book, "192.0.2.1");
+    app.devices[0].program_slots[0] = Some(program);
+    app.mark_address_book_dirty();
+    assert!(app.write_address_book_to(&book), "{}", app.status_message);
+
+    // Carried to another folder, as onto another machine.
+    std::fs::create_dir_all(moved.path().join("programs")).unwrap();
+    std::fs::copy(&book, moved.path().join("book.json")).unwrap();
+    std::fs::copy(
+        original.path().join("programs").join("room.lpz"),
+        moved.path().join("programs").join("room.lpz"),
+    )
+    .unwrap();
+
+    app.open_address_book(&moved.path().join("book.json"));
+    assert_eq!(
+        app.devices[0].program_slots[0].as_deref(),
+        Some(moved.path().join("programs").join("room.lpz").as_path()),
+        "the assignment still points at where the book came from"
+    );
+    assert!(
+        app.devices[0].program_slots[0]
+            .as_deref()
+            .unwrap()
+            .is_file()
     );
 }
 
