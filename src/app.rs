@@ -188,8 +188,6 @@ pub struct LoadRunnerApp {
     discovery_sender: std::sync::mpsc::Sender<DiscoveryEvent>,
     discovery_spawner: fn(mpsc::Sender<DiscoveryEvent>),
     discovering: bool,
-    /// A successful scan (even an empty one), since the device list was cleared.
-    discovery_completed: bool,
     discard_discovery_results: bool,
     pending_host_keys: HashMap<String, String>,
     device_log: crate::device_log::DeviceLog,
@@ -360,7 +358,6 @@ impl LoadRunnerApp {
             discovery_sender,
             discovery_spawner: discovery::spawn,
             discovering: false,
-            discovery_completed: false,
             discard_discovery_results: false,
             pending_host_keys: HashMap::new(),
             device_log: crate::device_log::DeviceLog::default(),
@@ -534,7 +531,6 @@ impl LoadRunnerApp {
         }
 
         let mut discovery_changed = false;
-        let mut discarded_scan_finished = false;
         while let Ok(event) = self.discovery_events.try_recv() {
             match event {
                 DiscoveryEvent::Found(device) => {
@@ -544,10 +540,6 @@ impl LoadRunnerApp {
                     }
                 }
                 DiscoveryEvent::Finished(result) => {
-                    discarded_scan_finished = self.discard_discovery_results;
-                    if !self.discard_discovery_results && result.is_ok() {
-                        self.discovery_completed = true;
-                    }
                     self.discovering = false;
                     self.discard_discovery_results = false;
                     discovery_changed = true;
@@ -556,11 +548,6 @@ impl LoadRunnerApp {
                     }
                 }
             }
-        }
-        // Clearing devices can leave an old scan draining. An editor opened
-        // during that interval needs a fresh scan once those results end.
-        if discarded_scan_finished && self.ipid_assignment.as_ref().is_some_and(|p| p.open) {
-            self.ensure_ipid_discovery();
         }
         if discovery_changed {
             self.sync_ipid_discovery();
@@ -849,7 +836,6 @@ impl LoadRunnerApp {
                 .iter()
                 .any(|device| device.source == DeviceSource::AddressBook);
         self.discard_discovery_results = self.discovering;
-        self.discovery_completed = false;
         self.devices.clear();
         self.retain_listed_terminals();
         self.vc4.clear();

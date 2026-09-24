@@ -24,7 +24,7 @@ impl LoadRunnerApp {
             .iter()
             .filter(|device| {
                 device.id != processor_id
-                    && device.discovered.is_some()
+                    && (device.discovered.is_some() || device.source == DeviceSource::AddressBook)
                     && !crate::vc4::is_vc4(&device.model)
             })
             .cloned()
@@ -33,13 +33,6 @@ impl LoadRunnerApp {
 
     pub(super) fn ipid_busy(&self) -> bool {
         self.ipid_assignment.as_ref().is_some_and(Panel::busy)
-    }
-
-    pub(super) fn ensure_ipid_discovery(&mut self) {
-        if !self.discovery_completed {
-            self.start_discovery();
-        }
-        self.sync_ipid_discovery();
     }
 
     pub(super) fn sync_ipid_discovery(&mut self) {
@@ -87,7 +80,7 @@ impl LoadRunnerApp {
             && panel.busy()
         {
             panel.open = true;
-            self.ensure_ipid_discovery();
+            self.sync_ipid_discovery();
             return;
         }
         if self.credential_prompt.is_some() || self.pending_action.is_some() {
@@ -101,7 +94,7 @@ impl LoadRunnerApp {
             }
         };
         // Reopening the same closed window retains its last results.
-        self.ensure_ipid_discovery();
+        self.sync_ipid_discovery();
         if let Some(panel) = &mut self.ipid_assignment
             && !panel.open
             && panel.processor.id == processor.id
@@ -269,6 +262,7 @@ impl LoadRunnerApp {
         match action {
             Some((token, Action::Reload)) => self.queue_ipid_table(token),
             Some((token, Action::Go)) => self.queue_ipid_assignments(token),
+            Some((_, Action::Discover)) => self.start_discovery(),
             None => {}
         }
     }

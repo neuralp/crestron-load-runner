@@ -23,6 +23,7 @@ pub(crate) struct Job {
 pub(crate) enum Action {
     Reload,
     Go,
+    Discover,
 }
 
 pub(crate) struct Panel {
@@ -41,12 +42,26 @@ pub(crate) struct Panel {
     pub discovering: bool,
 }
 
-fn model_matches(expected: &str, device: &Device) -> bool {
-    !expected.trim().is_empty()
-        && device
-            .discovered
-            .as_ref()
-            .is_some_and(|d| expected.trim().eq_ignore_ascii_case(d.model.trim()))
+/// The observed model when discovered, otherwise the address book's.
+fn device_model(device: &Device) -> &str {
+    device
+        .discovered
+        .as_ref()
+        .map_or(&device.model, |d| &d.model)
+        .trim()
+}
+
+pub(super) fn model_matches(expected: &str, device: &Device) -> bool {
+    !expected.trim().is_empty() && expected.trim().eq_ignore_ascii_case(device_model(device))
+}
+
+fn device_label(device: &Device) -> String {
+    let source = if device.discovered.is_some() {
+        "discovered"
+    } else {
+        "address book"
+    };
+    format!("{} ({})  ·  {source}", device.display_name(), device.host)
 }
 
 impl Panel {
@@ -144,11 +159,12 @@ impl Panel {
                 .iter()
                 .find(|d| &d.id == id)
                 .ok_or_else(|| "Selected device is no longer available".to_owned())?;
-            let identity = device
-                .discovered
-                .as_ref()
-                .ok_or_else(|| "Selected device must have been discovered".to_owned())?;
-            let endpoint = address_key(&identity.ip)?;
+            let endpoint = address_key(
+                device
+                    .discovered
+                    .as_ref()
+                    .map_or(&device.host, |identity| &identity.ip),
+            )?;
             if device.id == self.processor.id
                 || (!device.mac.is_empty() && device.mac.eq_ignore_ascii_case(&self.processor.mac))
                 || self
@@ -163,7 +179,7 @@ impl Panel {
             if !endpoints.insert(endpoint)
                 || (!device.mac.is_empty() && !macs.insert(device.mac.to_ascii_lowercase()))
             {
-                return Err("Assign each discovered device only once".into());
+                return Err("Assign each device only once".into());
             }
             jobs.push(Job {
                 row: index,
@@ -223,11 +239,11 @@ impl Panel {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.label(egui::RichText::new("Assign IPIDs").size(26.0).strong());
-                        ui.label("Choose a program, match its IPIDs to discovered devices, then apply the assignments.");
+                        ui.label("Choose a program, match its IPIDs to address book or discovered devices, then apply the assignments.");
                         ui.add_space(4.0);
                         self.configuration(ui, locked, &mut action);
                         ui.add_space(4.0);
-                        self.assignments(ui, locked);
+                        self.assignments(ui, locked, &mut action);
                         ui.add_space(4.0);
                         self.apply_controls(ui, locked, &mut action);
                         ui.collapsing("Raw processor response", |ui| {
@@ -318,21 +334,30 @@ impl Panel {
         });
     }
 
-    fn assignments(&mut self, ui: &mut egui::Ui, locked: bool) {
+    fn assignments(&mut self, ui: &mut egui::Ui, locked: bool, action: &mut Option<Action>) {
         card(ui).show(ui, |ui| {
             ui.set_width(ui.available_width());
             section_heading(ui, "02", "Device assignments");
-            let options: Vec<_> = self
-                .candidates
-                .iter()
-                .filter(|d| d.discovered.is_some())
-                .collect();
-            ui.weak(format!(
-                "{} IPIDs in program {}  ·  {} discovered devices",
-                self.rows.len(),
-                self.program,
-                options.len()
-            ));
+            let options: Vec<_> = self.candidates.iter().collect();
+            let discovered = options.iter().filter(|d| d.discovered.is_some()).count();
+            ui.horizontal_wrapped(|ui| {
+                ui.weak(format!(
+                    "{} IPIDs in program {}  ·  {} address book  ·  {discovered} discovered devices",
+                    self.rows.len(),
+                    self.program,
+                    options.len() - discovered,
+                ));
+                if ui
+                    .add_enabled(
+                        !self.discovering && action.is_none(),
+                        egui::Button::new("Discover devices"),
+                    )
+                    .on_hover_text("Scan the network for devices not in the address book")
+                    .clicked()
+                {
+                    *action = Some(Action::Discover);
+                }
+            });
             ui.horizontal_wrapped(|ui| {
                 if self.busy() {
                     ui.spinner();
@@ -374,7 +399,7 @@ impl Panel {
                     for (heading, width) in [
                         ("CIP_ID", 72.0),
                         ("Model Name", 160.0),
-                        ("Discovered device", device_width),
+                        ("Device", device_width),
                         ("Result", 200.0),
                     ] {
                         ui.vertical(|ui| {
@@ -396,7 +421,7 @@ impl Panel {
                             .selected
                             .as_ref()
                             .and_then(|id| options.iter().find(|d| &d.id == id))
-                            .map(|d| format!("{} ({})", d.display_name(), d.host))
+                            .map(|d| device_label(d))
                             .unwrap_or_else(|| "Skip".into());
                         let previous = row.selected.clone();
                         ui.vertical(|ui| {
@@ -412,16 +437,14 @@ impl Panel {
                                             ui.selectable_value(
                                                 &mut row.selected,
                                                 Some(device.id.clone()),
-                                                format!(
-                                                    "{} ({})",
-                                                    device.display_name(),
-                                                    device.host
-                                                ),
+                                                device_label(device),
                                             );
                                         }
                                     });
                                 if options.is_empty() {
-                                    ui.small("No discovered devices available");
+                                    ui.small(
+                                        "No devices available; add them to the address book or discover them",
+                                    );
                                 }
                             });
                             if let Some(device) = options
@@ -429,10 +452,7 @@ impl Panel {
                                 .find(|device| row.selected.as_ref() == Some(&device.id))
                                 && !model_matches(&row.key.model, device)
                             {
-                                let model = device
-                                    .discovered
-                                    .as_ref()
-                                    .map(|identity| identity.model.trim())
+                                let model = Some(device_model(device))
                                     .filter(|model| !model.is_empty())
                                     .unwrap_or("unknown");
                                 ui.colored_label(

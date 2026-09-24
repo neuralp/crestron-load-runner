@@ -1,3 +1,4 @@
+use super::window::model_matches;
 use super::*;
 use crate::model::{AddressEntry, DiscoveredIdentity};
 
@@ -33,6 +34,26 @@ fn panel_allows_model_mismatches_but_rejects_duplicate_physical_targets() {
     assert!(panel.jobs().is_err());
     panel.rows[1].selected = None;
     panel.candidates[1].discovered = None;
+    assert!(
+        panel.jobs().is_ok(),
+        "address book devices need no discovery"
+    );
+}
+
+#[test]
+fn undiscovered_book_devices_use_their_configured_host_and_model() {
+    let mut panel = panel();
+    let mut book = device("book-panel.example.test", "TS-770", "", false);
+    book.discovered = None;
+    panel.candidates[0].discovered = None;
+    panel.candidates.push(book.clone());
+    panel.rows[0].selected = Some(book.id.clone());
+    assert!(model_matches(&panel.rows[0].key.model, &book));
+    book.model = "TS-1070".into();
+    assert!(!model_matches(&panel.rows[0].key.model, &book));
+    assert_eq!(panel.jobs().unwrap()[0].id, book.id);
+    // An address book entry pointing at the processor is still refused.
+    panel.candidates.last_mut().unwrap().host = "192.0.2.10".into();
     assert!(panel.jobs().is_err());
 }
 
@@ -401,7 +422,7 @@ fn go_and_configuration_actions_obey_busy_and_modal_guards() {
     };
     assert_eq!(click(&mut panel, "GO", false), None);
     assert_eq!(click(&mut panel, "Skip", false), None);
-    assert_eq!(click(&mut panel, "User label (192.0.2.21)", false), None);
+    assert_eq!(click(&mut panel, "User label (192.0.2.21)  ·  discovered", false), None);
     assert_eq!(
         panel.rows[0].selected.as_ref(),
         Some(&panel.candidates[1].id)

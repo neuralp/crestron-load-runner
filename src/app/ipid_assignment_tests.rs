@@ -3,9 +3,8 @@ use crate::ipid_assignment::Panel;
 
 fn app() -> LoadRunnerApp {
     let mut app = LoadRunnerApp::from_parts(Preferences::default(), None, Vec::new(), None);
-    // Tests deliver discovery events explicitly; never broadcast on the LAN.
-    app.discovery_spawner = |_| {};
-    app.discovery_completed = true;
+    // Opening the editor must never scan; tests start discovery explicitly.
+    app.discovery_spawner = |_| panic!("discovery must be requested explicitly");
     app.devices.push(Device::from_address(&AddressEntry {
         host: "192.0.2.10".into(),
         kind: DeviceKind::Processor,
@@ -19,59 +18,71 @@ fn app() -> LoadRunnerApp {
 }
 
 #[test]
-fn opening_ipids_starts_discovery_once_and_streams_results_into_choices() {
+fn opening_ipids_offers_address_book_devices_without_discovering() {
     let mut app = app();
-    app.discovery_completed = false;
-    app.devices.retain(|d| d.kind == DeviceKind::Processor);
-    app.discovery_spawner = |sender| {
-        let packet = b"\x15\0\0\0new-panel\0TS-1070 [v1.0] @E-001122334466\0";
-        sender
-            .send(DiscoveryEvent::Found(Box::new(
-                crate::discovery::parse_response(packet, "192.0.2.21".into()).unwrap(),
-            )))
-            .unwrap();
-    };
-    app.open_ipid_assignment(None);
-    assert!(app.discovering);
-    assert!(app.ipid_assignment.as_ref().unwrap().discovering);
-    assert!(app.ipid_assignment.as_ref().unwrap().candidates.is_empty());
-    app.discovery_spawner = |_| panic!("must reuse in-progress discovery");
-    app.open_ipid_assignment(None);
-    app.process_events();
-    let panel = app.ipid_assignment.as_ref().unwrap();
-    assert_eq!(panel.candidates.len(), 1);
-    assert_eq!(panel.candidates[0].host, "192.0.2.21");
-    assert!(panel.discovering);
-    app.discovery_sender
-        .send(DiscoveryEvent::Finished(Ok(())))
-        .unwrap();
-    app.process_events();
-    assert!(app.discovery_completed);
-    assert!(!app.ipid_assignment.as_ref().unwrap().discovering);
-    app.cancel_credential_prompt();
-    app.ipid_assignment.as_mut().unwrap().open = false;
+    app.devices.push(Device::from_address(&AddressEntry {
+        host: "192.0.2.30".into(),
+        model: "TSW-1070".into(),
+        ..Default::default()
+    }));
     app.open_ipid_assignment(None);
     assert!(!app.discovering);
+    let panel = app.ipid_assignment.as_mut().unwrap();
+    assert!(!panel.discovering);
+    let hosts: Vec<_> = panel.candidates.iter().map(|d| d.host.as_str()).collect();
+    assert_eq!(hosts, ["192.0.2.20", "192.0.2.30"]);
+    panel.accept_table(Ok("CIP_ID|Model Name\n11|TSW-1070".into()));
+    panel.rows[0].selected = Some("192.0.2.30:22".into());
+    let jobs = panel.jobs().unwrap();
+    panel.validate_live(&app.devices, &jobs).unwrap();
 }
 
 #[test]
-fn ipids_reuses_manual_discovery_including_an_empty_completed_scan() {
+fn discover_action_streams_results_into_choices_and_merges_book_entries() {
     let mut app = app();
-    app.discovery_completed = false;
     app.devices.retain(|d| d.kind == DeviceKind::Processor);
-    app.start_discovery();
-    assert!(app.discovering);
-    app.discovery_spawner = |_| panic!("must not start another scan");
+    app.devices.push(Device::from_address(&AddressEntry {
+        host: "192.0.2.21".into(),
+        name: "Lobby".into(),
+        ..Default::default()
+    }));
     app.open_ipid_assignment(None);
+    assert_eq!(app.ipid_assignment.as_ref().unwrap().candidates.len(), 1);
+    app.discovery_spawner = |sender| {
+        for (packet, ip) in [
+            (
+                &b"\x15\0\0\0new-panel\0TS-1070 [v1.0] @E-001122334466\0"[..],
+                "192.0.2.21",
+            ),
+            (
+                &b"\x15\0\0\0panel-two\0TS-770 [v1.0] @E-001122334477\0"[..],
+                "192.0.2.22",
+            ),
+        ] {
+            sender
+                .send(DiscoveryEvent::Found(Box::new(
+                    crate::discovery::parse_response(packet, ip.into()).unwrap(),
+                )))
+                .unwrap();
+        }
+    };
+    app.start_discovery();
+    assert!(app.ipid_assignment.as_ref().unwrap().discovering);
+    app.discovery_spawner = |_| panic!("must reuse in-progress discovery");
+    app.start_discovery();
+    app.process_events();
+    let panel = app.ipid_assignment.as_ref().unwrap();
+    assert_eq!(
+        panel.candidates.len(),
+        2,
+        "book entry and scan result merge"
+    );
+    assert!(panel.candidates.iter().all(|d| d.discovered.is_some()));
     app.discovery_sender
         .send(DiscoveryEvent::Finished(Ok(())))
         .unwrap();
     app.process_events();
-    app.cancel_credential_prompt();
-    app.ipid_assignment = None;
-    app.open_ipid_assignment(None);
-    assert!(!app.discovering);
-    assert!(app.ipid_assignment.as_ref().unwrap().candidates.is_empty());
+    assert!(!app.ipid_assignment.as_ref().unwrap().discovering);
 }
 
 #[test]
@@ -124,70 +135,39 @@ fn discovery_enriches_processor_and_preserves_assignment_choices_and_snapshots()
 }
 
 #[test]
-fn failed_scan_can_be_retried_on_open_and_clear_resets_discovery() {
+fn failed_scan_can_be_retried_and_clear_discards_a_draining_scan() {
     let mut app = app();
-    app.discovery_completed = false;
+    app.discovery_spawner = |_| {};
     app.open_ipid_assignment(None);
+    app.start_discovery();
     app.discovery_sender
         .send(DiscoveryEvent::Finished(Err("no interface".into())))
         .unwrap();
     app.process_events();
     assert!(!app.discovering);
-    assert!(!app.discovery_completed);
     assert!(app.notice.as_ref().unwrap().contains("no interface"));
-    app.open_ipid_assignment(None);
+    app.start_discovery();
     assert!(app.discovering);
     app.cancel_credential_prompt();
     app.clear_devices();
-    assert!(!app.discovery_completed);
-    app.discovery_sender
-        .send(DiscoveryEvent::Finished(Ok(())))
-        .unwrap();
-    app.process_events();
-    assert!(!app.discovery_completed, "discarded scan is not reusable");
-}
-
-#[test]
-fn editor_opened_while_cleared_scan_drains_starts_a_fresh_scan_afterwards() {
-    let mut app = app();
-    app.discovery_completed = false;
-    let processor = app
-        .devices
-        .iter()
-        .find(|d| d.kind == DeviceKind::Processor)
-        .unwrap()
-        .clone();
-    app.start_discovery();
-    app.clear_devices();
     assert!(app.discard_discovery_results);
-    app.devices.push(processor);
-    app.open_ipid_assignment(None);
-    app.discovery_spawner = |sender| {
-        let packet = b"\x15\0\0\0panel-one\0TS-770 [v1.0] @E-001122334455\0";
-        sender
-            .send(DiscoveryEvent::Found(Box::new(
-                crate::discovery::parse_response(packet, "192.0.2.20".into()).unwrap(),
-            )))
-            .unwrap();
-        sender.send(DiscoveryEvent::Finished(Ok(()))).unwrap();
-    };
+    let packet = b"\x15\0\0\0panel-one\0TS-770 [v1.0] @E-001122334455\0";
+    app.discovery_sender
+        .send(DiscoveryEvent::Found(Box::new(
+            crate::discovery::parse_response(packet, "192.0.2.20".into()).unwrap(),
+        )))
+        .unwrap();
     app.discovery_sender
         .send(DiscoveryEvent::Finished(Ok(())))
         .unwrap();
-    app.process_events();
-    assert!(app.discovering);
-    assert!(!app.discovery_completed);
     app.process_events();
     assert!(!app.discovering);
-    assert!(app.discovery_completed);
-    assert_eq!(app.ipid_assignment.as_ref().unwrap().candidates.len(), 1);
+    assert!(app.devices.is_empty(), "discarded scan results are dropped");
 }
 
 #[test]
-fn invalid_processor_selection_does_not_start_discovery() {
+fn invalid_processor_selection_does_not_open_the_editor() {
     let mut app = app();
-    app.discovery_completed = false;
-    app.discovery_spawner = |_| panic!("invalid selection must not start discovery");
     for device in &mut app.devices {
         device.selected = false;
     }
