@@ -12,6 +12,7 @@ mod discovery;
 mod firmware;
 mod firmware_version;
 mod ip_table;
+mod ipid_assignment;
 /// The application mark, shared with `build.rs` by direct inclusion.
 mod logo;
 mod model;

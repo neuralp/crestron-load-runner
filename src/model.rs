@@ -64,6 +64,14 @@ pub struct DeviceDetails {
     pub cresnet: Option<String>,
 }
 
+/// Observed this session, independent of an editable address-book display name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiscoveredIdentity {
+    pub ip: String,
+    pub hostname: String,
+    pub model: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct Device {
     pub id: String,
@@ -75,6 +83,7 @@ pub struct Device {
     pub mac: String,
     pub kind: DeviceKind,
     pub source: DeviceSource,
+    pub discovered: Option<DiscoveredIdentity>,
     pub credentials: Credentials,
     pub ssh_host_key_fingerprint: Option<String>,
     pub https_certificate: Option<HttpsCertificateTrust>,
@@ -103,6 +112,7 @@ impl Device {
             mac: entry.mac.clone(),
             kind: entry.kind,
             source: DeviceSource::AddressBook,
+            discovered: None,
             credentials: Credentials {
                 username: entry.username.clone(),
                 password: String::new(),

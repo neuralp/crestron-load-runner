@@ -1,15 +1,15 @@
 use eframe::egui;
 
 #[derive(Debug, PartialEq, Eq)]
-struct Table<'a> {
-    title: &'a str,
-    headings: Vec<&'a str>,
-    rows: Vec<Vec<&'a str>>,
+pub(crate) struct Table<'a> {
+    pub(crate) title: &'a str,
+    pub(crate) headings: Vec<&'a str>,
+    pub(crate) rows: Vec<Vec<&'a str>>,
 }
 
 /// Headings come from the first pipe-delimited line of each table, not a
 /// firmware-specific schema. Empty cells must remain in place.
-fn parse(contents: &str) -> Option<Vec<Table<'_>>> {
+pub(crate) fn parse(contents: &str) -> Option<Vec<Table<'_>>> {
     let mut tables = Vec::new();
     let mut current: Option<Table<'_>> = None;
     let mut title = "";

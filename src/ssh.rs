@@ -76,6 +76,12 @@ impl Timings {
 }
 const CHUNK: usize = 64 * 1024;
 
+mod ipid_assignment;
+
+#[cfg(test)]
+#[path = "ssh/ipid_assignment_tests.rs"]
+mod ipid_assignment_tests;
+
 #[derive(Clone, Debug)]
 pub struct ConnectionSpec {
     pub id: String,
@@ -88,6 +94,17 @@ pub struct ConnectionSpec {
 #[derive(Debug)]
 pub enum WorkerCommand {
     Refresh(ConnectionSpec),
+    ReadIpids {
+        connection: ConnectionSpec,
+        program: u8,
+        reply: Sender<Result<String, String>>,
+    },
+    AssignIpid {
+        connection: ConnectionSpec,
+        ipid: String,
+        master: String,
+        reply: Sender<Result<String, String>>,
+    },
     RunScript {
         connection: ConnectionSpec,
         name: String,
@@ -408,6 +425,10 @@ async fn worker_loop(
 fn starting(command: &WorkerCommand) -> String {
     match command {
         WorkerCommand::Refresh(_) => "Reading device information".to_owned(),
+        WorkerCommand::ReadIpids { program, .. } => {
+            format!("Reading IP table for program {program}")
+        }
+        WorkerCommand::AssignIpid { ipid, .. } => format!("Assigning IPID {ipid}"),
         WorkerCommand::RunScript { name, .. } => format!("Running script {name}"),
         WorkerCommand::UploadProgram { slot, .. } => format!("Loading program slot {slot}"),
         WorkerCommand::UploadTouchpanel { .. } => "Loading touchpanel project".to_owned(),
@@ -532,6 +553,23 @@ async fn dispatch(
 ) -> WorkerResult<()> {
     match command {
         WorkerCommand::Refresh(connection) => refresh(&connection, device, events).await,
+        WorkerCommand::ReadIpids {
+            connection,
+            program,
+            reply,
+        } => {
+            ipid_assignment::read(&connection, program, reply, device, events).await;
+            Ok(())
+        }
+        WorkerCommand::AssignIpid {
+            connection,
+            ipid,
+            master,
+            reply,
+        } => {
+            ipid_assignment::assign(&connection, &ipid, &master, reply, device, events).await;
+            Ok(())
+        }
         WorkerCommand::RunScript {
             connection,
             name,

@@ -30,6 +30,10 @@ pub fn window(
             .with_title(title)
             .with_inner_size(size),
         |ui, _class| {
+            // A native viewport has no Window frame to paint its background.
+            // Cover the whole client area, even when the contents use no panels.
+            ui.painter()
+                .rect_filled(ui.max_rect(), 0.0, ui.visuals().panel_fill);
             contents(ui);
             open = !ui.ctx().input(|input| input.viewport().close_requested());
         },

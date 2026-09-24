@@ -107,6 +107,20 @@ Scripts run sequentially on each device over one authenticated SSH connection, u
 
 The library is `scripts.json` beside `preferences.json`, so `--config-dir` also isolates scripts. Saves use a temporary file, replacement, and read-back verification. Unreadable libraries are not overwritten, and address-book saves cannot overwrite the script library. Scripts and command logs are plain text: do not put passwords or other secrets in them. Run-time variable values are not saved in the library, but rendered commands are logged.
 
+## Assign IPIDs
+
+Opening the editor automatically starts device discovery if no scan has completed successfully in this session (or since **Clear Devices**). An in-progress scan is reused, and a completed scan is reused even when it found no devices. The window shows discovery progress and updates its device choices as results arrive without clearing assignments. Failed discovery can be retried by reopening the editor; **Discover Devices** in the main window always allows a manual rescan.
+
+Select exactly one console processor target and click **Assign IPIDs**, immediately after **Run Script**, or right-click a processor and choose **Assign IPIDs…**. The context action uses only the clicked processor and leaves target checkboxes unchanged. The separate window reads `ipt -t -P:<program>` for program **1–10** (default 1), using the same parser as the device information panel. Changing the program or clicking **Reload table** clears the previous mappings.
+
+Choose whether peripherals should reference the **processor** by **IP address** or **HOSTNAME** and review the displayed master address. Select a discovered device beside each CIP_ID/model row, or leave it at **Skip**. Any discovered model can be assigned: a model mismatch shows a warning on that row but does not prevent GO. Model comparison ignores case and surrounding whitespace. The same physical device cannot be selected twice. Devices must have been discovered in the current session, including those subsequently added to the address book. Editable display labels are never treated as hostnames. Rediscover if the processor's address information is unavailable.
+
+Press **GO** to read `ipt -t` on each selected peripheral. Load Runner removes only entries with the assigned IPID, using `remmaster <old IPID> <old address>`, verifies each removal, then issues `addmaster <IPID> <processor address>` and reads back the table again. Other IPIDs are preserved. An already-correct single entry is a read-only no-op. Unrecognized tables or unverified removals block writing; a successful SSH exit alone does not count as verification. Results appear per row and commands/responses appear in the device log.
+
+Credentials and host-key approval use the normal prompts in the main window. Failed operations are not automatically retried. A removal may succeed before an addition fails: inspect the table and log before pressing GO again. Closing the assignment window does not cancel queued writes; reopening it retains the results. Finish the operation or cancel its credential prompt before clearing devices, switching books, or exiting. Avoid concurrent table changes from other tools or console windows; this sequence is not an atomic transaction.
+
+This workflow is for console processors and IPv4/hostname masters, not VC-4's REST API. Firmware-specific peripheral table formats and CIP_ID notation must be validated on lab hardware before production use; unfamiliar formats fail closed rather than being assumed empty.
+
 ## The SSH console
 
 **Connect SSH…**, on a device's right-click menu and on the details panel, opens an interactive console for that device in its own window. It connects as it opens, using the same credentials and the same trust-on-first-use host-key check as every other operation; a device whose key has not been trusted yet asks in the main window, and the console can be opened again once it has been.

@@ -6,6 +6,12 @@ use std::{
 
 use eframe::egui::{self, Color32, RichText};
 
+mod ipid_assignment;
+
+#[cfg(test)]
+#[path = "app/ipid_assignment_tests.rs"]
+mod ipid_assignment_tests;
+
 use crate::{
     discovery::{self, DiscoveryEvent},
     model::{
@@ -136,6 +142,8 @@ enum PendingAction {
 /// resume, and there is nothing here to remember.
 enum CredentialGate {
     Refresh(String),
+    ReadIpids(u64),
+    AssignIpids(u64),
     RunScript(crate::scripts::RunRequest),
     LoadPrograms(Option<String>),
     LoadConfigs(Option<String>),
@@ -177,7 +185,10 @@ pub struct LoadRunnerApp {
     vc4: HashMap<String, crate::vc4::Panel>,
     discovery_events: Receiver<DiscoveryEvent>,
     discovery_sender: std::sync::mpsc::Sender<DiscoveryEvent>,
+    discovery_spawner: fn(mpsc::Sender<DiscoveryEvent>),
     discovering: bool,
+    /// A successful scan (even an empty one), since the device list was cleared.
+    discovery_completed: bool,
     discard_discovery_results: bool,
     pending_host_keys: HashMap<String, String>,
     device_log: crate::device_log::DeviceLog,
@@ -198,6 +209,8 @@ pub struct LoadRunnerApp {
     firmware_editor: crate::firmware::FirmwareEditor,
     script_editor: crate::scripts::ScriptEditor,
     script_run: Option<crate::scripts::RunDialog>,
+    ipid_assignment: Option<crate::ipid_assignment::Panel>,
+    next_ipid_token: u64,
     /// Typed into the prompt that appears when neither the device nor the
     /// preferences supply a credential. Deliberately not part of
     /// `Preferences`: it lives no longer than the process, and survives
@@ -285,6 +298,8 @@ impl LoadRunnerApp {
                     .map(|path| path.with_file_name("scripts.json")),
             ),
             script_run: None,
+            ipid_assignment: None,
+            next_ipid_token: 0,
             preferences_path,
             address_book,
             devices,
@@ -298,7 +313,9 @@ impl LoadRunnerApp {
             vc4: HashMap::new(),
             discovery_events,
             discovery_sender,
+            discovery_spawner: discovery::spawn,
             discovering: false,
+            discovery_completed: false,
             discard_discovery_results: false,
             pending_host_keys: HashMap::new(),
             device_log: crate::device_log::DeviceLog::default(),
@@ -429,22 +446,41 @@ impl LoadRunnerApp {
         while let Ok(event) = self.worker_events.try_recv() {
             self.apply_worker_event(event);
         }
+        if let Some(panel) = &mut self.ipid_assignment {
+            panel.poll();
+        }
 
+        let mut discovery_changed = false;
+        let mut discarded_scan_finished = false;
         while let Ok(event) = self.discovery_events.try_recv() {
             match event {
                 DiscoveryEvent::Found(device) => {
                     if !self.discard_discovery_results {
                         self.merge_discovered(*device);
+                        discovery_changed = true;
                     }
                 }
                 DiscoveryEvent::Finished(result) => {
+                    discarded_scan_finished = self.discard_discovery_results;
+                    if !self.discard_discovery_results && result.is_ok() {
+                        self.discovery_completed = true;
+                    }
                     self.discovering = false;
                     self.discard_discovery_results = false;
+                    discovery_changed = true;
                     if let Err(error) = result {
                         self.notice = Some(format!("Discovery failed: {error}"));
                     }
                 }
             }
+        }
+        // Clearing devices can leave an old scan draining. An editor opened
+        // during that interval needs a fresh scan once those results end.
+        if discarded_scan_finished && self.ipid_assignment.as_ref().is_some_and(|p| p.open) {
+            self.ensure_ipid_discovery();
+        }
+        if discovery_changed {
+            self.sync_ipid_discovery();
         }
     }
 
@@ -473,6 +509,7 @@ impl LoadRunnerApp {
             }
             let address_book_changed = {
                 let existing = &mut self.devices[index];
+                existing.discovered = discovered.discovered.clone();
                 let previous = (existing.source == DeviceSource::AddressBook)
                     .then(|| existing.to_address_entry());
                 if existing.source == DeviceSource::Discovered || existing.name.trim().is_empty() {
@@ -618,6 +655,8 @@ impl LoadRunnerApp {
         if let Some(resume) = prompt.resume {
             match resume {
                 CredentialGate::Refresh(id) => self.refresh_device(&id),
+                CredentialGate::ReadIpids(token) => self.queue_ipid_table(token),
+                CredentialGate::AssignIpids(token) => self.queue_ipid_assignments(token),
                 CredentialGate::RunScript(request) => self.queue_script(request),
                 CredentialGate::LoadPrograms(target) => {
                     self.load_assigned_programs_for(target.as_deref());
@@ -638,6 +677,12 @@ impl LoadRunnerApp {
     /// is dismissed.
     fn cancel_credential_prompt(&mut self) {
         self.credential_prompt = None;
+        if let Some(panel) = &mut self.ipid_assignment
+            && panel.awaiting_credentials
+        {
+            panel.awaiting_credentials = false;
+            panel.message = "Credentials cancelled; reload the table or press GO to retry".into();
+        }
         for id in self.terminals_awaiting_credentials() {
             if let Some(terminal) = self.terminals.get_mut(&id)
                 && let Some((_, output)) = terminal.take_pending_session()
@@ -665,11 +710,21 @@ impl LoadRunnerApp {
         if !self.discovering {
             self.discovering = true;
             self.discard_discovery_results = false;
-            discovery::spawn(self.discovery_sender.clone());
+            (self.discovery_spawner)(self.discovery_sender.clone());
+            self.sync_ipid_discovery();
         }
     }
 
     fn clear_devices(&mut self) {
+        // Preserve the existing clear behavior for other operations, but keep
+        // assignment snapshots/results until every IPID operation has replied.
+        if self.ipid_busy() {
+            self.status_message =
+                "Wait for device operations to finish before clearing devices".into();
+            self.status_is_error = true;
+            return;
+        }
+        self.ipid_assignment = None;
         let removed = self.devices.len();
         let address_book_changed = !self.address_book.is_empty()
             || self
@@ -677,6 +732,7 @@ impl LoadRunnerApp {
                 .iter()
                 .any(|device| device.source == DeviceSource::AddressBook);
         self.discard_discovery_results = self.discovering;
+        self.discovery_completed = false;
         self.devices.clear();
         self.retain_listed_terminals();
         self.vc4.clear();
@@ -1392,6 +1448,12 @@ impl LoadRunnerApp {
     /// Discovered devices describe the network rather than the document, so
     /// they survive a new address book just as they survive opening one.
     fn new_address_book(&mut self) {
+        if self.ipid_busy() {
+            self.status_message =
+                "Finish or cancel IPID operations before switching address books".into();
+            self.status_is_error = true;
+            return;
+        }
         if let Err(error) = self.worker_pool.retire_all() {
             self.status_message = error;
             self.status_is_error = true;
@@ -1399,6 +1461,7 @@ impl LoadRunnerApp {
         }
         self.devices
             .retain(|device| device.source == DeviceSource::Discovered);
+        self.ipid_assignment = None;
         self.retain_listed_terminals();
         self.vc4.clear();
         self.address_book.clear();
@@ -1426,6 +1489,12 @@ impl LoadRunnerApp {
     }
 
     fn request_action(&mut self, action: PendingAction, ctx: &egui::Context) {
+        if self.ipid_busy() {
+            self.status_message =
+                "Finish or cancel IPID operations before switching address books or exiting".into();
+            self.status_is_error = true;
+            return;
+        }
         if self.firmware_editor.is_busy() {
             self.status_message = "Wait for the firmware file import to finish".into();
             self.status_is_error = true;
@@ -1502,6 +1571,12 @@ impl LoadRunnerApp {
     }
 
     fn open_address_book(&mut self, path: &Path) {
+        if self.ipid_busy() {
+            self.status_message =
+                "Finish or cancel IPID operations before switching address books".into();
+            self.status_is_error = true;
+            return;
+        }
         if let Err(error) = self.worker_pool.retire_all() {
             self.status_message = error;
             self.status_is_error = true;
@@ -1511,6 +1586,7 @@ impl LoadRunnerApp {
             .and_then(|()| crate::storage::load_address_book(path));
         match result {
             Ok(entries) => {
+                self.ipid_assignment = None;
                 let mut devices: Vec<Device> = entries.iter().map(Device::from_address).collect();
                 devices.extend(
                     self.devices
@@ -1643,6 +1719,7 @@ impl LoadRunnerApp {
                 .then(|| device.id.clone())
         }) {
             let fingerprint = self.devices[index].ssh_host_key_fingerprint.clone();
+            let discovered = self.devices[index].discovered.clone();
             self.devices.remove(index);
             self.pending_host_keys.remove(&old_id);
             // The device this window was for has been merged into one already
@@ -1655,6 +1732,9 @@ impl LoadRunnerApp {
             self.selected_id = Some(existing.clone());
             if let Some(device) = self.device_mut(&existing) {
                 device.selected = true;
+                if discovered.is_some() {
+                    device.discovered = discovered;
+                }
                 if device.ssh_host_key_fingerprint.is_none() {
                     device.ssh_host_key_fingerprint = fingerprint;
                 }
@@ -1828,6 +1908,14 @@ impl LoadRunnerApp {
                 }
                 if ui.button("Run Script").clicked() {
                     self.open_script_run(None);
+                }
+                let can_assign = self.ipid_processor(None).is_ok();
+                if ui
+                    .add_enabled(can_assign, egui::Button::new("Assign IPIDs"))
+                    .on_disabled_hover_text("Select exactly one console processor target")
+                    .clicked()
+                {
+                    self.open_ipid_assignment(None);
                 }
                 ui.separator();
                 let selected = self.devices.iter().filter(|device| device.selected).count();
@@ -2157,6 +2245,15 @@ impl LoadRunnerApp {
             }
             if ui.button("Run Script…").clicked() {
                 self.open_script_run(Some(id));
+                ui.close();
+            }
+            let can_assign = self.ipid_processor(Some(id)).is_ok();
+            if ui
+                .add_enabled(can_assign, egui::Button::new("Assign IPIDs…"))
+                .on_disabled_hover_text("Requires a console processor; VC-4 uses REST")
+                .clicked()
+            {
+                self.open_ipid_assignment(Some(id));
                 ui.close();
             }
             ui.separator();
@@ -2573,6 +2670,7 @@ impl LoadRunnerApp {
         // drawing even while a modal owns the main window.
         self.firmware_editor.show(ctx);
         self.script_editor.show(ctx);
+        self.show_ipid_assignment(ctx);
         for terminal in self.terminals.values_mut() {
             terminal.show(ctx);
         }

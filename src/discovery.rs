@@ -187,6 +187,11 @@ pub(crate) fn parse_response(data: &[u8], host: String) -> Option<Device> {
         device_id.clone()
     };
 
+    let discovered = Some(crate::model::DiscoveredIdentity {
+        ip: host.clone(),
+        hostname: name.clone(),
+        model: model.clone(),
+    });
     Some(Device {
         id,
         host,
@@ -197,6 +202,7 @@ pub(crate) fn parse_response(data: &[u8], host: String) -> Option<Device> {
         mac,
         kind: classify_model(&model),
         source: DeviceSource::Discovered,
+        discovered,
         credentials: Credentials::default(),
         ssh_host_key_fingerprint: None,
         https_certificate: None,
