@@ -1,6 +1,6 @@
 [package]
 name = "crestron-load-runner"
-version = "26.9.11"
+version = "26.9.24"
 edition = "2024"
 
 [dependencies]
