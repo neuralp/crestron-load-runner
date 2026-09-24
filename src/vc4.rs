@@ -350,8 +350,8 @@ impl Load {
     }
 }
 
-/// Transient state only: neither tokens nor API data enter an address book or
-/// preferences file. Dropping a panel disconnects its reply channel so results
+/// Transient state only: API data never enters an address book or preferences
+/// file, and a saved token goes to the vault. Dropping a panel disconnects its reply channel so results
 /// cannot leak into a newly opened address book, even at the same endpoint.
 pub struct Panel {
     token: String,
@@ -556,7 +556,7 @@ impl Panel {
                 let mut changed = false;
                 ui.horizontal(|ui| {
                     ui.label("API token");
-                    changed |= ui.add(egui::TextEdit::singleline(&mut self.token).password(true)).changed();
+                    changed |= crate::app::secret_field(ui, "vc4_token", &mut self.token, "").changed();
                     if ui.button("Save token").clicked() { self.save_token = true; }
                     if ui.button("Forget token").clicked() { self.token.clear(); changed = true; self.save_token = true; }
                 });

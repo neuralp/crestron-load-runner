@@ -1,10 +1,18 @@
-//! Crestron `free` and `ramfree` reports and their free-capacity gauges.
+//! Crestron `free` and `ramfree` reports and their used-capacity gauges.
 use eframe::egui;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Capacity {
     pub free: u64,
     pub total: u64,
+}
+
+impl Capacity {
+    /// What the device reports as "actually used": `parse` guarantees that
+    /// free never exceeds total.
+    pub fn used(self) -> u64 {
+        self.total - self.free
+    }
 }
 
 pub fn parse(report: &str, memory: bool) -> Option<Capacity> {
@@ -45,8 +53,8 @@ pub fn parse(report: &str, memory: bool) -> Option<Capacity> {
 
 pub fn show(ui: &mut egui::Ui, disk: &str, memory: &str) {
     ui.columns(2, |columns| {
-        gauge(&mut columns[0], "Free disk space", disk, false);
-        gauge(&mut columns[1], "Free memory", memory, true);
+        gauge(&mut columns[0], "Used disk space", disk, false);
+        gauge(&mut columns[1], "Used memory", memory, true);
     });
     ui.separator();
 }
@@ -74,8 +82,8 @@ fn gauge(ui: &mut egui::Ui, title: &str, report: &str, memory: bool) {
             egui::Stroke::new(8.0, ui.visuals().widgets.noninteractive.bg_fill),
         ));
         if let Some(capacity) = capacity {
-            let fraction = capacity.free as f32 / capacity.total as f32;
-            let color = if fraction < 0.1 {
+            let fraction = capacity.used() as f32 / capacity.total as f32;
+            let color = if fraction > 0.9 {
                 egui::Color32::from_rgb(226, 96, 96)
             } else {
                 egui::Color32::from_rgb(68, 180, 110)
@@ -89,13 +97,13 @@ fn gauge(ui: &mut egui::Ui, title: &str, report: &str, memory: bool) {
             ui.painter().text(
                 center - egui::vec2(0.0, 12.0),
                 egui::Align2::CENTER_BOTTOM,
-                format!("{:.0}% free", fraction * 100.0),
+                format!("{:.0}% used", fraction * 100.0),
                 egui::FontId::proportional(16.0),
                 ui.visuals().text_color(),
             );
             ui.label(format!(
-                "{} free",
-                crate::archive::human_size(capacity.free)
+                "{} used",
+                crate::archive::human_size(capacity.used())
             ));
             ui.weak(format!(
                 "of {} total",
@@ -173,10 +181,13 @@ mod tests {
             })
             .collect();
         for expected in [
-            "Free disk space".to_owned(),
-            "Free memory".to_owned(),
-            format!("{} free", crate::archive::human_size(2755432448)),
-            format!("{} free", crate::archive::human_size(65351680)),
+            "Used disk space".to_owned(),
+            "Used memory".to_owned(),
+            // The devices' own "bytes actually used" lines.
+            format!("{} used", crate::archive::human_size(145522688)),
+            format!("{} used", crate::archive::human_size(105664512)),
+            "5% used".to_owned(),
+            "62% used".to_owned(),
         ] {
             assert!(texts.contains(&expected.as_str()), "missing {expected}");
         }

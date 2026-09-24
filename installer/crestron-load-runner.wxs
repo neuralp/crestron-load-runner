@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  A per-user MSI: no administrator rights, installed under
+  %LOCALAPPDATA%\Programs, with a Start-menu shortcut. Built by build.ps1,
+  which supplies Version and Exe.
+
+  The UpgradeCode ties every release together so a newer one replaces an
+  older one. It must never change.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="Crestron Load Runner"
+           Manufacturer="WorldDomination"
+           Version="$(Version)"
+           UpgradeCode="{E255FD56-19AB-4A51-B6F8-7D9292F69D3D}"
+           Scope="perUser">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Crestron Load Runner is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- The executable carries the icon build.rs rasters, so it is read from there. -->
+    <Icon Id="AppIcon" SourceFile="$(Exe)" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon" />
+    <!-- There is nothing to choose between, so Settings offers only Uninstall. -->
+    <Property Id="ARPNOMODIFY" Value="1" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="ProgramsFolder" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="Crestron Load Runner" />
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder" />
+
+    <!--
+      A per-user install keeps each component's key path in HKCU and says how
+      its folders go, which is what Windows Installer validation asks of files
+      under the user profile. RemoveFolder only ever removes an empty folder.
+      A file beside a registry key path cannot have its GUID generated, so
+      the program's is fixed, and like the UpgradeCode must never change.
+    -->
+    <Feature Id="Main">
+      <Component Id="Program" Directory="INSTALLFOLDER" Guid="{27DE46D6-AF2D-414F-A44A-67B595118D9B}">
+        <File Id="Exe" Source="$(Exe)" Name="crestron-load-runner.exe" KeyPath="no" />
+        <RegistryValue Root="HKCU" Key="Software\WorldDomination\CrestronLoadRunner"
+                       Name="Installed" Type="integer" Value="1" KeyPath="yes" />
+        <RemoveFolder Id="RemoveInstallFolder" On="uninstall" />
+        <RemoveFolder Id="RemoveProgramsFolder" Directory="ProgramsFolder" On="uninstall" />
+        <!-- In the program's own component, so the two come and go together. -->
+        <Shortcut Id="AppShortcut" Directory="ProgramMenuFolder" Name="Crestron Load Runner"
+                  Target="[#Exe]" WorkingDirectory="INSTALLFOLDER" />
+      </Component>
+    </Feature>
+
+    <!--
+      Offers to remove the saved preferences, firmware, scripts and passwords,
+      one kind at a time. Only on a real uninstall: not when a newer version is
+      replacing this one, and not when nobody is there to answer (msiexec /qn),
+      which keeps everything. Run while the program is still on disk, and
+      waited for; its result never fails the uninstall.
+    -->
+    <CustomAction Id="OfferDataRemoval" Directory="INSTALLFOLDER"
+                  ExeCommand="&quot;[INSTALLFOLDER]crestron-load-runner.exe&quot; --remove-data"
+                  Execute="immediate" Return="ignore" />
+    <InstallExecuteSequence>
+      <Custom Action="OfferDataRemoval" Before="RemoveFiles"
+              Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE AND UILevel &gt; 2" />
+    </InstallExecuteSequence>
+  </Package>
+</Wix>

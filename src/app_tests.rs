@@ -192,8 +192,23 @@ fn vc4_https_approval_promotes_discovered_device_and_reports_save_failure() {
     );
 }
 
+/// A store that refuses every write, standing in for a locked keyring.
+struct RefusingStore;
+
+impl crate::vault::SecretStore for RefusingStore {
+    fn get(&self, _: &str) -> Result<Option<String>, crate::vault::StoreError> {
+        Ok(None)
+    }
+    fn set(&self, _: &str, _: &str) -> Result<(), crate::vault::StoreError> {
+        Err(crate::vault::StoreError::Unavailable("locked".into()))
+    }
+    fn delete(&self, _: &str) -> Result<(), crate::vault::StoreError> {
+        Err(crate::vault::StoreError::Unavailable("locked".into()))
+    }
+}
+
 #[test]
-fn vc4_token_round_trips_without_debug_leaks_and_forgetting_removes_it() {
+fn vc4_token_is_kept_in_the_vault_never_in_the_book_or_debug_output() {
     let dir = TestDir::new();
     let mut app = app_in(&dir);
     let device = Device::from_address(&AddressEntry {
@@ -202,20 +217,27 @@ fn vc4_token_round_trips_without_debug_leaks_and_forgetting_removes_it() {
         ..Default::default()
     });
     let id = device.id.clone();
+    let key = crate::vault::DeviceKey::vc4_token("", &device.host, device.port);
     app.devices.push(device);
     app.selected_id = Some(id.clone());
     let token: crate::model::Vc4ApiToken = "synthetic-persisted-token".to_owned().into();
     app.vc4
         .insert(id.clone(), crate::vc4::Panel::new(None).with_token(&token));
+
+    // Typing is not saving: the field is followed in memory only.
     app.sync_vc4_token(&id);
-    assert!(app.address_book_dirty);
+    assert!(!app.address_book_dirty);
+    assert!(!app.vault.contains_device(&key));
     assert!(!format!("{:?}", app.devices[0]).contains(token.as_str()));
+
+    app.save_vc4_token(&id);
+    assert_eq!(app.vault.get_device(&key).as_deref(), Some(token.as_str()));
+
     let path = dir.path().join("vc4-book.json");
     assert!(app.write_address_book_to(&path));
-    assert_eq!(
-        crate::storage::load_address_book(&path).unwrap()[0].vc4_api_token,
-        token
-    );
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert!(!written.contains(token.as_str()), "{written}");
+    assert!(!written.contains("vc4_api_token"), "{written}");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -224,39 +246,65 @@ fn vc4_token_round_trips_without_debug_leaks_and_forgetting_removes_it() {
             0o600
         );
     }
+
+    // Reopened, the book has no token and the panel finds the saved one.
     app.open_address_book(&path);
+    assert!(!app.address_book_dirty);
     app.selected_id = Some(id.clone());
     let ctx = egui::Context::default();
     ctx.run_ui(input(), |ui| app.details_panel(ui))
         .drop_without_applying_deltas();
     assert_eq!(app.vc4[&id].token(), token);
+
+    // Forget token empties the field and saves that.
     app.vc4.insert(id.clone(), crate::vc4::Panel::new(None));
     app.save_vc4_token(&id);
-    assert!(!app.address_book_dirty);
-    assert!(
-        crate::storage::load_address_book(&path).unwrap()[0]
-            .vc4_api_token
-            .is_empty()
-    );
-    assert!(
-        !std::fs::read_to_string(&path)
-            .unwrap()
-            .contains("vc4_api_token")
-    );
-    let legacy: AddressEntry =
-        serde_json::from_str(r#"{"name":"Legacy","host":"legacy.example.test"}"#).unwrap();
-    assert!(legacy.vc4_api_token.is_empty());
-    app.current_address_book = Some(dir.path().to_owned());
+    assert!(!app.vault.contains_device(&key));
+}
+
+#[test]
+fn a_book_that_carries_a_token_hands_it_to_the_vault_and_saves_without_it() {
+    let dir = TestDir::new();
+    let mut app = app_in(&dir);
+    let path = dir.path().join("legacy.json");
+    std::fs::write(
+        &path,
+        r#"{"version":1,"devices":[{"name":"Server","host":"vc4.example.test","model":"VC-4","vc4_api_token":"legacy-token"}]}"#,
+    )
+    .unwrap();
+
+    app.open_address_book(&path);
+
+    let key = crate::vault::DeviceKey::vc4_token("", "vc4.example.test", 22);
+    assert_eq!(app.vault.get_device(&key).as_deref(), Some("legacy-token"));
+    assert!(app.address_book_dirty, "the file still holds the token");
+    assert!(app.status_message.contains("save the book"), "{}", app.status_message);
+    assert!(app.save_address_book());
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert!(!written.contains("legacy-token"), "{written}");
+}
+
+#[test]
+fn a_token_the_vault_refuses_is_reported_and_kept_for_the_session() {
+    let mut app = app();
+    app.vault = crate::vault::Vault::with_store(Box::new(RefusingStore), true);
+    let device = Device::from_address(&AddressEntry {
+        host: "vc4.example.test".into(),
+        model: "VC-4".into(),
+        ..Default::default()
+    });
+    let id = device.id.clone();
+    app.devices.push(device);
+    let token: crate::model::Vc4ApiToken = "synthetic-token".to_owned().into();
     app.vc4
         .insert(id.clone(), crate::vc4::Panel::new(None).with_token(&token));
+
     app.save_vc4_token(&id);
-    assert!(app.address_book_dirty);
-    assert!(
-        app.notice
-            .as_deref()
-            .unwrap()
-            .contains("token change has not been saved")
-    );
+
+    let notice = app.notice.as_deref().unwrap();
+    assert!(notice.contains("token change has not been saved"), "{notice}");
+    assert!(!notice.contains(token.as_str()), "{notice}");
+    assert_eq!(app.vc4_token(&app.devices[0]), token);
 }
 
 #[test]
@@ -279,11 +327,16 @@ fn vc4_save_token_promotes_discovered_device() {
     let path = dir.path().join("vc4-book.json");
     assert!(app.write_address_book_to(&path));
     app.save_vc4_token("discovered-vc4");
-    assert_eq!(
-        crate::storage::load_address_book(&path).unwrap()[0].vc4_api_token,
-        token
-    );
     assert_eq!(app.devices[0].source, DeviceSource::AddressBook);
+    let saved = crate::storage::load_address_book(&path).unwrap();
+    assert_eq!(saved.len(), 1, "the promoted server was saved to the book");
+    assert!(saved[0].vc4_api_token.is_empty());
+    assert_eq!(
+        app.vault
+            .get_device(&crate::vault::DeviceKey::vc4_token("", "vc4.example.test", 22))
+            .as_deref(),
+        Some(token.as_str())
+    );
 }
 
 /// An app whose preference writes land in `dir` instead of the real
@@ -1600,7 +1653,9 @@ fn session_credentials_fill_in_only_what_the_device_and_preferences_leave_blank(
     assert_eq!(session.password, "session-password");
     assert!(!app.connection_needs_credentials(&id));
 
-    app.preferences.default_password = "default-password".into();
+    app.vault
+        .set(crate::vault::DEFAULT_PASSWORD, "default-password")
+        .unwrap();
     let preferred = app.connection_spec(&id).unwrap().credentials;
     assert_eq!(preferred.username, "session-user");
     assert_eq!(
@@ -1787,11 +1842,16 @@ fn session_credentials_are_never_written_to_disk_or_printed() {
         assert!(printed.contains("[REDACTED]"), "{printed}");
     }
 
-    // The address book never carried a password, and still does not.
+    // The address book never carried a password, and still does not, even
+    // for one that is saved in the vault.
+    app.vault
+        .set_device(&crate::vault::DeviceKey::ssh_password("", "192.0.2.1", 22), "vault-password")
+        .unwrap();
     let book = dir.path().join("book.json");
     assert!(app.write_address_book_to(&book));
     let saved = std::fs::read_to_string(&book).unwrap();
     assert!(!saved.contains("session-password"), "{saved}");
+    assert!(!saved.contains("vault-password"), "{saved}");
 }
 
 /// Clearing takes effect at once rather than on Save, because nothing about it
@@ -1877,6 +1937,278 @@ fn cancelling_ends_the_console_sessions_that_were_waiting_on_it() {
 /// A refusal is worth asking about only when the prompt is what supplied the
 /// credential. A device carrying its own password is corrected where that is
 /// kept, not by changing what every other device connects as.
+/// A password saved for the device comes after one typed into it this session
+/// and before the saved default and the prompt, and needs no prompt at all.
+#[test]
+fn a_saved_device_password_is_used_without_asking() {
+    let mut app = app_without_credentials();
+    app.preferences.default_username = "admin".into();
+    app.devices.push(Device::from_address(&AddressEntry {
+        host: "192.0.2.1".into(),
+        ..Default::default()
+    }));
+    let id = app.devices[0].id.clone();
+    assert!(app.connection_needs_credentials(&id));
+
+    app.vault
+        .set(crate::vault::DEFAULT_PASSWORD, "default-password")
+        .unwrap();
+    app.vault
+        .set_device(&crate::vault::DeviceKey::ssh_password("", "192.0.2.1", 22), "saved-password")
+        .unwrap();
+    app.session_credentials.password = "session-password".into();
+    assert!(!app.connection_needs_credentials(&id));
+    assert!(!app.prompt_supplies_credentials(&id));
+    assert_eq!(
+        app.connection_spec(&id).unwrap().credentials.password,
+        "saved-password"
+    );
+
+    app.devices[0].credentials.password = "typed-password".into();
+    assert_eq!(
+        app.connection_spec(&id).unwrap().credentials.password,
+        "typed-password"
+    );
+}
+
+#[test]
+fn a_refused_saved_password_is_set_aside_and_the_prompt_asks() {
+    let mut app = app_without_credentials();
+    app.preferences.default_username = "admin".into();
+    app.devices.push(Device::from_address(&AddressEntry {
+        name: "Room".into(),
+        host: "192.0.2.1".into(),
+        ..Default::default()
+    }));
+    let id = app.devices[0].id.clone();
+    let key = crate::vault::DeviceKey::ssh_password("", "192.0.2.1", 22);
+    app.vault.set_device(&key, "stale-password").unwrap();
+
+    app.apply_worker_event(WorkerEvent::CredentialsRejected {
+        id: id.clone(),
+        message: "SSH authentication was not accepted".into(),
+    });
+
+    assert!(app.credential_prompt.is_some(), "nothing asked");
+    assert!(app.status_message.contains("refused the saved password"));
+    assert!(app.connection_needs_credentials(&id));
+}
+
+/// An earlier build kept the default password in `preferences.json`. It is
+/// moved to the vault and the file is rewritten without it.
+#[test]
+fn a_default_password_left_in_preferences_moves_to_the_vault() {
+    let dir = TestDir::new();
+    let path = dir.path().join("preferences.json");
+    std::fs::write(
+        &path,
+        r#"{"default_username":"admin","default_password":"plaintext-secret"}"#,
+    )
+    .unwrap();
+    let preferences = Preferences::load_from(&path).unwrap();
+
+    let app = LoadRunnerApp::from_parts(preferences, Some(path.clone()), Vec::new(), None);
+
+    assert_eq!(app.default_password().as_deref(), Some("plaintext-secret"));
+    assert!(app.preferences.default_password.is_empty());
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert!(!written.contains("plaintext-secret"), "{written}");
+    assert!(written.contains("admin"), "{written}");
+    assert!(app.status_message.contains("moved"), "{}", app.status_message);
+}
+
+/// With nowhere safe to keep it, the password is used for the session and the
+/// file is not rewritten behind the user's back; the next save leaves it out.
+#[test]
+fn without_a_keyring_the_default_password_lasts_the_session_and_is_never_written() {
+    let dir = TestDir::new();
+    let path = dir.path().join("preferences.json");
+    std::fs::write(&path, r#"{"default_password":"plaintext-secret"}"#).unwrap();
+    let preferences = Preferences::load_from(&path).unwrap();
+
+    let mut app = LoadRunnerApp::with_vault(
+        preferences,
+        Some(path.clone()),
+        Vec::new(),
+        None,
+        crate::vault::Vault::session_only(),
+    );
+
+    assert_eq!(app.default_password().as_deref(), Some("plaintext-secret"));
+    assert!(std::fs::read_to_string(&path).unwrap().contains("plaintext-secret"));
+
+    app.open_preferences();
+    assert_eq!(app.preferences_draft.default_password, "plaintext-secret");
+    app.preferences_draft.default_password = "typed-secret".into();
+    app.save_preferences();
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert!(!written.contains("secret"), "{written}");
+    assert_eq!(app.default_password().as_deref(), Some("typed-secret"));
+}
+
+#[test]
+fn the_default_password_is_saved_to_the_vault_and_cleared_from_it() {
+    let dir = TestDir::new();
+    let mut app = app_in(&dir);
+    app.open_preferences();
+    app.preferences_draft.default_password = "default-secret".into();
+    app.save_preferences();
+    assert!(!app.preferences_open);
+    assert_eq!(app.default_password().as_deref(), Some("default-secret"));
+    let written = std::fs::read_to_string(dir.path().join("preferences.json")).unwrap();
+    assert!(!written.contains("default-secret"), "{written}");
+
+    app.open_preferences();
+    app.preferences_draft.default_password.clear();
+    app.save_preferences();
+    assert_eq!(app.default_password(), None);
+}
+
+/// DHCP handing a discovered device a new address does not lose its password.
+#[test]
+fn a_remembered_password_follows_the_device_to_a_new_address() {
+    let mut app = app_without_credentials();
+    app.preferences.default_username = "admin".into();
+    app.merge_discovered(searchable("192.0.2.1", "Room", "RMC4", "1.0", "00:10:7f:11:22:33"));
+    let id = app.devices[0].id.clone();
+    app.vault
+        .set_device(&password_key(&app.devices[0]), "saved-password")
+        .unwrap();
+
+    app.merge_discovered(searchable("192.0.2.99", "Room", "RMC4", "1.0", "00:10:7f:11:22:33"));
+
+    assert_eq!(app.devices[0].host, "192.0.2.99");
+    assert_eq!(
+        app.connection_spec(&id).unwrap().credentials.password,
+        "saved-password"
+    );
+}
+
+/// Remembered for a device added by hand, before discovery told us its MAC:
+/// still found once the MAC is known, and kept under it from then on.
+#[test]
+fn a_password_remembered_before_the_mac_was_known_is_found_after() {
+    let mut app = app_without_credentials();
+    app.preferences.default_username = "admin".into();
+    app.devices.push(Device::from_address(&AddressEntry {
+        host: "192.0.2.1".into(),
+        ..Default::default()
+    }));
+    let id = app.devices[0].id.clone();
+    app.vault
+        .set_device(&password_key(&app.devices[0]), "saved-password")
+        .unwrap();
+
+    app.merge_discovered(searchable("192.0.2.1", "Room", "RMC4", "1.0", "00:10:7f:11:22:33"));
+
+    assert_eq!(app.devices[0].mac, "00:10:7f:11:22:33");
+    assert_eq!(
+        app.connection_spec(&id).unwrap().credentials.password,
+        "saved-password"
+    );
+    let by_mac = crate::vault::DeviceKey::ssh_password("00:10:7f:11:22:33", "192.0.2.50", 22);
+    assert_eq!(
+        app.vault.get_device(&by_mac).as_deref(),
+        Some("saved-password")
+    );
+}
+
+/// The bundled fonts are the only ones the application has, so a label they
+/// lack would draw as an empty box.
+#[test]
+fn the_reveal_button_label_is_in_the_bundled_fonts() {
+    let ctx = egui::Context::default();
+    ctx.run_ui(input(), |_| {}).drop_without_applying_deltas();
+    let found = ctx.fonts_mut(|fonts| {
+        fonts.has_glyphs(&egui::FontId::proportional(14.0), REVEAL_LABEL)
+    });
+    assert!(found);
+}
+
+/// Masked until asked, shown while toggled on, masked again when toggled off.
+#[test]
+fn the_reveal_button_unmasks_a_password_and_masks_it_again() {
+    let mut app = app();
+    app.add_device_open = true;
+    app.address_draft.password = "hunter2-synthetic".into();
+    let ctx = egui::Context::default();
+    let frame = |app: &mut LoadRunnerApp| {
+        for _ in 0..2 {
+            ctx.run_ui(input(), |ui| app.show(ui))
+                .drop_without_applying_deltas();
+        }
+        let output = ctx.run_ui(input(), |ui| app.show(ui));
+        let texts: Vec<(String, egui::Pos2)> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some((
+                    text.galley.text().to_owned(),
+                    text.pos + text.galley.size() * 0.5,
+                )),
+                _ => None,
+            })
+            .collect();
+        output.drop_without_applying_deltas();
+        texts
+    };
+    let click = |app: &mut LoadRunnerApp, pos: egui::Pos2| {
+        for pressed in [true, false] {
+            let mut raw = input();
+            raw.events.push(egui::Event::PointerMoved(pos));
+            raw.events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+            ctx.run_ui(raw, |ui| app.show(ui))
+                .drop_without_applying_deltas();
+        }
+    };
+    let shows_password =
+        |texts: &[(String, egui::Pos2)]| texts.iter().any(|(text, _)| text.contains("hunter2"));
+    let reveal = |texts: &[(String, egui::Pos2)]| {
+        texts
+            .iter()
+            .find(|(text, _)| text == REVEAL_LABEL)
+            .map(|(_, pos)| *pos)
+            .expect("no reveal button")
+    };
+
+    let texts = frame(&mut app);
+    assert!(!shows_password(&texts));
+    click(&mut app, reveal(&texts));
+    let texts = frame(&mut app);
+    assert!(shows_password(&texts));
+    click(&mut app, reveal(&texts));
+    assert!(!shows_password(&frame(&mut app)));
+}
+
+#[test]
+fn adding_a_device_can_remember_its_password() {
+    let mut app = app();
+    app.address_draft = AddressDraft {
+        host: "192.0.2.9".into(),
+        port: 22,
+        password: "added-password".into(),
+        remember_password: true,
+        ..Default::default()
+    };
+    app.add_address();
+    let key = crate::vault::DeviceKey::ssh_password("", "192.0.2.9", 22);
+    assert_eq!(app.vault.get_device(&key).as_deref(), Some("added-password"));
+
+    app.address_draft = AddressDraft {
+        host: "192.0.2.10".into(),
+        port: 22,
+        password: "session-only".into(),
+        ..Default::default()
+    };
+    app.add_address();
+    assert!(!app.vault.contains_device(&crate::vault::DeviceKey::ssh_password("", "192.0.2.10", 22)));
+}
+
 #[test]
 fn a_refused_password_asks_again_only_when_the_prompt_is_what_supplied_it() {
     let mut app = app_without_credentials();
@@ -2200,6 +2532,47 @@ fn console_windows_close_with_the_devices_they_belong_to() {
         !app.terminals.contains_key(&id),
         "a window outlived the device it was for"
     );
+}
+
+#[test]
+fn remove_devices_drops_discovered_and_address_book_devices() {
+    let mut app = app();
+    app.merge_discovered(searchable("192.0.2.1", "ROOM1", "RMC3", "1.0", "00:10:7f:00:00:01"));
+    app.merge_discovered(searchable("192.0.2.2", "ROOM2", "RMC3", "1.0", "00:10:7f:00:00:02"));
+    app.merge_discovered(searchable("192.0.2.3", "ROOM3", "RMC3", "1.0", "00:10:7f:00:00:03"));
+    let promoted = app.devices[0].id.clone();
+    app.add_discovered_to_address_book(&promoted);
+    let promoted = app.devices[0].id.clone();
+    let discovered_id = app.devices[1].id.clone();
+    let kept = app.devices[2].id.clone();
+    app.selected_id = Some(promoted.clone());
+    app.address_book_dirty = false;
+
+    app.remove_devices(&[promoted, discovered_id]);
+
+    assert_eq!(app.devices.len(), 1);
+    assert_eq!(app.devices[0].id, kept);
+    assert!(app.address_book.is_empty());
+    assert!(app.address_book_dirty);
+    assert!(app.selected_id.is_none());
+}
+
+#[test]
+fn a_busy_device_keeps_the_whole_removal_from_happening() {
+    let mut app = app();
+    app.merge_discovered(searchable("192.0.2.1", "ROOM1", "RMC3", "1.0", "00:10:7f:00:00:01"));
+    app.merge_discovered(searchable("192.0.2.2", "ROOM2", "RMC3", "1.0", "00:10:7f:00:00:02"));
+    let first = app.devices[0].id.clone();
+    let second = app.devices[1].id.clone();
+    app.add_discovered_to_address_book(&first);
+    let first = app.devices[0].id.clone();
+    app.refresh_device(&first);
+    assert!(app.worker_pool.is_busy(&first));
+
+    app.remove_devices(&[first, second]);
+
+    assert_eq!(app.devices.len(), 2);
+    assert!(app.status_is_error);
 }
 
 #[test]

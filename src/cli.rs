@@ -11,12 +11,16 @@ Options:
                           for a throwaway profile that leaves the real
                           preferences untouched. Address books are files you
                           choose and are not stored here.
+      --remove-data       Offer to remove the saved preferences, firmware
+                          library, scripts and passwords, then exit. The
+                          uninstaller runs this.
   -h, --help              Print this message and exit
 ";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Options {
     pub config_dir: Option<PathBuf>,
+    pub remove_data: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,6 +36,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Outcome, Str
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "-h" | "--help" => return Ok(Outcome::Help),
+            "--remove-data" => options.remove_data = true,
             "--config-dir" => {
                 let value = arguments
                     .next()
@@ -83,6 +88,19 @@ mod tests {
         let expected = Some(PathBuf::from("/tmp/profile"));
         assert_eq!(config_dir(&["--config-dir", "/tmp/profile"]), expected);
         assert_eq!(config_dir(&["--config-dir=/tmp/profile"]), expected);
+    }
+
+    #[test]
+    fn remove_data_is_off_unless_asked_for_and_combines_with_a_profile() {
+        let run = |arguments: &[&str]| match parse_arguments(arguments).unwrap() {
+            Outcome::Run(options) => options,
+            Outcome::Help => panic!("expected a run outcome"),
+        };
+        assert!(!run(&[]).remove_data);
+        assert!(run(&["--remove-data"]).remove_data);
+        let both = run(&["--remove-data", "--config-dir", "/tmp/profile"]);
+        assert!(both.remove_data);
+        assert_eq!(both.config_dir, Some(PathBuf::from("/tmp/profile")));
     }
 
     #[test]

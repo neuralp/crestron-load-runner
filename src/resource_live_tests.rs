@@ -26,7 +26,9 @@ fn read_rmc3_resources() {
         port: entry.port,
         credentials: crate::model::Credentials {
             username: preferences.default_username,
-            password: preferences.default_password,
+            password: crate::vault::Vault::open(crate::storage::vault_service())
+                .get(crate::vault::DEFAULT_PASSWORD)
+                .expect("No default password saved"),
         },
         trusted_fingerprint: entry.ssh_host_key_fingerprint.clone(),
     };
@@ -45,8 +47,8 @@ fn read_rmc3_resources() {
             let capacity = crate::resources::parse(&report, command == "ramfree")
                 .expect("Live report must parse");
             println!(
-                "{} free / {} total",
-                crate::archive::human_size(capacity.free),
+                "{} used / {} total",
+                crate::archive::human_size(capacity.used()),
                 crate::archive::human_size(capacity.total)
             );
         }

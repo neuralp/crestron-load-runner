@@ -115,6 +115,7 @@ struct AddressDraft {
     port: u16,
     username: String,
     password: String,
+    remember_password: bool,
     kind: DeviceKind,
 }
 
@@ -218,6 +219,9 @@ pub struct LoadRunnerApp {
     session_credentials: Credentials,
     credential_prompt: Option<CredentialPrompt>,
     notice: Option<String>,
+    /// Saved passwords and API tokens. Tests are given one that lives in
+    /// memory, so no test reaches the real store.
+    vault: crate::vault::Vault,
 }
 
 /// The application mark, drawn rather than loaded so it is sharp at any size
@@ -245,6 +249,16 @@ fn mark(ui: &mut egui::Ui, size: f32) {
     }
 }
 
+/// Where the vault keeps this device's SSH password.
+fn password_key(device: &Device) -> crate::vault::DeviceKey {
+    crate::vault::DeviceKey::ssh_password(&device.mac, &device.host, device.port)
+}
+
+/// Where the vault keeps this server's VC-4 API token.
+fn token_key(device: &Device) -> crate::vault::DeviceKey {
+    crate::vault::DeviceKey::vc4_token(&device.mac, &device.host, device.port)
+}
+
 /// A dialog that blocks the main window. The backdrop is painted separately,
 /// once per frame, so that stacked dialogs do not darken it twice.
 fn modal(id: &str) -> egui::Modal {
@@ -259,12 +273,20 @@ impl LoadRunnerApp {
         let moved = crate::storage::migrate_firmware_dir();
         let (preferences, load_error) = Preferences::load();
         let (startup_book, startup_error) = crate::storage::startup_address_book(&preferences);
-        let mut app = Self::from_parts(
+        let vault = crate::vault::Vault::open(crate::storage::vault_service());
+        let persistent = vault.is_persistent();
+        let mut app = Self::with_vault(
             preferences,
             crate::storage::preferences_path(),
             Vec::new(),
             moved.or(load_error).or(startup_error),
+            vault,
         );
+        if !persistent {
+            app.notice = Some(
+                "No system keyring was found, so saved passwords and API tokens last only until the application closes.".into(),
+            );
+        }
         app.firmware_editor = crate::firmware::FirmwareEditor::load(crate::storage::firmware_dir());
         if let Some(path) = startup_book {
             app.open_address_book(&path);
@@ -272,24 +294,47 @@ impl LoadRunnerApp {
         app
     }
 
+    #[cfg(test)]
     fn from_parts(
         preferences: Preferences,
         preferences_path: Option<PathBuf>,
         address_book: Vec<AddressEntry>,
         load_error: Option<String>,
     ) -> Self {
+        let vault = crate::vault::Vault::with_store(
+            Box::<crate::vault::MemoryStore>::default(),
+            true,
+        );
+        Self::with_vault(preferences, preferences_path, address_book, load_error, vault)
+    }
+
+    fn with_vault(
+        mut preferences: Preferences,
+        preferences_path: Option<PathBuf>,
+        address_book: Vec<AddressEntry>,
+        load_error: Option<String>,
+        vault: crate::vault::Vault,
+    ) -> Self {
+        let migration = Self::migrate_default_password(
+            &mut preferences,
+            preferences_path.as_deref(),
+            &vault,
+        );
         let status_is_error = load_error.is_some();
-        let status_message = load_error.unwrap_or_else(|| "Ready".into());
+        let status_message = load_error
+            .or(migration)
+            .unwrap_or_else(|| "Ready".into());
         let devices = address_book.iter().map(Device::from_address).collect();
         let (worker_sender, worker_events) = mpsc::channel();
         let (discovery_sender, discovery_events) = mpsc::channel();
         let preferences_draft = PreferencesDraft {
             default_username: preferences.default_username.clone(),
-            default_password: preferences.default_password.clone(),
+            default_password: String::new(),
             startup: preferences.startup,
             default_address_book: preferences.default_address_book.clone(),
         };
         Self {
+            vault,
             preferences,
             backdrop: crate::backdrop::Backdrop::default(),
             script_editor: crate::scripts::ScriptEditor::load(
@@ -339,6 +384,43 @@ impl LoadRunnerApp {
             session_credentials: Credentials::default(),
             credential_prompt: None,
             notice: None,
+        }
+    }
+
+    /// Moves a default password that an earlier build left in
+    /// `preferences.json` into the vault, and takes it out of the file.
+    ///
+    /// Without a vault that outlasts the process the file is left alone for
+    /// now: the password is used this session and dropped from the file at
+    /// the next save of the preferences, which the startup notice explains.
+    fn migrate_default_password(
+        preferences: &mut Preferences,
+        path: Option<&Path>,
+        vault: &crate::vault::Vault,
+    ) -> Option<String> {
+        if preferences.default_password.is_empty() {
+            return None;
+        }
+        let password = std::mem::take(&mut preferences.default_password);
+        let saved = vault.set(crate::vault::DEFAULT_PASSWORD, &password);
+        if !vault.is_persistent() {
+            return None;
+        }
+        if let Err(error) = saved {
+            return Some(format!(
+                "The default password is still in preferences.json: {error}"
+            ));
+        }
+        let path = path?;
+        match preferences.save_to(path) {
+            Ok(()) => Some(format!(
+                "The default password was moved from preferences.json to {}",
+                vault.store_name()
+            )),
+            Err(error) => Some(format!(
+                "The default password was copied to {}, but preferences.json could not be rewritten without it: {error}",
+                vault.store_name()
+            )),
         }
     }
 
@@ -429,6 +511,7 @@ impl LoadRunnerApp {
             // failure, and silently loading firmware again on the strength of
             // a corrected password is not what the button was clicked for.
             WorkerEvent::CredentialsRejected { id, message } => {
+                self.set_aside_rejected_password(&id);
                 if self.prompt_supplies_credentials(&id) {
                     let target = self.device_name(&id);
                     self.open_credential_prompt(target, None, Some(message));
@@ -540,10 +623,24 @@ impl LoadRunnerApp {
         self.devices.iter_mut().find(|device| device.id == id)
     }
 
+    /// The password saved in the vault for this device, if there is one.
+    fn saved_password(&self, device: &Device) -> Option<String> {
+        self.vault
+            .get_device(&password_key(device))
+            .filter(|password| !password.is_empty())
+    }
+
+    fn default_password(&self) -> Option<String> {
+        self.vault
+            .get(crate::vault::DEFAULT_PASSWORD)
+            .filter(|password| !password.is_empty())
+    }
+
     /// What the device will be connected as: its own credentials, then the
     /// saved defaults, then whatever the session-credential prompt was
     /// answered with. Each field falls back on its own, so a device that
-    /// carries a username but no password keeps its username.
+    /// carries a username but no password keeps its username. A password
+    /// saved for the device itself comes before the default one.
     fn connection_spec(&self, id: &str) -> Option<ConnectionSpec> {
         let device = self.devices.iter().find(|device| device.id == id)?;
         let mut credentials = device.credentials.clone();
@@ -554,10 +651,10 @@ impl LoadRunnerApp {
             credentials.username = self.session_credentials.username.clone();
         }
         if credentials.password.is_empty() {
-            credentials.password = self.preferences.default_password.clone();
-        }
-        if credentials.password.is_empty() {
-            credentials.password = self.session_credentials.password.clone();
+            credentials.password = self
+                .saved_password(device)
+                .or_else(|| self.default_password())
+                .unwrap_or_else(|| self.session_credentials.password.clone());
         }
         Some(ConnectionSpec {
             id: device.id.clone(),
@@ -590,7 +687,27 @@ impl LoadRunnerApp {
         (device.credentials.username.trim().is_empty()
             && self.preferences.default_username.trim().is_empty())
             || (device.credentials.password.is_empty()
-                && self.preferences.default_password.is_empty())
+                && self.saved_password(device).is_none()
+                && self.default_password().is_none())
+    }
+
+    /// A password saved for the device that the device has just refused is
+    /// set aside for the rest of the run rather than sent again, so the next
+    /// attempt asks instead. It stays in the vault: the device may simply be
+    /// mid-way through a password change.
+    fn set_aside_rejected_password(&mut self, id: &str) {
+        let Some(device) = self.devices.iter().find(|device| device.id == id) else {
+            return;
+        };
+        if !device.credentials.password.is_empty() || self.saved_password(device).is_none() {
+            return;
+        }
+        self.vault.suppress_device(&password_key(device));
+        self.status_message = format!(
+            "{} refused the saved password; it will not be used again this session",
+            self.device_name(id)
+        );
+        self.status_is_error = true;
     }
 
     /// Raises the session-credential prompt when any of these devices would
@@ -748,7 +865,7 @@ impl LoadRunnerApp {
     fn open_preferences(&mut self) {
         self.preferences_draft = PreferencesDraft {
             default_username: self.preferences.default_username.clone(),
-            default_password: self.preferences.default_password.clone(),
+            default_password: self.default_password().unwrap_or_default(),
             startup: self.preferences.startup,
             default_address_book: self.preferences.default_address_book.clone(),
         };
@@ -774,17 +891,32 @@ impl LoadRunnerApp {
         // Assigned field by field: the recent list lives on the same struct and
         // is not part of the draft.
         self.preferences.default_username = draft.default_username.trim().to_owned();
-        self.preferences.default_password = draft.default_password;
         self.preferences.startup = draft.startup;
         self.preferences.default_address_book = draft.default_address_book;
-        match self.store_preferences() {
-            Ok(()) => {
+        // Only written when it changed, so that saving the other preferences
+        // does not touch the vault.
+        let password_saved = if self.default_password().unwrap_or_default() == draft.default_password
+        {
+            Ok(())
+        } else if draft.default_password.is_empty() {
+            self.vault.delete(crate::vault::DEFAULT_PASSWORD)
+        } else {
+            self.vault
+                .set(crate::vault::DEFAULT_PASSWORD, &draft.default_password)
+        };
+        match (self.store_preferences(), password_saved) {
+            (Ok(()), Ok(())) => {
                 self.preferences_open = false;
                 self.status_message = "Preferences saved".into();
                 self.status_is_error = false;
             }
-            Err(error) => {
+            (Err(error), _) => {
                 self.notice = Some(format!("Could not save preferences: {error}"));
+            }
+            (Ok(()), Err(error)) => {
+                self.notice = Some(format!(
+                    "{error}. The default password will be used until the application closes."
+                ));
             }
         }
     }
@@ -819,17 +951,28 @@ impl LoadRunnerApp {
         }
     }
 
+    /// The server's token: the one typed this session, or else the saved one.
+    fn vc4_token(&self, device: &Device) -> crate::model::Vc4ApiToken {
+        if !device.vc4_api_token.is_empty() {
+            return device.vc4_api_token.clone();
+        }
+        self.vault
+            .get_device(&token_key(device))
+            .unwrap_or_default()
+            .into()
+    }
+
     fn refresh_device(&mut self, id: &str) {
         if let Some(device) = self
             .devices
             .iter()
             .find(|d| d.id == id && crate::vc4::is_vc4(&d.model))
         {
+            let token = self.vc4_token(device);
             self.vc4
                 .entry(id.to_owned())
                 .or_insert_with(|| {
-                    crate::vc4::Panel::new(device.https_certificate.clone())
-                        .with_token(&device.vc4_api_token)
+                    crate::vc4::Panel::new(device.https_certificate.clone()).with_token(&token)
                 })
                 .refresh(&device.host);
             return;
@@ -879,30 +1022,51 @@ impl LoadRunnerApp {
         Some(target)
     }
 
+    /// Keeps the device's in-memory token in step with the panel's field.
+    /// Nothing is saved: that waits for Save token or Forget token, so the
+    /// vault is not written at every keystroke.
     fn sync_vc4_token(&mut self, id: &str) {
         let Some(token) = self.vc4.get(id).map(crate::vc4::Panel::token) else {
             return;
         };
-        let Some(device) = self.device_mut(id) else {
-            return;
-        };
-        if device.vc4_api_token != token {
+        if let Some(device) = self.device_mut(id) {
             device.vc4_api_token = token;
-            if device.source == DeviceSource::AddressBook {
-                self.mark_address_book_dirty();
-            }
         }
     }
 
+    /// Saves the panel's token to the vault, or removes the saved one when the
+    /// field is empty. A discovered server is added to the address book first,
+    /// and the book is saved so that it is still there next time.
     fn save_vc4_token(&mut self, id: &str) {
         let Some(target) = self.vc4_address_book_target(id) else {
             return;
         };
         self.sync_vc4_token(&target);
-        self.mark_address_book_dirty();
-        if !self.save_address_book() {
+        let Some(device) = self.devices.iter().find(|device| device.id == target) else {
+            return;
+        };
+        let key = token_key(device);
+        let token = device.vc4_api_token.clone();
+        let saved = if token.is_empty() {
+            self.vault.delete_device(&key)
+        } else {
+            self.vault.set_device(&key, token.as_str())
+        };
+        if let Err(error) = saved {
             self.notice = Some(format!(
-                "API token change has not been saved. {}",
+                "API token change has not been saved. {error}. It will be used until the application closes."
+            ));
+            return;
+        }
+        self.status_message = if token.is_empty() {
+            format!("API token removed from {}", self.vault.store_name())
+        } else {
+            format!("API token saved in {}", self.vault.store_name())
+        };
+        self.status_is_error = false;
+        if self.address_book_dirty && !self.save_address_book() {
+            self.notice = Some(format!(
+                "The API token was saved, but the address book has not been. {}",
                 self.status_message
             ));
         }
@@ -1587,6 +1751,7 @@ impl LoadRunnerApp {
         match result {
             Ok(entries) => {
                 self.ipid_assignment = None;
+                let imported = self.import_vc4_tokens(&entries);
                 let mut devices: Vec<Device> = entries.iter().map(Device::from_address).collect();
                 devices.extend(
                     self.devices
@@ -1600,17 +1765,23 @@ impl LoadRunnerApp {
                         })
                         .cloned(),
                 );
-                self.address_book = entries;
                 self.vc4.clear();
                 self.devices = devices;
+                self.sync_address_book_from_devices();
                 self.retain_listed_terminals();
                 self.selected_id = None;
                 self.pending_host_keys.clear();
                 self.credential_prompt = None;
                 self.current_address_book = Some(path.to_owned());
-                self.address_book_dirty = false;
-                self.status_message = format!("Loaded {}", path.display());
-                self.status_is_error = false;
+                // A book that brought tokens in is left marked as changed, so
+                // that saving it, or being asked to on the way out, takes them
+                // out of the file.
+                self.address_book_dirty = imported.is_some();
+                self.status_is_error = imported.as_ref().is_some_and(|(_, failed)| *failed);
+                self.status_message = match imported {
+                    Some((note, _)) => format!("Loaded {}. {note}", path.display()),
+                    None => format!("Loaded {}", path.display()),
+                };
                 self.remember_recent(path);
             }
             Err(error) => {
@@ -1624,6 +1795,48 @@ impl LoadRunnerApp {
                 }
             }
         }
+    }
+
+    /// Moves the API tokens a book written by an earlier build carries into
+    /// the vault. The devices built from the book still hold them for this
+    /// session either way. Says what happened, and whether it failed, when
+    /// the book carried any.
+    fn import_vc4_tokens(&self, entries: &[AddressEntry]) -> Option<(String, bool)> {
+        let carrying: Vec<&AddressEntry> = entries
+            .iter()
+            .filter(|entry| !entry.vc4_api_token.is_empty())
+            .collect();
+        if carrying.is_empty() {
+            return None;
+        }
+        let failed = carrying
+            .iter()
+            .filter_map(|entry| {
+                self.vault
+                    .set_device(
+                        &crate::vault::DeviceKey::vc4_token(&entry.mac, &entry.host, entry.port),
+                        entry.vc4_api_token.as_str(),
+                    )
+                    .err()
+            })
+            .last();
+        Some(match failed {
+            Some(error) => (
+                format!("Its API tokens are still in the file: {error}"),
+                true,
+            ),
+            None if self.vault.is_persistent() => (
+                format!(
+                    "Its API tokens were moved to {}; save the book to remove them from the file",
+                    self.vault.store_name()
+                ),
+                false,
+            ),
+            None => (
+                "Its API tokens are kept for this session only, and saving the book removes them from the file".into(),
+                false,
+            ),
+        })
     }
 
     fn add_address(&mut self) {
@@ -1662,6 +1875,7 @@ impl LoadRunnerApp {
             let discovered_id = self.devices[index].id.clone();
             self.add_discovered_to_address_book(&discovered_id);
             let password = self.address_draft.password.clone();
+            self.remember_drafted_password(&id);
             let Some(device) = self.device_mut(&id) else {
                 return;
             };
@@ -1685,6 +1899,7 @@ impl LoadRunnerApp {
         device.credentials.password = self.address_draft.password.clone();
         self.address_book.push(entry);
         self.devices.push(device);
+        self.remember_drafted_password(&id);
         self.selected_id = Some(id);
         self.add_device_open = false;
         self.address_draft = AddressDraft {
@@ -1692,6 +1907,23 @@ impl LoadRunnerApp {
             ..Default::default()
         };
         self.mark_address_book_dirty();
+    }
+
+    /// Saves the Add Device password when its box was ticked. A failure is
+    /// reported but does not stop the device being added.
+    fn remember_drafted_password(&mut self, id: &str) {
+        if !self.address_draft.remember_password || self.address_draft.password.is_empty() {
+            return;
+        }
+        let Some(device) = self.devices.iter().find(|device| device.id == id) else {
+            return;
+        };
+        if let Err(error) = self
+            .vault
+            .set_device(&password_key(device), &self.address_draft.password)
+        {
+            self.notice = Some(error);
+        }
     }
 
     fn add_discovered_to_address_book(&mut self, id: &str) {
@@ -1763,27 +1995,73 @@ impl LoadRunnerApp {
         let Some(id) = self.selected_id.clone() else {
             return;
         };
-        let Some(device) = self.devices.iter().find(|device| device.id == id) else {
-            return;
-        };
-        if device.source != DeviceSource::AddressBook {
+        if self
+            .devices
+            .iter()
+            .any(|device| device.id == id && device.source == DeviceSource::AddressBook)
+        {
+            self.remove_devices(&[id]);
+        }
+    }
+
+    /// Takes the given devices off the list, discovered or not. Nothing is
+    /// removed unless every one of them can be, so a busy device never leaves
+    /// the rest half-removed.
+    fn remove_devices(&mut self, ids: &[String]) {
+        let ids: Vec<String> = ids
+            .iter()
+            .filter(|id| self.devices.iter().any(|device| &device.id == *id))
+            .cloned()
+            .collect();
+        if ids.is_empty() {
             return;
         }
-        let host = device.host.clone();
-        let port = device.port;
-        if let Err(error) = self.worker_pool.retire(&id) {
-            self.status_message = error;
+        if self.ipid_busy() {
+            self.status_message =
+                "Wait for device operations to finish before removing devices".into();
             self.status_is_error = true;
             return;
         }
-        self.devices.retain(|device| device.id != id);
-        self.vc4.remove(&id);
-        self.terminals.remove(&id);
-        self.address_book
-            .retain(|entry| entry.host != host || entry.port != port);
-        self.pending_host_keys.remove(&id);
-        self.selected_id = None;
-        self.mark_address_book_dirty();
+        if ids.iter().any(|id| self.worker_pool.is_busy(id)) {
+            self.status_message = "Wait for this device's queued operations to finish".into();
+            self.status_is_error = true;
+            return;
+        }
+        for id in &ids {
+            if let Err(error) = self.worker_pool.retire(id) {
+                self.status_message = error;
+                self.status_is_error = true;
+                return;
+            }
+        }
+        let address_book_changed = self.devices.iter().any(|device| {
+            device.source == DeviceSource::AddressBook && ids.contains(&device.id)
+        });
+        self.devices.retain(|device| !ids.contains(&device.id));
+        for id in &ids {
+            self.vc4.remove(id);
+            self.terminals.remove(id);
+            self.pending_host_keys.remove(id);
+        }
+        if self
+            .ipid_assignment
+            .as_ref()
+            .is_some_and(|panel| ids.contains(&panel.processor.id))
+        {
+            self.ipid_assignment = None;
+        }
+        if self
+            .selected_id
+            .as_ref()
+            .is_some_and(|selected| ids.contains(selected))
+        {
+            self.selected_id = None;
+        }
+        if address_book_changed {
+            self.mark_address_book_dirty();
+        }
+        self.status_message = format!("Removed {} device(s)", ids.len());
+        self.status_is_error = false;
     }
 
     fn menu_bar(&mut self, root: &mut egui::Ui) {
@@ -2040,6 +2318,19 @@ impl LoadRunnerApp {
                             device.selected = false;
                         }
                     }
+                    if ui
+                        .add_enabled(selected_count > 0, egui::Button::new("Remove selected"))
+                        .on_hover_text("Remove the selected devices from the list")
+                        .clicked()
+                    {
+                        let ids: Vec<String> = self
+                            .devices
+                            .iter()
+                            .filter(|device| device.selected)
+                            .map(|device| device.id.clone())
+                            .collect();
+                        self.remove_devices(&ids);
+                    }
                 });
                 ui.small("Address-book devices can be selected for concurrent loads.");
                 ui.separator();
@@ -2238,6 +2529,7 @@ impl LoadRunnerApp {
         let has_host_key = self.devices[index].ssh_host_key_fingerprint.is_some();
         let mut add_to_address_book = false;
         let mut forget_host_key = false;
+        let mut remove = false;
         response.context_menu(|ui| {
             if ui.button("Connect SSH…").clicked() {
                 self.open_terminal(id);
@@ -2330,6 +2622,11 @@ impl LoadRunnerApp {
                 forget_host_key = true;
                 ui.close();
             }
+            ui.separator();
+            if ui.button("Remove from list").clicked() {
+                remove = true;
+                ui.close();
+            }
         });
         if response.clicked() || response.secondary_clicked() {
             self.selected_id = Some(id.to_owned());
@@ -2345,6 +2642,9 @@ impl LoadRunnerApp {
         }
         if forget_host_key {
             self.forget_host_key(id);
+        }
+        if remove {
+            self.remove_devices(&[id.to_owned()]);
         }
     }
 
@@ -2370,6 +2670,7 @@ impl LoadRunnerApp {
                 let mut open_log = false;
                 let mut address_changed = false;
                 let mut model_changed = false;
+                let mut vault_error = None;
                 {
                     let device = &mut self.devices[index];
                     ui.label(RichText::new(device.display_name()).strong().size(20.0));
@@ -2434,14 +2735,50 @@ impl LoadRunnerApp {
                                 .text_edit_singleline(&mut device.credentials.username)
                                 .changed();
                         });
-                        ui.horizontal(|ui| {
-                            ui.label("Password");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut device.credentials.password)
-                                    .password(true),
-                            );
+                        let key = password_key(device);
+                        let saved = self.vault.contains_device(&key);
+                        let password_field = ui
+                            .horizontal(|ui| {
+                                ui.label("Password");
+                                secret_field(
+                                    ui,
+                                    ("device_password", &device.id),
+                                    &mut device.credentials.password,
+                                    if saved { "Saved" } else { "" },
+                                )
+                            })
+                            .inner;
+                        let mut remember = saved;
+                        let can_remember = saved || !device.credentials.password.is_empty();
+                        let toggled = ui
+                            .add_enabled(
+                                can_remember,
+                                egui::Checkbox::new(&mut remember, "Remember password"),
+                            )
+                            .on_disabled_hover_text("Type the password to remember first")
+                            .changed();
+                        // A remembered password follows edits to the field, once
+                        // the edit is finished rather than at every keystroke.
+                        let edited = saved
+                            && password_field.lost_focus()
+                            && !device.credentials.password.is_empty()
+                            && self.vault.get_device(&key).as_deref()
+                                != Some(device.credentials.password.as_str());
+                        let written = if toggled && !remember {
+                            Some(self.vault.delete_device(&key))
+                        } else if (toggled && remember) || edited {
+                            Some(self.vault.set_device(&key, &device.credentials.password))
+                        } else {
+                            None
+                        };
+                        if let Some(Err(error)) = written {
+                            vault_error = Some(error);
+                        }
+                        ui.small(if saved || remember {
+                            format!("Password is saved in {}.", self.vault.store_name())
+                        } else {
+                            "Password is kept for this session only.".to_owned()
                         });
-                        ui.small("Password is not saved to disk.");
                         if let Some(fingerprint) = &device.ssh_host_key_fingerprint {
                             ui.separator();
                             ui.label("SSH host-key fingerprint");
@@ -2491,6 +2828,9 @@ impl LoadRunnerApp {
                 if address_changed {
                     self.mark_address_book_dirty();
                 }
+                if vault_error.is_some() {
+                    self.notice = vault_error;
+                }
                 if model_changed { self.vc4.remove(&id); }
 
                 if open_log {
@@ -2527,7 +2867,7 @@ impl LoadRunnerApp {
                 ui.add_space(8.0);
                 if crate::vc4::is_vc4(&self.devices[index].model) {
                     let trust = self.devices[index].https_certificate.clone();
-                    let token = self.devices[index].vc4_api_token.clone();
+                    let token = self.vc4_token(&self.devices[index]);
                     let panel = self.vc4.entry(id.clone()).or_insert_with(|| crate::vc4::Panel::new(trust).with_token(&token));
                     panel.show(ui, &id);
                     let save_token = panel.take_token_save();
@@ -2754,13 +3094,21 @@ impl LoadRunnerApp {
                         ui.text_edit_singleline(&mut self.address_draft.username);
                         ui.end_row();
                         ui.label("Password");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.address_draft.password)
-                                .password(true),
-                        );
+                        secret_field(ui, "add_device_password", &mut self.address_draft.password, "");
+                        ui.end_row();
+                        ui.label("");
+                        ui.checkbox(&mut self.address_draft.remember_password, "Remember password");
                         ui.end_row();
                     });
-                ui.small("The address and username are saved. The password is session-only.");
+                ui.small(if self.address_draft.remember_password {
+                    format!(
+                        "The address and username are saved in the address book, and the password in {}.",
+                        self.vault.store_name()
+                    )
+                } else {
+                    "The address and username are saved. The password is kept for this session only."
+                        .to_owned()
+                });
                 ui.separator();
                 ui.horizontal(|ui| {
                     if ui.button("Add device").clicked() {
@@ -2787,15 +3135,18 @@ impl LoadRunnerApp {
                         ui.text_edit_singleline(&mut self.preferences_draft.default_username);
                         ui.end_row();
                         ui.label("Password");
-                        ui.add(
-                            egui::TextEdit::singleline(
-                                &mut self.preferences_draft.default_password,
-                            )
-                            .password(true),
+                        secret_field(
+                            ui,
+                            "default_password",
+                            &mut self.preferences_draft.default_password,
+                            "",
                         );
                         ui.end_row();
                     });
-                ui.small("These credentials are saved in the local application settings.");
+                ui.small(format!(
+                    "The username is saved in the application settings, and the password in {}.",
+                    self.vault.store_name()
+                ));
                 ui.add_space(12.0);
                 ui.separator();
                 ui.horizontal(|ui| {
@@ -2932,9 +3283,7 @@ impl LoadRunnerApp {
                         ui.text_edit_singleline(&mut prompt.username);
                         ui.end_row();
                         ui.label("Password");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut prompt.password).password(true),
-                        );
+                        secret_field(ui, "prompt_password", &mut prompt.password, "");
                         ui.end_row();
                     });
                 ui.small(
@@ -3247,6 +3596,41 @@ fn outcome_indicator(ui: &mut egui::Ui, outcome: Outcome, message: &str) {
     if !message.is_empty() {
         response.on_hover_text(message);
     }
+}
+
+/// The label on the button that unmasks a [`secret_field`].
+const REVEAL_LABEL: &str = "👁";
+
+/// A masked box for a password or token, with a button beside it that shows
+/// what is typed. Whether it is shown is kept per `id_salt` for this run, and
+/// only in memory; give each device its own salt so that showing one
+/// device's password does not show the next one selected.
+///
+/// Answers the text box's response, so callers can still watch for edits.
+pub(crate) fn secret_field(
+    ui: &mut egui::Ui,
+    id_salt: impl std::hash::Hash + std::fmt::Debug,
+    text: &mut String,
+    hint: &str,
+) -> egui::Response {
+    let id = ui.make_persistent_id(("secret_field_shown", id_salt));
+    let mut shown = ui.data(|data| data.get_temp::<bool>(id).unwrap_or(false));
+    ui.horizontal(|ui| {
+        let field = ui.add(
+            egui::TextEdit::singleline(text)
+                .password(!shown)
+                .hint_text(hint),
+        );
+        if ui
+            .toggle_value(&mut shown, REVEAL_LABEL)
+            .on_hover_text(if shown { "Hide" } else { "Show" })
+            .changed()
+        {
+            ui.data_mut(|data| data.insert_temp(id, shown));
+        }
+        field
+    })
+    .inner
 }
 
 fn status_badge(ui: &mut egui::Ui, state: ConnectionState) {

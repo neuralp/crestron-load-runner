@@ -1,6 +1,6 @@
 [package]
 name = "crestron-load-runner"
-version = "2026.9.11"
+version = "26.9.11"
 edition = "2024"
 
 [dependencies]
@@ -8,6 +8,12 @@ directories = "6.0.0"
 flate2 = "1.1.10"
 eframe = { version = "0.36.1", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 if-addrs = "0.15.0"
+# Windows Credential Manager and the Linux Secret Service. zbus keeps Linux
+# free of a libdbus build dependency; it runs on async-io rather than tokio
+# because keyring's blocking calls deadlock on tokio when made from the UI
+# thread. A target with no backend listed here would silently get keyring's
+# in-memory mock, so each platform is named.
+keyring = { version = "3.6", default-features = false, features = ["windows-native", "async-secret-service", "async-io", "crypto-rust"] }
 rfd = "0.17.2"
 reqwest = { version = "0.12.28", default-features = false, features = ["blocking", "rustls-tls-manual-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
@@ -18,6 +24,11 @@ serde_json = "1.0.145"
 sha2 = "0.11.0"
 socket2 = "0.6.1"
 tokio = { version = "1", features = ["rt", "net", "io-util", "time", "fs", "sync", "macros"] }
+
+[target.'cfg(windows)'.dependencies]
+# Lists this application's Credential Manager entries, which keyring cannot.
+# The version keyring already uses, so there is one copy.
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Security_Credentials"] }
 
 [build-dependencies]
 flate2 = "1.1.10"

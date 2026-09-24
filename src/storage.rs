@@ -23,12 +23,14 @@ pub enum StartupBook {
 /// The address book is a file the user names and owns; this is everything else.
 /// `deny_unknown_fields` matches the rest of this module: an older build
 /// discards a newer build's preferences rather than half-reading them.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Preferences {
     #[serde(default)]
     pub default_username: String,
-    #[serde(default)]
+    /// Read so that a file written before the vault can be migrated into it,
+    /// and never written: [`Preferences::save_to`] leaves it out.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub default_password: String,
     #[serde(default)]
     pub startup: StartupBook,
@@ -36,6 +38,18 @@ pub struct Preferences {
     pub default_address_book: Option<PathBuf>,
     #[serde(default)]
     pub recent_address_books: Vec<PathBuf>,
+}
+
+impl std::fmt::Debug for Preferences {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Preferences")
+            .field("default_username", &self.default_username)
+            .field("default_password", &"[REDACTED]")
+            .field("startup", &self.startup)
+            .field("default_address_book", &self.default_address_book)
+            .field("recent_address_books", &self.recent_address_books)
+            .finish()
+    }
 }
 
 impl Preferences {
@@ -64,11 +78,18 @@ impl Preferences {
 
     /// Path-taking because the configuration directory is a process-global set
     /// once at startup, which leaves a test no way to redirect a save.
+    ///
+    /// The default password is left out whatever it holds. It belongs in the
+    /// vault, and a file is no place for it even when there is no vault.
     pub fn save_to(&self, path: &Path) -> io::Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let data = serde_json::to_vec_pretty(self).map_err(io::Error::other)?;
+        let written = Self {
+            default_password: String::new(),
+            ..self.clone()
+        };
+        let data = serde_json::to_vec_pretty(&written).map_err(io::Error::other)?;
         let temporary = path.with_extension("json.tmp");
         fs::write(&temporary, data)?;
         fs::rename(temporary, path)
@@ -173,7 +194,8 @@ pub fn save_address_book(path: &Path, entries: &[AddressEntry]) -> io::Result<()
     };
     let data = serde_json::to_vec_pretty(&document).map_err(io::Error::other)?;
     let temporary = path.with_extension("json.tmp");
-    // Books can contain API tokens. Create a private temporary file rather
+    // Secrets are kept in the vault, but a book still says what is on the
+    // network and how it is trusted. Create a private temporary file rather
     // than following or reusing an existing temporary file/symlink.
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -423,11 +445,30 @@ fn project_dirs() -> Option<ProjectDirs> {
     ProjectDirs::from("com", "WorldDomination", "CrestronLoadRunner")
 }
 
+/// Whether `--config-dir` named the profile, rather than the platform.
+pub fn config_dir_overridden() -> bool {
+    CONFIG_DIR_OVERRIDE.get().is_some()
+}
+
 pub fn config_dir() -> Option<PathBuf> {
     if let Some(dir) = CONFIG_DIR_OVERRIDE.get() {
         return Some(dir.clone());
     }
     project_dirs().map(|dirs| dirs.config_dir().to_path_buf())
+}
+
+/// The name secrets are kept under in the platform vault. A `--config-dir`
+/// profile gets its own, so a throwaway profile neither reads nor overwrites
+/// the real one's passwords.
+pub fn vault_service() -> String {
+    const SERVICE: &str = "CrestronLoadRunner";
+    match CONFIG_DIR_OVERRIDE.get() {
+        Some(dir) => {
+            let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.clone());
+            format!("{SERVICE} ({})", dir.display())
+        }
+        None => SERVICE.to_owned(),
+    }
 }
 
 pub fn preferences_path() -> Option<PathBuf> {
@@ -617,7 +658,18 @@ mod tests {
 
         preferences.save_to(&path).unwrap();
 
-        assert_eq!(Preferences::load_from(&path).unwrap(), preferences);
+        assert_eq!(
+            Preferences::load_from(&path).unwrap(),
+            Preferences {
+                default_password: String::new(),
+                ..preferences.clone()
+            },
+            "everything but the password comes back"
+        );
+        let written = fs::read_to_string(&path).unwrap();
+        assert!(!written.contains("secret"), "{written}");
+        assert!(!written.contains("default_password"), "{written}");
+        assert!(!format!("{preferences:?}").contains("secret"));
         // The address book is a file of its own now.
         let saved: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();

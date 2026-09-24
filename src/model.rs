@@ -148,7 +148,8 @@ impl Device {
             username: self.credentials.username.clone(),
             ssh_host_key_fingerprint: self.ssh_host_key_fingerprint.clone(),
             https_certificate: self.https_certificate.clone(),
-            vc4_api_token: self.vc4_api_token.clone(),
+            // The token is kept in the vault; a book only ever brings one in.
+            vc4_api_token: Vc4ApiToken::default(),
             kind: self.kind,
             model: self.model.clone(),
             firmware: self.firmware.clone(),
@@ -188,7 +189,9 @@ pub struct HttpsCertificateTrust {
     pub fingerprint: String,
 }
 
-/// Portable address books intentionally serialize this secret; debug output must not.
+/// Kept in the vault. Books written by earlier builds carry it, so it is still
+/// read from them to be moved there, but a book is never written with one.
+/// Debug output must not show it either.
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Vc4ApiToken(String);

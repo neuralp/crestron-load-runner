@@ -23,6 +23,8 @@ mod scripts;
 mod ssh;
 mod storage;
 mod terminal;
+mod uninstall;
+mod vault;
 mod vc4;
 
 #[cfg(test)]
@@ -42,6 +44,12 @@ fn main() -> eframe::Result {
             {
                 report(&format!("{error}\n\n{}", cli::USAGE));
                 std::process::exit(2);
+            }
+            // The uninstaller waits on this, and a window that cannot open
+            // must not stop the program being removed, so failure is ignored.
+            if options.remove_data {
+                let _ = uninstall::run(window_icon());
+                return Ok(());
             }
         }
         Err(error) => {
