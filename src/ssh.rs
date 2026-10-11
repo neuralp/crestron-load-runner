@@ -22,7 +22,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::{
     device_log::Direction,
-    model::{Credentials, DeviceDetails},
+    model::{Credentials, DeviceDetails, DeviceKind},
 };
 
 /// Long enough for a processor on a slow link, short enough that an
@@ -93,7 +93,7 @@ pub struct ConnectionSpec {
 
 #[derive(Debug)]
 pub enum WorkerCommand {
-    Refresh(ConnectionSpec),
+    Refresh(ConnectionSpec, DeviceKind),
     ReadIpids {
         connection: ConnectionSpec,
         program: u8,
@@ -424,7 +424,7 @@ async fn worker_loop(
 /// to open, so the operation says what it is instead, which is more use anyway.
 fn starting(command: &WorkerCommand) -> String {
     match command {
-        WorkerCommand::Refresh(_) => "Reading device information".to_owned(),
+        WorkerCommand::Refresh(_, _) => "Reading device information".to_owned(),
         WorkerCommand::ReadIpids { program, .. } => {
             format!("Reading IP table for program {program}")
         }
@@ -552,7 +552,7 @@ async fn dispatch(
     events: &Sender<WorkerEvent>,
 ) -> WorkerResult<()> {
     match command {
-        WorkerCommand::Refresh(connection) => refresh(&connection, device, events).await,
+        WorkerCommand::Refresh(connection, kind) => refresh_for_kind(&connection, kind, device, events).await,
         WorkerCommand::ReadIpids {
             connection,
             program,
@@ -1034,8 +1034,14 @@ fn same_connection(open_for: &ConnectionSpec, wanted: &ConnectionSpec) -> bool {
         && open_for.trusted_fingerprint == wanted.trusted_fingerprint
 }
 
-async fn refresh(
+#[cfg(test)]
+async fn refresh(spec: &ConnectionSpec, device: &SharedSession, events: &Sender<WorkerEvent>) -> WorkerResult<()> {
+    refresh_for_kind(spec, DeviceKind::Processor, device, events).await
+}
+
+async fn refresh_for_kind(
     spec: &ConnectionSpec,
+    kind: DeviceKind,
     device: &SharedSession,
     events: &Sender<WorkerEvent>,
 ) -> WorkerResult<()> {
@@ -1065,13 +1071,22 @@ async fn refresh(
             section_result(run_command(spec, &session, "ver -v", SSH_TIMEOUT, events).await)
         ),
         network: section_result(run_command(spec, &session, "ipconfig", SSH_TIMEOUT, events).await),
-        programs: section_result(
-            run_command(spec, &session, "progcomments", SSH_TIMEOUT, events).await,
-        ),
+        programs: if kind == DeviceKind::Touchpanel {
+            String::new()
+        } else {
+            section_result(run_command(spec, &session, "progcomments", SSH_TIMEOUT, events).await)
+        },
+        project_info: if kind == DeviceKind::Touchpanel {
+            section_result(run_command(spec, &session, "projectinfo", SSH_TIMEOUT, events).await)
+        } else {
+            String::new()
+        },
         ip_table: section_result(run_command(spec, &session, "ipt -t", SSH_TIMEOUT, events).await),
-        cresnet: optional_section(
-            run_command(spec, &session, "REPORTCRESNET", SSH_TIMEOUT, events).await,
-        ),
+        cresnet: if kind == DeviceKind::Touchpanel {
+            None
+        } else {
+            optional_section(run_command(spec, &session, "REPORTCRESNET", SSH_TIMEOUT, events).await)
+        },
     };
     events
         .send(WorkerEvent::Details {
@@ -1331,6 +1346,7 @@ async fn upload_staged(
     upload_files(
         spec,
         vec![transfer],
+        None,
         Apply::from(command),
         None,
         device,
@@ -1339,8 +1355,8 @@ async fn upload_staged(
     .await
 }
 
-/// A program is staged with its signature: the processor reads the signature
-/// from the same directory, under the program's name with a `.zig` extension.
+/// Load the program first, then leave its signature in the slot directory as
+/// `.zig`. `progload` must not run after the signature has been transferred.
 async fn upload_program(
     spec: &ConnectionSpec,
     local_path: &Path,
@@ -1352,27 +1368,30 @@ async fn upload_program(
     let file_name = safe_remote_file_name(local_path)
         .ok_or_else(|| message(spec, "The selected file has an unsafe or missing file name"))?;
     let directory = program_directory(slot);
-    let mut transfers = vec![Transfer::new(
+    let program = Transfer::new(
         local_path,
         format!("{directory}/{file_name}"),
         file_name.clone(),
-    )];
-    if let Some(signature) = signature {
+    );
+    let signature = if let Some(signature) = signature {
         let remote_name = signature_remote_name(&file_name).ok_or_else(|| {
             message(
                 spec,
                 "The program's signature has an unsafe or missing file name",
             )
         })?;
-        transfers.push(Transfer::new(
+        Some(Transfer::new(
             signature,
             format!("{directory}/{remote_name}"),
             remote_name,
-        ));
-    }
+        ))
+    } else {
+        None
+    };
     upload_files(
         spec,
-        transfers,
+        vec![program],
+        signature,
         Apply::Command(format!("progload -p:{slot}")),
         None,
         device,
@@ -1438,7 +1457,7 @@ async fn upload_firmware(
         })?;
     let version = crate::firmware_version::Version::from_package(&archive.package)
         .map_err(|error| message(spec, error))?;
-    upload_files(spec, vec![transfer], apply, Some(version), device, events).await
+    upload_files(spec, vec![transfer], None, apply, Some(version), device, events).await
 }
 
 /// What to do once the firmware is staged. Only the file name decides: a zip
@@ -1697,12 +1716,85 @@ async fn stage(
     Ok(Staged::Ready(sftp))
 }
 
-/// Stages every file over one SFTP session and then runs the load command once,
-/// so a multi-file load is a single conversation with the device and reports a
-/// single progress bar.
+type UploadSource = (Transfer, tokio::fs::File, u64);
+
+async fn open_upload_source(spec: &ConnectionSpec, transfer: Transfer) -> WorkerResult<UploadSource> {
+    let file = tokio::fs::File::open(&transfer.local)
+        .await
+        .map_err(|error| {
+            message(
+                spec,
+                format!("Could not open {}: {error}", transfer.local.display()),
+            )
+        })?;
+    let length = file
+        .metadata()
+        .await
+        .map_err(|error| message(spec, error.to_string()))?
+        .len();
+    Ok((transfer, file, length))
+}
+
+async fn send_upload_source(
+    spec: &ConnectionSpec,
+    sftp: &SftpSession,
+    (transfer, mut local, length): UploadSource,
+    buffer: &mut [u8],
+    sent: &mut u64,
+    total: u64,
+    events: &Sender<WorkerEvent>,
+) -> WorkerResult<()> {
+    log(
+        events,
+        &spec.id,
+        Direction::Note,
+        &format!("SFTP create {} ({length} bytes)", transfer.remote),
+    );
+    let mut remote = sftp.create(&transfer.remote).await.map_err(|error| {
+        message(
+            spec,
+            format!("Could not create remote file {}: {error}", transfer.remote),
+        )
+    })?;
+    loop {
+        let read = local
+            .read(buffer)
+            .await
+            .map_err(|error| message(spec, format!("Could not read local file: {error}")))?;
+        if read == 0 {
+            break;
+        }
+        remote
+            .write_all(&buffer[..read])
+            .await
+            .map_err(|error| message(spec, format!("SFTP upload failed: {error}")))?;
+        *sent += read as u64;
+        let _ = events.send(WorkerEvent::Progress {
+            id: spec.id.clone(),
+            sent: *sent,
+            total,
+        });
+    }
+    remote
+        .close()
+        .await
+        .map_err(|error| message(spec, format!("Could not close remote file: {error}")))?;
+    log(
+        events,
+        &spec.id,
+        Direction::Note,
+        &format!("Uploaded {} to {}", transfer.display, transfer.remote),
+    );
+    Ok(())
+}
+
+/// Stage program/files before the load command; a program signature, if any,
+/// is sent on a new SFTP channel only after `progload` finishes. Keep one
+/// progress total and report completion only after the final transfer.
 async fn upload_files(
     spec: &ConnectionSpec,
     transfers: Vec<Transfer>,
+    after_apply: Option<Transfer>,
     apply: Apply,
     firmware_version: Option<crate::firmware_version::Version>,
     device: &SharedSession,
@@ -1712,24 +1804,20 @@ async fn upload_files(
     let mut sources = Vec::with_capacity(transfers.len());
     let mut total = 0_u64;
     for transfer in transfers {
-        let file = tokio::fs::File::open(&transfer.local)
-            .await
-            .map_err(|error| {
-                message(
-                    spec,
-                    format!("Could not open {}: {error}", transfer.local.display()),
-                )
-            })?;
-        let length = file
-            .metadata()
-            .await
-            .map_err(|error| message(spec, error.to_string()))?
-            .len();
+        let (transfer, file, length) = open_upload_source(spec, transfer).await?;
         total += length;
         sources.push((transfer, file, length));
     }
+    let after_apply = if let Some(transfer) = after_apply {
+        let source = open_upload_source(spec, transfer).await?;
+        total += source.2;
+        Some(source)
+    } else {
+        None
+    };
     let display_name = sources
         .iter()
+        .chain(after_apply.iter())
         .map(|(transfer, _, _)| transfer.display.as_str())
         .collect::<Vec<_>>()
         .join(" + ");
@@ -1764,48 +1852,8 @@ async fn upload_files(
 
     let mut buffer = vec![0_u8; CHUNK];
     let mut sent = 0_u64;
-    for (transfer, mut local, length) in sources {
-        log(
-            events,
-            &spec.id,
-            Direction::Note,
-            &format!("SFTP create {} ({length} bytes)", transfer.remote),
-        );
-        let mut remote = sftp.create(&transfer.remote).await.map_err(|error| {
-            message(
-                spec,
-                format!("Could not create remote file {}: {error}", transfer.remote),
-            )
-        })?;
-        loop {
-            let read = local
-                .read(&mut buffer)
-                .await
-                .map_err(|error| message(spec, format!("Could not read local file: {error}")))?;
-            if read == 0 {
-                break;
-            }
-            remote
-                .write_all(&buffer[..read])
-                .await
-                .map_err(|error| message(spec, format!("SFTP upload failed: {error}")))?;
-            sent += read as u64;
-            let _ = events.send(WorkerEvent::Progress {
-                id: spec.id.clone(),
-                sent,
-                total,
-            });
-        }
-        remote
-            .close()
-            .await
-            .map_err(|error| message(spec, format!("Could not close remote file: {error}")))?;
-        log(
-            events,
-            &spec.id,
-            Direction::Note,
-            &format!("Uploaded {} to {}", transfer.display, transfer.remote),
-        );
+    for source in sources {
+        send_upload_source(spec, &sftp, source, &mut buffer, &mut sent, total, events).await?;
     }
     let _ = sftp.close().await;
 
@@ -1815,6 +1863,22 @@ async fn upload_files(
             let output = run_command(spec, &session, &command, LOAD_TIMEOUT, events)
                 .await
                 .map_err(|error| message(spec, format!("Load command failed: {error}")))?;
+            if let Some(source) = after_apply {
+                // The console may close an idle SSH connection after progload.
+                // A failed SFTP setup is safe to retry: no signature bytes were sent.
+                let mut staged = stage(spec, &session, None, events).await;
+                if staged.is_err() {
+                    device.forget().await;
+                    (session, _) = device.acquire(spec, Announce::OnTheCard, events).await?;
+                    staged = stage(spec, &session, None, events).await;
+                }
+                let Staged::Ready(sftp) = staged? else {
+                    unreachable!("a signature upload has no firmware version preflight")
+                };
+                send_upload_source(spec, &sftp, source, &mut buffer, &mut sent, total, events)
+                    .await?;
+                let _ = sftp.close().await;
+            }
             if output.trim().is_empty() {
                 format!("Uploaded {display_name}; command completed")
             } else {
@@ -1911,6 +1975,10 @@ fn base64_without_dependency(bytes: &[u8]) -> String {
 #[cfg(test)]
 #[path = "firmware_preflight_tests.rs"]
 mod firmware_preflight_tests;
+
+#[cfg(test)]
+#[path = "program_upload_tests.rs"]
+mod program_upload_tests;
 
 #[cfg(test)]
 #[path = "resource_live_tests.rs"]
@@ -2136,6 +2204,31 @@ mod tests {
                 "the script ran three times and the refresh asks for the hostname once"
             );
             device_server.server.abort();
+        });
+    }
+
+    #[test]
+    fn touchpanel_refresh_requests_projectinfo_only_for_touchpanels() {
+        runtime().block_on(async {
+            let server = Loopback::start(31, false).await;
+            let spec = server.spec();
+            let (events, receiver) = mpsc::channel();
+            let device = SharedSession::default();
+            refresh_for_kind(&spec, DeviceKind::Touchpanel, &device, &events).await.unwrap();
+            let details = receiver.try_iter().find_map(|event| {
+                if let WorkerEvent::Details { details, .. } = event { Some(details) } else { None }
+            }).expect("touchpanel details received");
+            assert_eq!(details.project_info, "output for projectinfo");
+            assert_eq!(server.received().iter().filter(|command| *command == "projectinfo").count(), 1);
+            assert!(!server.received().iter().any(|command| matches!(command.as_str(), "progcomments" | "REPORTCRESNET")));
+
+            refresh_for_kind(&spec, DeviceKind::Processor, &device, &events).await.unwrap();
+            let details = receiver.try_iter().find_map(|event| {
+                if let WorkerEvent::Details { details, .. } = event { Some(details) } else { None }
+            }).expect("processor details received");
+            assert!(details.project_info.is_empty());
+            assert_eq!(server.received().iter().filter(|command| *command == "projectinfo").count(), 1);
+            server.server.abort();
         });
     }
 
@@ -2595,8 +2688,8 @@ mod tests {
             credentials: Credentials::default(),
             trusted_fingerprint: None,
         };
-        pool.send(id, WorkerCommand::Refresh(spec.clone())).unwrap();
-        pool.send(id, WorkerCommand::Refresh(spec)).unwrap();
+        pool.send(id, WorkerCommand::Refresh(spec.clone(), DeviceKind::Processor)).unwrap();
+        pool.send(id, WorkerCommand::Refresh(spec, DeviceKind::Processor)).unwrap();
         assert!(pool.is_busy(id));
         assert!(pool.retire(id).is_err());
         assert!(pool.retire_all().is_err());

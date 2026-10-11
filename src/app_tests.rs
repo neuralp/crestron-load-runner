@@ -555,6 +555,99 @@ fn a_modal_backdrop_covers_the_window_and_every_other_window_under_it() {
 }
 
 #[test]
+fn device_log_uses_a_native_window_and_keeps_entries_when_closed() {
+    use std::{cell::RefCell, rc::Rc};
+
+    let mut app = app();
+    app.log_view_open = true;
+    app.selected_id = Some("192.0.2.1:22".into());
+    for (id, text) in [
+        ("192.0.2.1:22", "Selected device response"),
+        ("192.0.2.2:22", "Other device response"),
+    ] {
+        app.device_log
+            .push(id.into(), crate::device_log::Direction::Received, text);
+    }
+    let ctx = egui::Context::default();
+    ctx.set_embed_viewports(false);
+    let labels = Rc::new(RefCell::new(Vec::new()));
+    let observed = labels.clone();
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let pending_events = events.clone();
+    egui::Context::set_immediate_viewport_renderer(move |ctx, mut viewport| {
+        assert_eq!(viewport.builder.title.as_deref(), Some("Device log"));
+        assert_ne!(viewport.ids.this, egui::ViewportId::ROOT);
+        assert_eq!(viewport.ids.parent, egui::ViewportId::ROOT);
+        assert_eq!(viewport.builder.inner_size, Some(egui::vec2(820.0, 460.0)));
+        let mut input = egui::RawInput {
+            viewport_id: viewport.ids.this,
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                viewport.builder.inner_size.unwrap(),
+            )),
+            ..Default::default()
+        };
+        let info = input.viewports.entry(viewport.ids.this).or_default();
+        info.parent = Some(viewport.ids.parent);
+        info.events = pending_events.take();
+        let output = ctx.run_ui(input, |ui| (viewport.viewport_ui_cb)(ui));
+        *observed.borrow_mut() = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.text().to_owned()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        output.drop_without_applying_deltas();
+    });
+    let draw = |app: &mut LoadRunnerApp| {
+        ctx.run_ui(input(), |_| app.log_window(&ctx))
+            .drop_without_applying_deltas();
+    };
+    draw(&mut app);
+    draw(&mut app);
+    for expected in ["Copy all", "Clear", "Selected device response"] {
+        assert!(labels.borrow().iter().any(|text| text == expected));
+    }
+    assert!(
+        !labels
+            .borrow()
+            .iter()
+            .any(|text| text == "Other device response")
+    );
+    assert!(app.log_view_open);
+
+    events.borrow_mut().push(egui::ViewportEvent::Close);
+    draw(&mut app);
+    assert!(!app.log_view_open);
+    assert!(!app.close_approved);
+    assert!(app.pending_action.is_none());
+    assert_eq!(app.device_log.len(), 2);
+    labels.borrow_mut().clear();
+    draw(&mut app);
+    assert!(labels.borrow().is_empty(), "Closed log must not render");
+
+    app.log_view_open = true;
+    app.log_only_selected = false;
+    draw(&mut app);
+    assert!(app.log_view_open);
+    assert!(
+        labels
+            .borrow()
+            .iter()
+            .any(|text| text == "Selected device response")
+    );
+    assert!(
+        labels
+            .borrow()
+            .iter()
+            .any(|text| text == "Other device response")
+    );
+    egui::Context::set_immediate_viewport_renderer(|_, _| {});
+}
+
+#[test]
 fn the_editors_keep_their_windows_while_a_dialog_owns_the_main_one() {
     let mut app = app();
     app.script_editor.open = true;
@@ -635,6 +728,7 @@ fn program_and_cresnet_reports_are_visible_only_for_processors() {
     });
     device.details = Some(crate::model::DeviceDetails {
         programs: "Program File: processor-only.smw".into(),
+        project_info: "[BEGIN_INFO]\n[TPS]\nVTZ=touchpanel-only.vtz\nDate=June 16, 2026 13:46:13\n[END_INFO]".into(),
         cresnet: Some("0A: STATUSSIGN [v1.3443.00016, #01415779]".into()),
         ..Default::default()
     });
@@ -662,6 +756,10 @@ fn program_and_cresnet_reports_are_visible_only_for_processors() {
         let processor = kind == DeviceKind::Processor;
         assert_eq!(has_text("Running programs"), processor);
         assert_eq!(has_text("processor-only.smw"), processor);
+        let touchpanel = kind == DeviceKind::Touchpanel;
+        assert_eq!(has_text("Touchpanel project"), touchpanel);
+        assert_eq!(has_text("touchpanel-only.vtz"), touchpanel);
+        assert_eq!(has_text("June 16, 2026 13:46:13"), touchpanel);
         // The Cresnet bus is a processor's, and is reported as a table.
         assert_eq!(has_text("Cresnet devices"), processor);
         for cell in ["ID", "Model", "Firmware", "Serial", "0A", "#01415779"] {
@@ -670,6 +768,26 @@ fn program_and_cresnet_reports_are_visible_only_for_processors() {
         assert!(has_text("Identity"));
         assert!(has_text("Network"));
         assert!(has_text("IP table"));
+        let heading_y = |label| {
+            output.shapes.iter().find_map(|shape| {
+                if let egui::Shape::Text(text) = &shape.shape
+                    && text.galley.text() == label
+                {
+                    Some(text.pos.y)
+                } else {
+                    None
+                }
+            }).unwrap_or_else(|| panic!("{label} heading rendered"))
+        };
+        if processor {
+            assert!(heading_y("Running programs") < heading_y("IP table"));
+            assert!(heading_y("IP table") < heading_y("Cresnet devices"));
+            assert!(heading_y("Cresnet devices") < heading_y("Identity"));
+        } else if touchpanel {
+            assert!(heading_y("Touchpanel project") < heading_y("IP table"));
+        }
+        assert!(heading_y("IP table") < heading_y("Identity"));
+        assert!(heading_y("Identity") < heading_y("Network"));
         output.drop_without_applying_deltas();
     }
 }
@@ -794,6 +912,76 @@ fn program_info_parses_requested_fields_without_truncating_values() {
     );
     assert_eq!(parse_program_info("No program loaded"), [None; 4]);
     assert_eq!(parse_program_info(""), [None; 4]);
+}
+
+const PROJECTINFO: &str = concat!(
+    "TSW-1060 Control Console\r\n\r\nTSW-1060>\r\n",
+    "[BEGIN_INFO]\r\n[TPS]\r\n",
+    "VTZ=tsw.vtz\r\n",
+    "Date=June 16, 2026 13:46:13\r\n",
+    "Panel=TS-770\r\nVideo=false\r\nRGB=false\r\nPNG=false\r\n",
+    "Rackname=TS-770\r\nMinCore3UILevel=2.0\r\n",
+    "ProjectPlatform=Smart Graphics\r\nOrientation=Landscape\r\n",
+    "VTpro-e=6202\r\nDatabase=21660000\r\n[END_INFO]\r\nTSW-1060>",
+);
+
+const TOUCHPANEL_CR_RESPONSE: &str = concat!(
+    "[BEGIN_INFO]\r[TPS]\r",
+    "VTZ=tsw.vtz\rDate=June 16, 2026 13:46:13\r",
+    "Panel=TS-770\rVideo=false\rRGB=false\rPNG=false\r",
+    "Rackname=TS-770\rMinCore3UILevel=2.0\r",
+    "ProjectPlatform=Smart Graphics\rOrientation=Landscape\r",
+    "VTpro-e=6202\rDatabase=21660000\r[END_INFO]",
+);
+
+#[test]
+fn project_info_reads_only_tps_vtz_and_date() {
+    assert_eq!(
+        parse_project_info(PROJECTINFO),
+        [Some("tsw.vtz"), Some("June 16, 2026 13:46:13")]
+    );
+    assert_eq!(
+        parse_project_info(TOUCHPANEL_CR_RESPONSE),
+        [Some("tsw.vtz"), Some("June 16, 2026 13:46:13")]
+    );
+    assert_eq!(
+        parse_project_info("[BEGIN_INFO]\n[TPS]\n VTZ = room=one.vtz \nDate=\n[END_INFO]"),
+        [Some("room=one.vtz"), Some("")]
+    );
+    assert_eq!(
+        parse_project_info("[TPS]\nVTZ=first.vtz\n[OTHER]\nVTZ=wrong.vtz\nDate=wrong\n[END_INFO]\n[TPS]\nDate=also wrong"),
+        [Some("first.vtz"), None]
+    );
+    assert_eq!(parse_project_info("projectinfo not supported"), [None, None]);
+}
+
+#[test]
+fn project_info_shows_summary_with_other_fields_in_raw_response() {
+    let ctx = egui::Context::default();
+    let render = |ui: &mut egui::Ui| project_info_section(ui, "test", TOUCHPANEL_CR_RESPONSE);
+    for _ in 0..2 {
+        ctx.run_ui(input(), render).drop_without_applying_deltas();
+    }
+    let output = ctx.run_ui(input(), render);
+    let labels: Vec<_> = output
+        .shapes
+        .iter()
+        .filter_map(|shape| {
+            if let egui::Shape::Text(text) = &shape.shape {
+                Some(text.galley.text())
+            } else {
+                None
+            }
+        })
+        .collect();
+    for label in [
+        "Touchpanel project", "VTZ:", "tsw.vtz", "Date:",
+        "June 16, 2026 13:46:13", "Raw response",
+    ] {
+        assert!(labels.contains(&label), "missing {label}");
+    }
+    assert!(!labels.contains(&"ProjectPlatform"));
+    output.drop_without_applying_deltas();
 }
 
 #[test]
@@ -1486,6 +1674,21 @@ fn program_signatures_are_found_beside_the_program() {
     let other = dir.path().join("other.lpz");
     std::fs::write(&other, b"program").unwrap();
     assert!(signature_beside(&other).is_none());
+
+    // Windows-produced .SIG files must still be found on Linux/macOS.
+    let uppercase = dir.path().join("OTHER.SIG");
+    std::fs::write(&uppercase, b"signature").unwrap();
+    assert_eq!(signature_beside(&other), Some(uppercase.clone()));
+
+    // Prefer the exact spelling, and never choose arbitrarily between two
+    // different case-insensitive matches on a case-sensitive filesystem.
+    let exact = dir.path().join("other.sig");
+    std::fs::write(&exact, b"signature").unwrap();
+    assert_eq!(signature_beside(&other), Some(exact.clone()));
+    std::fs::remove_file(&exact).unwrap();
+    let second = dir.path().join("Other.SIG");
+    std::fs::write(&second, b"signature").unwrap();
+    assert!(signature_beside(&other).is_none());
 }
 
 #[test]
@@ -1518,6 +1721,19 @@ fn a_missing_program_signature_is_recorded_and_does_not_block_the_load() {
 
     // With the signature present, nothing is noted.
     std::fs::write(dir.path().join("W classrooms.sig"), b"signature").unwrap();
+    app.device_log.clear();
+    app.load_assigned_programs();
+    assert!(app.notice.is_none());
+    assert!(
+        !app.device_log
+            .entries()
+            .any(|entry| entry.text.contains("No signature file"))
+    );
+
+    // A Windows-generated uppercase extension is still queued on a
+    // case-sensitive host instead of silently loading the program alone.
+    std::fs::remove_file(dir.path().join("W classrooms.sig")).unwrap();
+    std::fs::write(dir.path().join("W classrooms.SIG"), b"signature").unwrap();
     app.device_log.clear();
     app.load_assigned_programs();
     assert!(app.notice.is_none());
@@ -1836,7 +2052,7 @@ fn session_credentials_are_never_written_to_disk_or_printed() {
     for printed in [
         format!("{:?}", app.devices[0]),
         format!("{spec:?}"),
-        format!("{:?}", WorkerCommand::Refresh(spec.clone())),
+        format!("{:?}", WorkerCommand::Refresh(spec.clone(), DeviceKind::Processor)),
     ] {
         assert!(!printed.contains("session-password"), "{printed}");
         assert!(printed.contains("[REDACTED]"), "{printed}");

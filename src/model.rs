@@ -60,6 +60,7 @@ pub struct DeviceDetails {
     pub identity: String,
     pub network: String,
     pub programs: String,
+    pub project_info: String,
     pub ip_table: String,
     pub cresnet: Option<String>,
 }

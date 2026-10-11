@@ -970,9 +970,12 @@ impl LoadRunnerApp {
         let Some(connection) = self.connection_spec(id) else {
             return;
         };
+        let Some(kind) = self.devices.iter().find(|device| device.id == id).map(|device| device.kind) else {
+            return;
+        };
         if let Err(error) = self
             .worker_pool
-            .send(id, WorkerCommand::Refresh(connection))
+            .send(id, WorkerCommand::Refresh(connection, kind))
         {
             self.notice = Some(error);
         }
@@ -2866,17 +2869,20 @@ impl LoadRunnerApp {
                 let details = self.devices[index].details.clone();
                 if let Some(details) = details {
                     crate::resources::show(ui, &details.disk_free, &details.ram_free);
-                    detail_section(ui, "Identity", &details.identity, true);
-                    detail_section(ui, "Network", &details.network, true);
-                    if self.devices[index].kind == DeviceKind::Processor {
+                    let processor = self.devices[index].kind == DeviceKind::Processor;
+                    if processor {
                         program_info_section(ui, &id, &details.programs);
+                    } else if self.devices[index].kind == DeviceKind::Touchpanel {
+                        project_info_section(ui, &id, &details.project_info);
                     }
                     crate::ip_table::show(ui, &id, &details.ip_table);
                     if let Some(cresnet) = details.cresnet
-                        && self.devices[index].kind == DeviceKind::Processor
+                        && processor
                     {
                         crate::cresnet::show(ui, &id, &cresnet);
                     }
+                    detail_section(ui, "Identity", &details.identity, true);
+                    detail_section(ui, "Network", &details.network, true);
                 } else {
                     ui.label("Connect to retrieve network, program, IP table, and Cresnet information.");
                 }
@@ -2889,11 +2895,8 @@ impl LoadRunnerApp {
             return;
         }
         let selected = self.selected_id.clone();
-        let mut open = true;
-        egui::Window::new("Device log")
-            .open(&mut open)
-            .default_size([820.0, 460.0])
-            .show(ctx, |ui| {
+        let open = crate::popout::window(ctx, "Device log", [820.0, 460.0], |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.add_enabled(
                         selected.is_some(),
@@ -2967,6 +2970,7 @@ impl LoadRunnerApp {
                         }
                     });
             });
+        });
         self.log_view_open = open;
     }
 
@@ -3369,11 +3373,32 @@ fn file_has_extension(path: &Path, expected: &str) -> bool {
 }
 
 /// A program is loaded with its signature: the `.sig` file sitting beside it
-/// under the same name. Absent is not an error — an unsigned program still
-/// loads — so a missing signature is recorded in the device log instead.
+/// under the same name. Windows-created signature extensions may be uppercase
+/// even when the program is loaded from a case-sensitive filesystem. Absent is
+/// not an error — an unsigned program still loads — so a missing signature is
+/// recorded in the device log instead.
 fn signature_beside(program: &Path) -> Option<PathBuf> {
     let signature = program.with_extension("sig");
-    signature.is_file().then_some(signature)
+    if signature.is_file() {
+        return Some(signature);
+    }
+    let stem = program.file_stem()?.to_str()?;
+    let mut matches = program
+        .parent()?
+        .read_dir()
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && file_has_extension(path, "sig")
+                && path
+                    .file_stem()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.eq_ignore_ascii_case(stem))
+        });
+    let match_path = matches.next()?;
+    matches.next().is_none().then_some(match_path)
 }
 
 fn file_display_name(path: &Path) -> String {
@@ -3698,6 +3723,71 @@ fn program_info_section(ui: &mut egui::Ui, device_id: &str, contents: &str) {
                         });
                 } else {
                     ui.label("No program information fields were reported.");
+                }
+                detail_section(ui, "Raw response", contents, false);
+            });
+    });
+}
+
+/// `projectinfo` reports a bracketed TPS block, followed by other metadata.
+fn parse_project_info(contents: &str) -> [Option<&str>; 2] {
+    let mut values = [None; 2];
+    let mut in_tps = false;
+    // Crestron consoles can delimit lines with bare CR rather than LF/CRLF.
+    for line in contents.split(['\r', '\n']).map(str::trim) {
+        match line {
+            "[TPS]" => {
+                in_tps = true;
+                continue;
+            }
+            "[END_INFO]" => break,
+            _ if line.starts_with('[') && line.ends_with(']') => {
+                in_tps = false;
+                continue;
+            }
+            _ => {}
+        }
+        if in_tps && let Some((key, value)) = line.split_once('=') {
+            match key.trim() {
+                "VTZ" => values[0] = Some(value.trim()),
+                "Date" => values[1] = Some(value.trim()),
+                _ => {}
+            }
+        }
+    }
+    values
+}
+
+fn project_info_section(ui: &mut egui::Ui, device_id: &str, contents: &str) {
+    ui.push_id(("project_info", device_id), |ui| {
+        egui::CollapsingHeader::new("Touchpanel project")
+            .default_open(true)
+            .show(ui, |ui| {
+                let values = parse_project_info(contents);
+                if values.iter().any(Option::is_some) {
+                    egui::Frame::new()
+                        .inner_margin(4)
+                        .fill(ui.visuals().text_edit_bg_color())
+                        .stroke(egui::Stroke::new(1.0, egui::Color32::BLACK))
+                        .show(ui, |ui| {
+                            egui::Grid::new("summary").num_columns(2).show(ui, |ui| {
+                                for (field, value) in ["VTZ", "Date"].into_iter().zip(values) {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(format!("{field}:")).strong(),
+                                        )
+                                        .selectable(true),
+                                    );
+                                    ui.add(
+                                        egui::Label::new(value.unwrap_or("Not reported"))
+                                            .selectable(true),
+                                    );
+                                    ui.end_row();
+                                }
+                            });
+                        });
+                } else {
+                    ui.label("No project information fields were reported.");
                 }
                 detail_section(ui, "Raw response", contents, false);
             });

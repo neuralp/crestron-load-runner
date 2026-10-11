@@ -12,7 +12,7 @@ A native Rust/egui utility for discovering Crestron devices, keeping an address 
 - App-specific trust-on-first-use SSH host-key verification, with **Forget SSH host key** on a device's right-click menu to ask again
 - `--config-dir` for an isolated preferences and firmware profile
 - Persistent `.lpz` processor assignments for program slots 1–10
-- Program signatures uploaded automatically: a `.sig` file beside the assigned `.lpz` is sent to the same slot directory as `.zig`
+- Program signatures uploaded automatically: after `progload`, a `.sig` file beside the assigned `.lpz` is sent to the same slot directory as `.zig`
 - Persistent processor configuration-file assignments for slots 1–10
 - Persistent `.vtz` touchpanel project assignments
 - Network, program, IP table, and optional Cresnet detail views
@@ -174,7 +174,7 @@ The IP-table API can return HTTP 200 with `StatusInfo: INVALID ID`; the app repo
 The application uses Crestron console commands over SSH:
 
 - Details: `hostname`, `ver`, `ipconfig`, `progcomments`, `ipt -t`, `REPORTCRESNET`
-- Processor load: SFTP upload into `/program<NN>` for the target slot, with the program's `.sig` file uploaded alongside it as `.zig`, followed by `progload -p:<slot>`
+- Processor load: SFTP upload the `.lpz` into `/program<NN>`, run `progload -p:<slot>`, then SFTP upload its matching `.sig` as `.zig` into that slot directory
 - Configuration load: SFTP upload into `/user`; no console command is issued
 - Touchpanel load: SFTP upload into the panel's `/display` directory followed by `projectload`
 - Console: an interactive shell channel with a terminal requested, which is what **Connect SSH…** opens
@@ -186,7 +186,7 @@ The SFTP namespace is not the one the SSH console presents. A program the consol
 
 ## Device log
 
-Every console command sent to a device and every response it returns is recorded in memory for the session, along with app-side notes for connection attempts, SFTP transfers and failures. Open it with **Device log…** on the Device details panel. The window filters to the selected device by default, and offers **Copy all** and **Clear**.
+Every console command sent to a device and every response it returns is recorded in memory for the session, along with app-side notes for connection attempts, SFTP transfers and failures. Open it in its own window with **Device log…** on the Device details panel. The window filters to the selected device by default, and offers **Copy all** and **Clear**. Closing the window keeps the log in memory so it is still available when reopened.
 
 A device card shows only whether the last operation succeeded or failed; the text it produced goes to the log. Hovering the indicator shows the last message.
 
