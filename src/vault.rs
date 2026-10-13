@@ -69,7 +69,9 @@ fn normalized_mac(mac: &str) -> Option<String> {
         .map(|character| character.to_ascii_lowercase())
         .collect();
     (digits.len() == 12
-        && digits.chars().all(|character| character.is_ascii_hexdigit())
+        && digits
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
         && digits.chars().any(|character| character != '0'))
     .then_some(digits)
 }
@@ -169,7 +171,9 @@ pub fn saved_keys(service: &str) -> Result<Vec<String>, String> {
         return if error == ERROR_NOT_FOUND {
             Ok(Vec::new())
         } else {
-            Err(format!("Could not list Windows Credential Manager entries (error {error})"))
+            Err(format!(
+                "Could not list Windows Credential Manager entries (error {error})"
+            ))
         };
     }
     let mut keys = Vec::new();
@@ -181,7 +185,9 @@ pub fn saved_keys(service: &str) -> Result<Vec<String>, String> {
             continue;
         }
         let name = unsafe {
-            let length = (0..).take_while(|&i| *credential.TargetName.add(i) != 0).count();
+            let length = (0..)
+                .take_while(|&i| *credential.TargetName.add(i) != 0)
+                .count();
             String::from_utf16_lossy(std::slice::from_raw_parts(credential.TargetName, length))
         };
         if let Some(key) = name.strip_suffix(&suffix).filter(|key| !key.is_empty()) {

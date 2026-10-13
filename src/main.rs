@@ -7,6 +7,7 @@ mod archive;
 mod backdrop;
 mod cli;
 mod cresnet;
+mod debugger;
 mod device_log;
 mod discovery;
 mod firmware;

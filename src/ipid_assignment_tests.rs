@@ -422,7 +422,10 @@ fn go_and_configuration_actions_obey_busy_and_modal_guards() {
     };
     assert_eq!(click(&mut panel, "GO", false), None);
     assert_eq!(click(&mut panel, "Skip", false), None);
-    assert_eq!(click(&mut panel, "User label (192.0.2.21)  ·  discovered", false), None);
+    assert_eq!(
+        click(&mut panel, "User label (192.0.2.21)  ·  discovered", false),
+        None
+    );
     assert_eq!(
         panel.rows[0].selected.as_ref(),
         Some(&panel.candidates[1].id)

@@ -6,6 +6,11 @@ use std::{
 
 use eframe::egui::{self, Color32, RichText};
 
+mod debugger;
+
+#[cfg(test)]
+#[path = "app/debugger_tests.rs"]
+mod debugger_tests;
 mod ipid_assignment;
 
 #[cfg(test)]
@@ -150,6 +155,7 @@ enum CredentialGate {
     LoadConfigs(Option<String>),
     LoadTouchpanels(Option<String>),
     LoadFirmware,
+    StartDebug(String),
 }
 
 /// The session-credential prompt while it is up.
@@ -183,6 +189,7 @@ pub struct LoadRunnerApp {
     worker_pool: WorkerPool,
     worker_events: Receiver<WorkerEvent>,
     terminals: BTreeMap<String, crate::terminal::Terminal>,
+    debuggers: BTreeMap<String, crate::debugger::Panel>,
     vc4: HashMap<String, crate::vc4::Panel>,
     discovery_events: Receiver<DiscoveryEvent>,
     discovery_sender: std::sync::mpsc::Sender<DiscoveryEvent>,
@@ -198,6 +205,7 @@ pub struct LoadRunnerApp {
     current_address_book: Option<PathBuf>,
     address_book_dirty: bool,
     pending_action: Option<PendingAction>,
+    pending_debug_action: Option<PendingAction>,
     close_approved: bool,
     status_message: String,
     status_is_error: bool,
@@ -299,11 +307,15 @@ impl LoadRunnerApp {
         address_book: Vec<AddressEntry>,
         load_error: Option<String>,
     ) -> Self {
-        let vault = crate::vault::Vault::with_store(
-            Box::<crate::vault::MemoryStore>::default(),
-            true,
-        );
-        Self::with_vault(preferences, preferences_path, address_book, load_error, vault)
+        let vault =
+            crate::vault::Vault::with_store(Box::<crate::vault::MemoryStore>::default(), true);
+        Self::with_vault(
+            preferences,
+            preferences_path,
+            address_book,
+            load_error,
+            vault,
+        )
     }
 
     fn with_vault(
@@ -313,15 +325,10 @@ impl LoadRunnerApp {
         load_error: Option<String>,
         vault: crate::vault::Vault,
     ) -> Self {
-        let migration = Self::migrate_default_password(
-            &mut preferences,
-            preferences_path.as_deref(),
-            &vault,
-        );
+        let migration =
+            Self::migrate_default_password(&mut preferences, preferences_path.as_deref(), &vault);
         let status_is_error = load_error.is_some();
-        let status_message = load_error
-            .or(migration)
-            .unwrap_or_else(|| "Ready".into());
+        let status_message = load_error.or(migration).unwrap_or_else(|| "Ready".into());
         let devices = address_book.iter().map(Device::from_address).collect();
         let (worker_sender, worker_events) = mpsc::channel();
         let (discovery_sender, discovery_events) = mpsc::channel();
@@ -353,6 +360,7 @@ impl LoadRunnerApp {
             worker_pool: WorkerPool::new(worker_sender),
             worker_events,
             terminals: BTreeMap::new(),
+            debuggers: BTreeMap::new(),
             vc4: HashMap::new(),
             discovery_events,
             discovery_sender,
@@ -371,6 +379,7 @@ impl LoadRunnerApp {
             current_address_book: None,
             address_book_dirty: false,
             pending_action: None,
+            pending_debug_action: None,
             close_approved: false,
             status_message,
             status_is_error,
@@ -772,6 +781,7 @@ impl LoadRunnerApp {
                     self.load_assigned_touchpanels_for(target.as_deref());
                 }
                 CredentialGate::LoadFirmware => self.load_assigned_firmware(),
+                CredentialGate::StartDebug(id) => self.start_debugger(&id),
             }
         }
     }
@@ -781,6 +791,12 @@ impl LoadRunnerApp {
     /// is dismissed.
     fn cancel_credential_prompt(&mut self) {
         self.credential_prompt = None;
+        for panel in self.debuggers.values_mut() {
+            if panel.awaiting_session {
+                panel.awaiting_session = false;
+                panel.status = "Credentials cancelled".into();
+            }
+        }
         if let Some(panel) = &mut self.ipid_assignment
             && panel.awaiting_credentials
         {
@@ -820,6 +836,15 @@ impl LoadRunnerApp {
     }
 
     fn clear_devices(&mut self) {
+        if self
+            .debuggers
+            .values()
+            .any(|panel| panel.session_sent || panel.stopping)
+        {
+            self.status_message = "Stop the signal debugger before clearing devices".into();
+            self.status_is_error = true;
+            return;
+        }
         // Preserve the existing clear behavior for other operations, but keep
         // assignment snapshots/results until every IPID operation has replied.
         if self.ipid_busy() {
@@ -881,15 +906,15 @@ impl LoadRunnerApp {
         self.preferences.default_address_book = draft.default_address_book;
         // Only written when it changed, so that saving the other preferences
         // does not touch the vault.
-        let password_saved = if self.default_password().unwrap_or_default() == draft.default_password
-        {
-            Ok(())
-        } else if draft.default_password.is_empty() {
-            self.vault.delete(crate::vault::DEFAULT_PASSWORD)
-        } else {
-            self.vault
-                .set(crate::vault::DEFAULT_PASSWORD, &draft.default_password)
-        };
+        let password_saved =
+            if self.default_password().unwrap_or_default() == draft.default_password {
+                Ok(())
+            } else if draft.default_password.is_empty() {
+                self.vault.delete(crate::vault::DEFAULT_PASSWORD)
+            } else {
+                self.vault
+                    .set(crate::vault::DEFAULT_PASSWORD, &draft.default_password)
+            };
         match (self.store_preferences(), password_saved) {
             (Ok(()), Ok(())) => {
                 self.preferences_open = false;
@@ -970,7 +995,12 @@ impl LoadRunnerApp {
         let Some(connection) = self.connection_spec(id) else {
             return;
         };
-        let Some(kind) = self.devices.iter().find(|device| device.id == id).map(|device| device.kind) else {
+        let Some(kind) = self
+            .devices
+            .iter()
+            .find(|device| device.id == id)
+            .map(|device| device.kind)
+        else {
             return;
         };
         if let Err(error) = self
@@ -1666,6 +1696,17 @@ impl LoadRunnerApp {
     }
 
     fn execute_action(&mut self, action: PendingAction, ctx: &egui::Context) {
+        if self
+            .debuggers
+            .values()
+            .any(|panel| panel.session_sent || panel.stopping)
+        {
+            for panel in self.debuggers.values_mut() {
+                panel.stop();
+            }
+            self.pending_debug_action = Some(action);
+            return;
+        }
         if let Err(error) = self.worker_pool.retire_all() {
             self.status_message = error;
             self.status_is_error = true;
@@ -2005,6 +2046,15 @@ impl LoadRunnerApp {
         if ids.is_empty() {
             return;
         }
+        if ids.iter().any(|id| {
+            self.debuggers
+                .get(id)
+                .is_some_and(|panel| panel.session_sent || panel.stopping)
+        }) {
+            self.status_message = "Stop the signal debugger before removing this device".into();
+            self.status_is_error = true;
+            return;
+        }
         if self.ipid_busy() {
             self.status_message =
                 "Wait for device operations to finish before removing devices".into();
@@ -2023,9 +2073,10 @@ impl LoadRunnerApp {
                 return;
             }
         }
-        let address_book_changed = self.devices.iter().any(|device| {
-            device.source == DeviceSource::AddressBook && ids.contains(&device.id)
-        });
+        let address_book_changed = self
+            .devices
+            .iter()
+            .any(|device| device.source == DeviceSource::AddressBook && ids.contains(&device.id));
         self.devices.retain(|device| !ids.contains(&device.id));
         for id in &ids {
             self.vc4.remove(id);
@@ -2183,6 +2234,13 @@ impl LoadRunnerApp {
                     .clicked()
                 {
                     self.open_ipid_assignment(None);
+                }
+                if ui
+                    .add_enabled(can_assign, egui::Button::new("Debug Signals"))
+                    .on_disabled_hover_text("Select exactly one console processor target")
+                    .clicked()
+                {
+                    self.open_debugger(None);
                 }
                 ui.separator();
                 let selected = self.devices.iter().filter(|device| device.selected).count();
@@ -2535,6 +2593,14 @@ impl LoadRunnerApp {
                 .clicked()
             {
                 self.open_ipid_assignment(Some(id));
+                ui.close();
+            }
+            if ui
+                .add_enabled(can_assign, egui::Button::new("Debug Signals…"))
+                .on_disabled_hover_text("Requires a console processor; VC-4 uses REST")
+                .clicked()
+            {
+                self.open_debugger(Some(id));
                 ui.close();
             }
             ui.separator();
@@ -3001,6 +3067,7 @@ impl LoadRunnerApp {
         self.firmware_editor.show(ctx);
         self.script_editor.show(ctx);
         self.show_ipid_assignment(ctx);
+        self.show_debuggers(ctx);
         for terminal in self.terminals.values_mut() {
             terminal.show(ctx);
         }
@@ -3335,7 +3402,7 @@ impl LoadRunnerApp {
             self.request_action(PendingAction::Quit, ctx);
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         }
-        if self.discovering || self.worker_pool.has_pending() {
+        if self.discovering || self.worker_pool.has_pending() || !self.debuggers.is_empty() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
@@ -3354,6 +3421,7 @@ impl LoadRunnerApp {
         self.dialogs(&ctx);
         if self.discovering
             || self.worker_pool.has_pending()
+            || !self.debuggers.is_empty()
             || self.devices.iter().any(|device| {
                 matches!(
                     device.connection,

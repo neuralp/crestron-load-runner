@@ -15,7 +15,11 @@ struct ProgramServer {
 impl russh::server::Handler for ProgramServer {
     type Error = russh::Error;
 
-    async fn auth_password(&mut self, _: &str, _: &str) -> Result<russh::server::Auth, Self::Error> {
+    async fn auth_password(
+        &mut self,
+        _: &str,
+        _: &str,
+    ) -> Result<russh::server::Auth, Self::Error> {
         Ok(russh::server::Auth::Accept)
     }
 
@@ -45,7 +49,8 @@ impl russh::server::Handler for ProgramServer {
                 steps: self.steps.clone(),
                 fail_signature: self.fail_signature,
             },
-        ).await;
+        )
+        .await;
         Ok(())
     }
 
@@ -89,7 +94,10 @@ impl russh_sftp::server::Handler for SignatureServer {
         if self.fail_signature && filename.ends_with(".zig") {
             return Err(StatusCode::Failure);
         }
-        Ok(SftpHandle { id, handle: filename })
+        Ok(SftpHandle {
+            id,
+            handle: filename,
+        })
     }
 
     async fn write(
@@ -99,10 +107,10 @@ impl russh_sftp::server::Handler for SignatureServer {
         _: u64,
         data: Vec<u8>,
     ) -> Result<Status, Self::Error> {
-        self.steps.lock().unwrap().push(format!(
-            "write:{handle}:{}",
-            String::from_utf8_lossy(&data)
-        ));
+        self.steps
+            .lock()
+            .unwrap()
+            .push(format!("write:{handle}:{}", String::from_utf8_lossy(&data)));
         Ok(ok_status(id))
     }
 
@@ -171,7 +179,10 @@ fn program_upload_orders_signature_after_load_and_reports_failures() {
                 id: "test".into(),
                 host: "127.0.0.1".into(),
                 port,
-                credentials: Credentials { username: "admin".into(), password: "test".into() },
+                credentials: Credentials {
+                    username: "admin".into(),
+                    password: "test".into(),
+                },
                 trusted_fingerprint: Some(fingerprint),
             };
             let (events, receiver) = mpsc::channel();

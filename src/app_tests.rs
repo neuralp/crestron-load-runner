@@ -278,7 +278,11 @@ fn a_book_that_carries_a_token_hands_it_to_the_vault_and_saves_without_it() {
     let key = crate::vault::DeviceKey::vc4_token("", "vc4.example.test", 22);
     assert_eq!(app.vault.get_device(&key).as_deref(), Some("legacy-token"));
     assert!(app.address_book_dirty, "the file still holds the token");
-    assert!(app.status_message.contains("save the book"), "{}", app.status_message);
+    assert!(
+        app.status_message.contains("save the book"),
+        "{}",
+        app.status_message
+    );
     assert!(app.save_address_book());
     let written = std::fs::read_to_string(&path).unwrap();
     assert!(!written.contains("legacy-token"), "{written}");
@@ -302,7 +306,10 @@ fn a_token_the_vault_refuses_is_reported_and_kept_for_the_session() {
     app.save_vc4_token(&id);
 
     let notice = app.notice.as_deref().unwrap();
-    assert!(notice.contains("token change has not been saved"), "{notice}");
+    assert!(
+        notice.contains("token change has not been saved"),
+        "{notice}"
+    );
     assert!(!notice.contains(token.as_str()), "{notice}");
     assert_eq!(app.vc4_token(&app.devices[0]), token);
 }
@@ -333,7 +340,11 @@ fn vc4_save_token_promotes_discovered_device() {
     assert!(saved[0].vc4_api_token.is_empty());
     assert_eq!(
         app.vault
-            .get_device(&crate::vault::DeviceKey::vc4_token("", "vc4.example.test", 22))
+            .get_device(&crate::vault::DeviceKey::vc4_token(
+                "",
+                "vc4.example.test",
+                22
+            ))
             .as_deref(),
         Some(token.as_str())
     );
@@ -728,7 +739,9 @@ fn program_and_cresnet_reports_are_visible_only_for_processors() {
     });
     device.details = Some(crate::model::DeviceDetails {
         programs: "Program File: processor-only.smw".into(),
-        project_info: "[BEGIN_INFO]\n[TPS]\nVTZ=touchpanel-only.vtz\nDate=June 16, 2026 13:46:13\n[END_INFO]".into(),
+        project_info:
+            "[BEGIN_INFO]\n[TPS]\nVTZ=touchpanel-only.vtz\nDate=June 16, 2026 13:46:13\n[END_INFO]"
+                .into(),
         cresnet: Some("0A: STATUSSIGN [v1.3443.00016, #01415779]".into()),
         ..Default::default()
     });
@@ -769,15 +782,19 @@ fn program_and_cresnet_reports_are_visible_only_for_processors() {
         assert!(has_text("Network"));
         assert!(has_text("IP table"));
         let heading_y = |label| {
-            output.shapes.iter().find_map(|shape| {
-                if let egui::Shape::Text(text) = &shape.shape
-                    && text.galley.text() == label
-                {
-                    Some(text.pos.y)
-                } else {
-                    None
-                }
-            }).unwrap_or_else(|| panic!("{label} heading rendered"))
+            output
+                .shapes
+                .iter()
+                .find_map(|shape| {
+                    if let egui::Shape::Text(text) = &shape.shape
+                        && text.galley.text() == label
+                    {
+                        Some(text.pos.y)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| panic!("{label} heading rendered"))
         };
         if processor {
             assert!(heading_y("Running programs") < heading_y("IP table"));
@@ -949,10 +966,15 @@ fn project_info_reads_only_tps_vtz_and_date() {
         [Some("room=one.vtz"), Some("")]
     );
     assert_eq!(
-        parse_project_info("[TPS]\nVTZ=first.vtz\n[OTHER]\nVTZ=wrong.vtz\nDate=wrong\n[END_INFO]\n[TPS]\nDate=also wrong"),
+        parse_project_info(
+            "[TPS]\nVTZ=first.vtz\n[OTHER]\nVTZ=wrong.vtz\nDate=wrong\n[END_INFO]\n[TPS]\nDate=also wrong"
+        ),
         [Some("first.vtz"), None]
     );
-    assert_eq!(parse_project_info("projectinfo not supported"), [None, None]);
+    assert_eq!(
+        parse_project_info("projectinfo not supported"),
+        [None, None]
+    );
 }
 
 #[test]
@@ -975,8 +997,12 @@ fn project_info_shows_summary_with_other_fields_in_raw_response() {
         })
         .collect();
     for label in [
-        "Touchpanel project", "VTZ:", "tsw.vtz", "Date:",
-        "June 16, 2026 13:46:13", "Raw response",
+        "Touchpanel project",
+        "VTZ:",
+        "tsw.vtz",
+        "Date:",
+        "June 16, 2026 13:46:13",
+        "Raw response",
     ] {
         assert!(labels.contains(&label), "missing {label}");
     }
@@ -2052,7 +2078,10 @@ fn session_credentials_are_never_written_to_disk_or_printed() {
     for printed in [
         format!("{:?}", app.devices[0]),
         format!("{spec:?}"),
-        format!("{:?}", WorkerCommand::Refresh(spec.clone(), DeviceKind::Processor)),
+        format!(
+            "{:?}",
+            WorkerCommand::Refresh(spec.clone(), DeviceKind::Processor)
+        ),
     ] {
         assert!(!printed.contains("session-password"), "{printed}");
         assert!(printed.contains("[REDACTED]"), "{printed}");
@@ -2061,7 +2090,10 @@ fn session_credentials_are_never_written_to_disk_or_printed() {
     // The address book never carried a password, and still does not, even
     // for one that is saved in the vault.
     app.vault
-        .set_device(&crate::vault::DeviceKey::ssh_password("", "192.0.2.1", 22), "vault-password")
+        .set_device(
+            &crate::vault::DeviceKey::ssh_password("", "192.0.2.1", 22),
+            "vault-password",
+        )
         .unwrap();
     let book = dir.path().join("book.json");
     assert!(app.write_address_book_to(&book));
@@ -2170,7 +2202,10 @@ fn a_saved_device_password_is_used_without_asking() {
         .set(crate::vault::DEFAULT_PASSWORD, "default-password")
         .unwrap();
     app.vault
-        .set_device(&crate::vault::DeviceKey::ssh_password("", "192.0.2.1", 22), "saved-password")
+        .set_device(
+            &crate::vault::DeviceKey::ssh_password("", "192.0.2.1", 22),
+            "saved-password",
+        )
         .unwrap();
     app.session_credentials.password = "session-password".into();
     assert!(!app.connection_needs_credentials(&id));
@@ -2230,7 +2265,11 @@ fn a_default_password_left_in_preferences_moves_to_the_vault() {
     let written = std::fs::read_to_string(&path).unwrap();
     assert!(!written.contains("plaintext-secret"), "{written}");
     assert!(written.contains("admin"), "{written}");
-    assert!(app.status_message.contains("moved"), "{}", app.status_message);
+    assert!(
+        app.status_message.contains("moved"),
+        "{}",
+        app.status_message
+    );
 }
 
 /// With nowhere safe to keep it, the password is used for the session and the
@@ -2251,7 +2290,11 @@ fn without_a_keyring_the_default_password_lasts_the_session_and_is_never_written
     );
 
     assert_eq!(app.default_password().as_deref(), Some("plaintext-secret"));
-    assert!(std::fs::read_to_string(&path).unwrap().contains("plaintext-secret"));
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("plaintext-secret")
+    );
 
     app.open_preferences();
     assert_eq!(app.preferences_draft.default_password, "plaintext-secret");
@@ -2285,13 +2328,25 @@ fn the_default_password_is_saved_to_the_vault_and_cleared_from_it() {
 fn a_remembered_password_follows_the_device_to_a_new_address() {
     let mut app = app_without_credentials();
     app.preferences.default_username = "admin".into();
-    app.merge_discovered(searchable("192.0.2.1", "Room", "RMC4", "1.0", "00:10:7f:11:22:33"));
+    app.merge_discovered(searchable(
+        "192.0.2.1",
+        "Room",
+        "RMC4",
+        "1.0",
+        "00:10:7f:11:22:33",
+    ));
     let id = app.devices[0].id.clone();
     app.vault
         .set_device(&password_key(&app.devices[0]), "saved-password")
         .unwrap();
 
-    app.merge_discovered(searchable("192.0.2.99", "Room", "RMC4", "1.0", "00:10:7f:11:22:33"));
+    app.merge_discovered(searchable(
+        "192.0.2.99",
+        "Room",
+        "RMC4",
+        "1.0",
+        "00:10:7f:11:22:33",
+    ));
 
     assert_eq!(app.devices[0].host, "192.0.2.99");
     assert_eq!(
@@ -2315,7 +2370,13 @@ fn a_password_remembered_before_the_mac_was_known_is_found_after() {
         .set_device(&password_key(&app.devices[0]), "saved-password")
         .unwrap();
 
-    app.merge_discovered(searchable("192.0.2.1", "Room", "RMC4", "1.0", "00:10:7f:11:22:33"));
+    app.merge_discovered(searchable(
+        "192.0.2.1",
+        "Room",
+        "RMC4",
+        "1.0",
+        "00:10:7f:11:22:33",
+    ));
 
     assert_eq!(app.devices[0].mac, "00:10:7f:11:22:33");
     assert_eq!(
@@ -2335,9 +2396,8 @@ fn a_password_remembered_before_the_mac_was_known_is_found_after() {
 fn the_reveal_button_label_is_in_the_bundled_fonts() {
     let ctx = egui::Context::default();
     ctx.run_ui(input(), |_| {}).drop_without_applying_deltas();
-    let found = ctx.fonts_mut(|fonts| {
-        fonts.has_glyphs(&egui::FontId::proportional(14.0), REVEAL_LABEL)
-    });
+    let found =
+        ctx.fonts_mut(|fonts| fonts.has_glyphs(&egui::FontId::proportional(14.0), REVEAL_LABEL));
     assert!(found);
 }
 
@@ -2413,7 +2473,10 @@ fn adding_a_device_can_remember_its_password() {
     };
     app.add_address();
     let key = crate::vault::DeviceKey::ssh_password("", "192.0.2.9", 22);
-    assert_eq!(app.vault.get_device(&key).as_deref(), Some("added-password"));
+    assert_eq!(
+        app.vault.get_device(&key).as_deref(),
+        Some("added-password")
+    );
 
     app.address_draft = AddressDraft {
         host: "192.0.2.10".into(),
@@ -2422,7 +2485,10 @@ fn adding_a_device_can_remember_its_password() {
         ..Default::default()
     };
     app.add_address();
-    assert!(!app.vault.contains_device(&crate::vault::DeviceKey::ssh_password("", "192.0.2.10", 22)));
+    assert!(
+        !app.vault
+            .contains_device(&crate::vault::DeviceKey::ssh_password("", "192.0.2.10", 22))
+    );
 }
 
 #[test]
@@ -2753,9 +2819,27 @@ fn console_windows_close_with_the_devices_they_belong_to() {
 #[test]
 fn remove_devices_drops_discovered_and_address_book_devices() {
     let mut app = app();
-    app.merge_discovered(searchable("192.0.2.1", "ROOM1", "RMC3", "1.0", "00:10:7f:00:00:01"));
-    app.merge_discovered(searchable("192.0.2.2", "ROOM2", "RMC3", "1.0", "00:10:7f:00:00:02"));
-    app.merge_discovered(searchable("192.0.2.3", "ROOM3", "RMC3", "1.0", "00:10:7f:00:00:03"));
+    app.merge_discovered(searchable(
+        "192.0.2.1",
+        "ROOM1",
+        "RMC3",
+        "1.0",
+        "00:10:7f:00:00:01",
+    ));
+    app.merge_discovered(searchable(
+        "192.0.2.2",
+        "ROOM2",
+        "RMC3",
+        "1.0",
+        "00:10:7f:00:00:02",
+    ));
+    app.merge_discovered(searchable(
+        "192.0.2.3",
+        "ROOM3",
+        "RMC3",
+        "1.0",
+        "00:10:7f:00:00:03",
+    ));
     let promoted = app.devices[0].id.clone();
     app.add_discovered_to_address_book(&promoted);
     let promoted = app.devices[0].id.clone();
@@ -2776,8 +2860,20 @@ fn remove_devices_drops_discovered_and_address_book_devices() {
 #[test]
 fn a_busy_device_keeps_the_whole_removal_from_happening() {
     let mut app = app();
-    app.merge_discovered(searchable("192.0.2.1", "ROOM1", "RMC3", "1.0", "00:10:7f:00:00:01"));
-    app.merge_discovered(searchable("192.0.2.2", "ROOM2", "RMC3", "1.0", "00:10:7f:00:00:02"));
+    app.merge_discovered(searchable(
+        "192.0.2.1",
+        "ROOM1",
+        "RMC3",
+        "1.0",
+        "00:10:7f:00:00:01",
+    ));
+    app.merge_discovered(searchable(
+        "192.0.2.2",
+        "ROOM2",
+        "RMC3",
+        "1.0",
+        "00:10:7f:00:00:02",
+    ));
     let first = app.devices[0].id.clone();
     let second = app.devices[1].id.clone();
     app.add_discovered_to_address_book(&first);

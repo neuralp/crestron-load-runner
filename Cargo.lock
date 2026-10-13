@@ -831,8 +831,9 @@ dependencies = [
 
 [[package]]
 name = "crestron-load-runner"
-version = "26.10.11"
+version = "26.10.13"
 dependencies = [
+ "chrono",
  "directories",
  "eframe",
  "flate2",

@@ -33,12 +33,24 @@ impl DataLocations {
         // The folder itself, the application's, and the organisation's. A
         // `--config-dir` profile is a folder the user chose, so nothing above
         // it is touched, empty or not.
-        let levels = if crate::storage::config_dir_overridden() { 1 } else { 3 };
-        let mut prune: Vec<PathBuf> = [config.as_deref(), firmware.as_deref().and_then(Path::parent)]
-            .into_iter()
-            .flatten()
-            .flat_map(|dir| dir.ancestors().take(levels).map(Path::to_path_buf).collect::<Vec<_>>())
-            .collect();
+        let levels = if crate::storage::config_dir_overridden() {
+            1
+        } else {
+            3
+        };
+        let mut prune: Vec<PathBuf> = [
+            config.as_deref(),
+            firmware.as_deref().and_then(Path::parent),
+        ]
+        .into_iter()
+        .flatten()
+        .flat_map(|dir| {
+            dir.ancestors()
+                .take(levels)
+                .map(Path::to_path_buf)
+                .collect::<Vec<_>>()
+        })
+        .collect();
         prune.sort_by_key(|dir| std::cmp::Reverse(dir.components().count()));
         prune.dedup();
         Self {
@@ -228,7 +240,10 @@ impl RemoveData {
             self.inventory.firmware.is_some(),
             "Firmware library",
             &match self.inventory.firmware {
-                Some(size) => format!("Imported firmware files, {}", crate::archive::human_size(size)),
+                Some(size) => format!(
+                    "Imported firmware files, {}",
+                    crate::archive::human_size(size)
+                ),
                 None => "Imported firmware files".to_owned(),
             },
             &path(&self.locations.firmware),
@@ -244,7 +259,10 @@ impl RemoveData {
         let (saved, detail) = match &self.inventory.vault {
             Ok(0) => (false, "Nothing saved".to_owned()),
             Ok(1) => (true, "1 entry in Windows Credential Manager".to_owned()),
-            Ok(count) => (true, format!("{count} entries in Windows Credential Manager")),
+            Ok(count) => (
+                true,
+                format!("{count} entries in Windows Credential Manager"),
+            ),
             Err(error) => (false, error.clone()),
         };
         choice(
@@ -280,7 +298,14 @@ impl RemoveData {
 }
 
 /// One tickable kind of data. Disabled, and marked so, when there is none.
-fn choice(ui: &mut egui::Ui, chosen: &mut bool, present: bool, title: &str, what: &str, detail: &str) {
+fn choice(
+    ui: &mut egui::Ui,
+    chosen: &mut bool,
+    present: bool,
+    title: &str,
+    what: &str,
+    detail: &str,
+) {
     if !present {
         *chosen = false;
     }
@@ -315,7 +340,11 @@ mod tests {
         fs::write(config.join("preferences.json"), b"{}").unwrap();
         fs::write(config.join("preferences.json.tmp"), b"{}").unwrap();
         fs::write(config.join("scripts.json"), b"[]").unwrap();
-        fs::write(data.join("firmware").join("RMC4").join("rmc4.puf"), [0u8; 2048]).unwrap();
+        fs::write(
+            data.join("firmware").join("RMC4").join("rmc4.puf"),
+            [0u8; 2048],
+        )
+        .unwrap();
         DataLocations {
             preferences: Some(config.join("preferences.json")),
             scripts: Some(config.join("scripts.json")),
@@ -366,7 +395,10 @@ mod tests {
         assert!(locations.preferences.as_ref().unwrap().exists());
         assert!(locations.firmware.as_ref().unwrap().exists());
         assert!(!vault_cleared, "passwords were not ticked");
-        assert!(locations.prune[3].exists(), "a folder still in use was removed");
+        assert!(
+            locations.prune[3].exists(),
+            "a folder still in use was removed"
+        );
     }
 
     #[test]
@@ -412,7 +444,12 @@ mod tests {
         assert!(remove(&locations, all, |_| Ok(0)).is_empty());
 
         assert!(unrelated.exists());
-        assert!(!dir.path().join("WorldDomination").join("CrestronLoadRunner").exists());
+        assert!(
+            !dir.path()
+                .join("WorldDomination")
+                .join("CrestronLoadRunner")
+                .exists()
+        );
     }
 
     #[test]
@@ -467,7 +504,10 @@ mod tests {
             "Saved passwords and API tokens (nothing saved)",
             "Keep everything",
         ] {
-            assert!(texts.iter().any(|text| text == expected), "missing {expected}");
+            assert!(
+                texts.iter().any(|text| text == expected),
+                "missing {expected}"
+            );
         }
     }
 }

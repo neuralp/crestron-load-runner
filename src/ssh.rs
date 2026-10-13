@@ -76,6 +76,7 @@ impl Timings {
 }
 const CHUNK: usize = 64 * 1024;
 
+mod debugger;
 mod ipid_assignment;
 
 #[cfg(test)]
@@ -98,6 +99,12 @@ pub enum WorkerCommand {
         connection: ConnectionSpec,
         program: u8,
         reply: Sender<Result<String, String>>,
+    },
+    ReadDebugSignature {
+        connection: ConnectionSpec,
+        slot: u8,
+        assigned_name: Option<String>,
+        reply: Sender<Result<Vec<u8>, String>>,
     },
     AssignIpid {
         connection: ConnectionSpec,
@@ -139,7 +146,35 @@ pub enum WorkerCommand {
         input: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
         output: Sender<TerminalEvent>,
     },
+    OpenDebugger {
+        connection: ConnectionSpec,
+        slot: u8,
+        signums: Vec<u32>,
+        input: tokio::sync::mpsc::UnboundedReceiver<DebugCommand>,
+        output: tokio::sync::mpsc::Sender<DebugEvent>,
+    },
     Stop,
+}
+
+#[derive(Debug)]
+pub enum DebugCommand {
+    Stop,
+}
+
+#[derive(Debug)]
+pub enum DebugEvent {
+    Opened,
+    SyncComplete,
+    Progress {
+        processed: usize,
+        total: usize,
+        already_on: usize,
+    },
+    Output {
+        bytes: Vec<u8>,
+        received_at: std::time::SystemTime,
+    },
+    Closed(String),
 }
 
 #[derive(Debug)]
@@ -262,6 +297,33 @@ impl WorkerPool {
         result
     }
 
+    pub fn open_debugger(
+        &mut self,
+        id: &str,
+        connection: ConnectionSpec,
+        slot: u8,
+        signums: Vec<u32>,
+        input: tokio::sync::mpsc::UnboundedReceiver<DebugCommand>,
+        output: tokio::sync::mpsc::Sender<DebugEvent>,
+    ) -> Result<(), String> {
+        let reply = output.clone();
+        let result = self.worker(id).and_then(|sender| {
+            sender
+                .send(WorkerCommand::OpenDebugger {
+                    connection,
+                    slot,
+                    signums,
+                    input,
+                    output,
+                })
+                .map_err(|_| "device worker stopped unexpectedly".to_owned())
+        });
+        if let Err(error) = &result {
+            let _ = reply.try_send(DebugEvent::Closed(error.clone()));
+        }
+        result
+    }
+
     pub fn is_busy(&self, id: &str) -> bool {
         self.pending.get(id).is_some_and(|count| *count > 0)
     }
@@ -354,6 +416,8 @@ async fn worker_loop(
     let mut queue: VecDeque<WorkerCommand> = VecDeque::new();
     let mut running: Option<tokio::task::JoinHandle<()>> = None;
     let mut console: Option<Console> = None;
+    let mut debugger: Option<tokio::task::JoinHandle<()>> = None;
+    let mut debugger_cancel: Option<tokio::sync::watch::Sender<bool>> = None;
     // Set once this worker has been told to stop. What is still queued is
     // abandoned, but whatever is already running is waited for: a firmware
     // transfer cut off partway through would leave the device half written.
@@ -367,12 +431,25 @@ async fn worker_loop(
                 None | Some(WorkerCommand::Stop) => {
                     stopping = true;
                     queue.clear();
+                    if let Some(cancel) = &debugger_cancel { let _ = cancel.send(true); }
                 }
                 Some(WorkerCommand::OpenTerminal { connection, input, output }) => {
                     // One window per device: the application only asks for a
                     // second once the first has gone.
                     end_console(&mut console, None).await;
                     open_console(&device, &mut console, connection, input, output, &events).await;
+                }
+                Some(WorkerCommand::OpenDebugger { connection, slot, signums, input, output }) => {
+                    if debugger.as_ref().is_some_and(|task| !task.is_finished()) {
+                        let _ = output.try_send(DebugEvent::Closed("A debugger session is already active".into()));
+                    } else {
+                        let (shared, reporter) = (device.clone(), events.clone());
+                        let (cancel, cancelled) = tokio::sync::watch::channel(false);
+                        debugger_cancel = Some(cancel);
+                        debugger = Some(tokio::spawn(async move {
+                            debugger::session(connection, debugger::Target { slot, signums }, input, output, shared, reporter, cancelled).await;
+                        }));
+                    }
                 }
                 Some(command) => queue.push_back(command),
             },
@@ -414,6 +491,11 @@ async fn worker_loop(
     // channel and saying goodbye are both work, and there is nowhere left to do
     // it once `block_on` has returned.
     end_console(&mut console, Some("The device session was closed")).await;
+    if let Some(debugger) = debugger {
+        // The debugger's sender was dropped with the application on shutdown;
+        // let the task send OFF before saying goodbye to the processor.
+        let _ = debugger.await;
+    }
     device.close().await;
 }
 
@@ -428,6 +510,9 @@ fn starting(command: &WorkerCommand) -> String {
         WorkerCommand::ReadIpids { program, .. } => {
             format!("Reading IP table for program {program}")
         }
+        WorkerCommand::ReadDebugSignature { slot, .. } => {
+            format!("Reading signature for slot {slot}")
+        }
         WorkerCommand::AssignIpid { ipid, .. } => format!("Assigning IPID {ipid}"),
         WorkerCommand::RunScript { name, .. } => format!("Running script {name}"),
         WorkerCommand::UploadProgram { slot, .. } => format!("Loading program slot {slot}"),
@@ -435,7 +520,9 @@ fn starting(command: &WorkerCommand) -> String {
         WorkerCommand::UploadConfig { .. } => "Loading configuration file".to_owned(),
         WorkerCommand::UploadFirmware { .. } => "Loading firmware".to_owned(),
         // Neither is ever queued.
-        WorkerCommand::OpenTerminal { .. } | WorkerCommand::Stop => String::new(),
+        WorkerCommand::OpenTerminal { .. }
+        | WorkerCommand::OpenDebugger { .. }
+        | WorkerCommand::Stop => String::new(),
     }
 }
 
@@ -552,13 +639,32 @@ async fn dispatch(
     events: &Sender<WorkerEvent>,
 ) -> WorkerResult<()> {
     match command {
-        WorkerCommand::Refresh(connection, kind) => refresh_for_kind(&connection, kind, device, events).await,
+        WorkerCommand::Refresh(connection, kind) => {
+            refresh_for_kind(&connection, kind, device, events).await
+        }
         WorkerCommand::ReadIpids {
             connection,
             program,
             reply,
         } => {
             ipid_assignment::read(&connection, program, reply, device, events).await;
+            Ok(())
+        }
+        WorkerCommand::ReadDebugSignature {
+            connection,
+            slot,
+            assigned_name,
+            reply,
+        } => {
+            debugger::read_signature(
+                &connection,
+                slot,
+                assigned_name.as_deref(),
+                reply,
+                device,
+                events,
+            )
+            .await;
             Ok(())
         }
         WorkerCommand::AssignIpid {
@@ -614,7 +720,9 @@ async fn dispatch(
             remote_name,
         } => upload_firmware(&connection, &local_path, &remote_name, device, events).await,
         // Neither reaches here: the loop takes both before anything is queued.
-        WorkerCommand::Stop | WorkerCommand::OpenTerminal { .. } => Ok(()),
+        WorkerCommand::Stop
+        | WorkerCommand::OpenTerminal { .. }
+        | WorkerCommand::OpenDebugger { .. } => Ok(()),
     }
 }
 
@@ -1035,7 +1143,11 @@ fn same_connection(open_for: &ConnectionSpec, wanted: &ConnectionSpec) -> bool {
 }
 
 #[cfg(test)]
-async fn refresh(spec: &ConnectionSpec, device: &SharedSession, events: &Sender<WorkerEvent>) -> WorkerResult<()> {
+async fn refresh(
+    spec: &ConnectionSpec,
+    device: &SharedSession,
+    events: &Sender<WorkerEvent>,
+) -> WorkerResult<()> {
     refresh_for_kind(spec, DeviceKind::Processor, device, events).await
 }
 
@@ -1085,7 +1197,9 @@ async fn refresh_for_kind(
         cresnet: if kind == DeviceKind::Touchpanel {
             None
         } else {
-            optional_section(run_command(spec, &session, "REPORTCRESNET", SSH_TIMEOUT, events).await)
+            optional_section(
+                run_command(spec, &session, "REPORTCRESNET", SSH_TIMEOUT, events).await,
+            )
         },
     };
     events
@@ -1457,7 +1571,16 @@ async fn upload_firmware(
         })?;
     let version = crate::firmware_version::Version::from_package(&archive.package)
         .map_err(|error| message(spec, error))?;
-    upload_files(spec, vec![transfer], None, apply, Some(version), device, events).await
+    upload_files(
+        spec,
+        vec![transfer],
+        None,
+        apply,
+        Some(version),
+        device,
+        events,
+    )
+    .await
 }
 
 /// What to do once the firmware is staged. Only the file name decides: a zip
@@ -1718,7 +1841,10 @@ async fn stage(
 
 type UploadSource = (Transfer, tokio::fs::File, u64);
 
-async fn open_upload_source(spec: &ConnectionSpec, transfer: Transfer) -> WorkerResult<UploadSource> {
+async fn open_upload_source(
+    spec: &ConnectionSpec,
+    transfer: Transfer,
+) -> WorkerResult<UploadSource> {
     let file = tokio::fs::File::open(&transfer.local)
         .await
         .map_err(|error| {
@@ -1918,15 +2044,15 @@ fn optional_section(result: Result<String, String>) -> Option<String> {
     }
 }
 
-fn safe_remote_file_name(path: &Path) -> Option<String> {
-    let name = path.file_name()?.to_str()?;
+pub(crate) fn safe_remote_file_name(path: &Path) -> Option<String> {
+    let name = path.to_str()?.rsplit(['/', '\\']).next()?;
     is_safe_remote_file_name(name).then(|| name.to_owned())
 }
 
 /// Staged names reach the device only as the last component of an SFTP path, so
 /// the requirement is that they cannot escape the destination directory.
 /// Ordinary filename characters, spaces included, are fine.
-fn is_safe_remote_file_name(name: &str) -> bool {
+pub(crate) fn is_safe_remote_file_name(name: &str) -> bool {
     !name.trim().is_empty()
         && name != "."
         && name != ".."
@@ -2214,20 +2340,57 @@ mod tests {
             let spec = server.spec();
             let (events, receiver) = mpsc::channel();
             let device = SharedSession::default();
-            refresh_for_kind(&spec, DeviceKind::Touchpanel, &device, &events).await.unwrap();
-            let details = receiver.try_iter().find_map(|event| {
-                if let WorkerEvent::Details { details, .. } = event { Some(details) } else { None }
-            }).expect("touchpanel details received");
+            refresh_for_kind(&spec, DeviceKind::Touchpanel, &device, &events)
+                .await
+                .unwrap();
+            let details = receiver
+                .try_iter()
+                .find_map(|event| {
+                    if let WorkerEvent::Details { details, .. } = event {
+                        Some(details)
+                    } else {
+                        None
+                    }
+                })
+                .expect("touchpanel details received");
             assert_eq!(details.project_info, "output for projectinfo");
-            assert_eq!(server.received().iter().filter(|command| *command == "projectinfo").count(), 1);
-            assert!(!server.received().iter().any(|command| matches!(command.as_str(), "progcomments" | "REPORTCRESNET")));
+            assert_eq!(
+                server
+                    .received()
+                    .iter()
+                    .filter(|command| *command == "projectinfo")
+                    .count(),
+                1
+            );
+            assert!(
+                !server
+                    .received()
+                    .iter()
+                    .any(|command| matches!(command.as_str(), "progcomments" | "REPORTCRESNET"))
+            );
 
-            refresh_for_kind(&spec, DeviceKind::Processor, &device, &events).await.unwrap();
-            let details = receiver.try_iter().find_map(|event| {
-                if let WorkerEvent::Details { details, .. } = event { Some(details) } else { None }
-            }).expect("processor details received");
+            refresh_for_kind(&spec, DeviceKind::Processor, &device, &events)
+                .await
+                .unwrap();
+            let details = receiver
+                .try_iter()
+                .find_map(|event| {
+                    if let WorkerEvent::Details { details, .. } = event {
+                        Some(details)
+                    } else {
+                        None
+                    }
+                })
+                .expect("processor details received");
             assert!(details.project_info.is_empty());
-            assert_eq!(server.received().iter().filter(|command| *command == "projectinfo").count(), 1);
+            assert_eq!(
+                server
+                    .received()
+                    .iter()
+                    .filter(|command| *command == "projectinfo")
+                    .count(),
+                1
+            );
             server.server.abort();
         });
     }
@@ -2688,8 +2851,13 @@ mod tests {
             credentials: Credentials::default(),
             trusted_fingerprint: None,
         };
-        pool.send(id, WorkerCommand::Refresh(spec.clone(), DeviceKind::Processor)).unwrap();
-        pool.send(id, WorkerCommand::Refresh(spec, DeviceKind::Processor)).unwrap();
+        pool.send(
+            id,
+            WorkerCommand::Refresh(spec.clone(), DeviceKind::Processor),
+        )
+        .unwrap();
+        pool.send(id, WorkerCommand::Refresh(spec, DeviceKind::Processor))
+            .unwrap();
         assert!(pool.is_busy(id));
         assert!(pool.retire(id).is_err());
         assert!(pool.retire_all().is_err());
