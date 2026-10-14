@@ -112,9 +112,13 @@ fn both_trees_support_ranges_toggles_and_watch_removal() {
         click(&mut panel, "Signal-0", secondary, plain);
         assert_eq!(selected(&panel), HashSet::from([0, 2]));
         if watch {
-            click(&mut panel, "Remove selected signals", primary, plain);
+            click(&mut panel, "Remove 2 signals from group", primary, plain);
             assert_eq!(panel.groups["Watched"], [1, 3]);
             assert!(selected(&panel).is_empty());
+            // Right-clicking an unselected signal acts on that one alone.
+            click(&mut panel, "Signal-3", secondary, plain);
+            click(&mut panel, "Remove from group", primary, plain);
+            assert_eq!(panel.groups["Watched"], [1]);
             click(&mut panel, "Watched", secondary, plain);
             click(&mut panel, "Remove all signals", primary, plain);
             assert!(panel.groups["Watched"].is_empty());

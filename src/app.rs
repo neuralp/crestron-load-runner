@@ -24,7 +24,7 @@ use crate::{
         endpoint_id,
     },
     ssh::{ConnectionSpec, WorkerCommand, WorkerEvent, WorkerPool},
-    storage::{Preferences, StartupBook},
+    storage::{DebuggerFont, Preferences, SignalFont, StartupBook, Theme},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -130,6 +130,11 @@ struct PreferencesDraft {
     default_password: String,
     startup: StartupBook,
     default_address_book: Option<PathBuf>,
+    theme: Theme,
+    debugger_font: DebuggerFont,
+    /// The chosen font file, with its family name or why it cannot be used.
+    /// Read when it is chosen rather than at every frame.
+    font_file: Option<(PathBuf, Result<String, String>)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -212,6 +217,11 @@ pub struct LoadRunnerApp {
     about_open: bool,
     preferences_open: bool,
     preferences_draft: PreferencesDraft,
+    /// The theme the context was last given, so it is set only on a change.
+    applied_theme: Option<Theme>,
+    /// Likewise the debugger font, and what it resolved to.
+    applied_signal_font: Option<DebuggerFont>,
+    signal_fonts: crate::signal_font::SignalFonts,
     backdrop: crate::backdrop::Backdrop,
     firmware_editor: crate::firmware::FirmwareEditor,
     script_editor: crate::scripts::ScriptEditor,
@@ -273,11 +283,13 @@ fn modal(id: &str) -> egui::Modal {
 
 impl LoadRunnerApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        cc.egui_ctx.set_visuals(egui::Visuals::dark());
         // Before the editor reads the catalog, since where it reads depends on
         // whether a library from an earlier build could be moved.
         let moved = crate::storage::migrate_firmware_dir();
         let (preferences, load_error) = Preferences::load();
+        // Before the first frame, so it is never drawn in the other theme.
+        cc.egui_ctx.set_theme(preferences.theme.egui());
+        let applied_theme = preferences.theme;
         let (startup_book, startup_error) = crate::storage::startup_address_book(&preferences);
         let vault = crate::vault::Vault::open(crate::storage::vault_service());
         let persistent = vault.is_persistent();
@@ -288,6 +300,10 @@ impl LoadRunnerApp {
             moved.or(load_error).or(startup_error),
             vault,
         );
+        app.applied_theme = Some(applied_theme);
+        // Also before the first frame: a chosen font file's family has to be
+        // registered before anything is drawn in it.
+        app.apply_signal_font(&cc.egui_ctx);
         if !persistent {
             app.notice = Some(
                 "No system keyring was found, so saved passwords and API tokens last only until the application closes.".into(),
@@ -337,6 +353,9 @@ impl LoadRunnerApp {
             default_password: String::new(),
             startup: preferences.startup,
             default_address_book: preferences.default_address_book.clone(),
+            theme: preferences.theme,
+            debugger_font: preferences.debugger_font.clone(),
+            font_file: None,
         };
         Self {
             vault,
@@ -386,6 +405,9 @@ impl LoadRunnerApp {
             about_open: false,
             preferences_open: false,
             preferences_draft,
+            applied_theme: None,
+            applied_signal_font: None,
+            signal_fonts: Default::default(),
             firmware_editor: Default::default(),
             session_credentials: Credentials::default(),
             credential_prompt: None,
@@ -879,12 +901,21 @@ impl LoadRunnerApp {
             default_password: self.default_password().unwrap_or_default(),
             startup: self.preferences.startup,
             default_address_book: self.preferences.default_address_book.clone(),
+            theme: self.preferences.theme,
+            debugger_font: self.preferences.debugger_font.clone(),
+            font_file: font_file_check(&self.preferences.debugger_font.font),
         };
         self.preferences_open = true;
     }
 
     fn save_preferences(&mut self) {
         let draft = self.preferences_draft.clone();
+        if let SignalFont::File(path) = &draft.debugger_font.font
+            && let Err(error) = crate::signal_font::read(path)
+        {
+            self.notice = Some(format!("Cannot use that debugger font: {error}"));
+            return;
+        }
         if draft.startup == StartupBook::Specific {
             let Some(path) = draft.default_address_book.as_deref() else {
                 self.notice = Some("Choose the address book to open at startup".into());
@@ -904,6 +935,8 @@ impl LoadRunnerApp {
         self.preferences.default_username = draft.default_username.trim().to_owned();
         self.preferences.startup = draft.startup;
         self.preferences.default_address_book = draft.default_address_book;
+        self.preferences.theme = draft.theme;
+        self.preferences.debugger_font = draft.debugger_font;
         // Only written when it changed, so that saving the other preferences
         // does not touch the vault.
         let password_saved =
@@ -2021,19 +2054,6 @@ impl LoadRunnerApp {
         self.mark_address_book_dirty();
     }
 
-    fn remove_selected_address(&mut self) {
-        let Some(id) = self.selected_id.clone() else {
-            return;
-        };
-        if self
-            .devices
-            .iter()
-            .any(|device| device.id == id && device.source == DeviceSource::AddressBook)
-        {
-            self.remove_devices(&[id]);
-        }
-    }
-
     /// Takes the given devices off the list, discovered or not. Nothing is
     /// removed unless every one of them can be, so a busy device never leaves
     /// the rest half-removed.
@@ -2226,21 +2246,6 @@ impl LoadRunnerApp {
                 }
                 if ui.button("Run Script").clicked() {
                     self.open_script_run(None);
-                }
-                let can_assign = self.ipid_processor(None).is_ok();
-                if ui
-                    .add_enabled(can_assign, egui::Button::new("Assign IPIDs"))
-                    .on_disabled_hover_text("Select exactly one console processor target")
-                    .clicked()
-                {
-                    self.open_ipid_assignment(None);
-                }
-                if ui
-                    .add_enabled(can_assign, egui::Button::new("Debug Signals"))
-                    .on_disabled_hover_text("Select exactly one console processor target")
-                    .clicked()
-                {
-                    self.open_debugger(None);
                 }
                 ui.separator();
                 let selected = self.devices.iter().filter(|device| device.selected).count();
@@ -2721,8 +2726,12 @@ impl LoadRunnerApp {
 
                 let mut refresh = false;
                 let mut terminal = false;
-                let mut remove = false;
                 let mut open_log = false;
+                let mut assign_ipids = false;
+                let mut debug_signals = false;
+                // Processor tools, with why they are unavailable (a VC-4).
+                let processor_tools = (self.devices[index].kind == DeviceKind::Processor)
+                    .then(|| self.ipid_processor(Some(&id)).err());
                 let mut address_changed = false;
                 let mut model_changed = false;
                 let mut vault_error = None;
@@ -2858,10 +2867,18 @@ impl LoadRunnerApp {
                         {
                             open_log = true;
                         }
-                        if device.source == DeviceSource::AddressBook
-                            && ui.button("Remove").clicked()
-                        {
-                            remove = true;
+                        if let Some(unavailable) = &processor_tools {
+                            let reason = unavailable.as_deref().unwrap_or_default();
+                            assign_ipids = ui
+                                .add_enabled(unavailable.is_none(), egui::Button::new("Assign IPIDs…"))
+                                .on_hover_text("Point peripherals' IP tables at this processor")
+                                .on_disabled_hover_text(reason)
+                                .clicked();
+                            debug_signals = ui
+                                .add_enabled(unavailable.is_none(), egui::Button::new("Debug Signals…"))
+                                .on_hover_text("Watch this processor's program signals in their own window")
+                                .on_disabled_hover_text(reason)
+                                .clicked();
                         }
                     });
                     if device.source == DeviceSource::AddressBook && !crate::vc4::is_vc4(&device.model) {
@@ -2897,9 +2914,11 @@ impl LoadRunnerApp {
                 if terminal {
                     self.open_terminal(&id);
                 }
-                if remove {
-                    self.remove_selected_address();
-                    return;
+                if assign_ipids {
+                    self.open_ipid_assignment(Some(&id));
+                }
+                if debug_signals {
+                    self.open_debugger(Some(&id));
                 }
 
                 if let Some(fingerprint) = self.pending_host_keys.get(&id).cloned() {
@@ -3005,7 +3024,11 @@ impl LoadRunnerApp {
                             shown += 1;
                             let color = match entry.direction {
                                 crate::device_log::Direction::Sent => {
-                                    Color32::from_rgb(120, 170, 255)
+                                    if ui.visuals().dark_mode {
+                                        Color32::from_rgb(120, 170, 255)
+                                    } else {
+                                        Color32::from_rgb(25, 85, 190)
+                                    }
                                 }
                                 crate::device_log::Direction::Received => {
                                     ui.visuals().strong_text_color()
@@ -3227,6 +3250,16 @@ impl LoadRunnerApp {
                 );
                 ui.add_space(12.0);
                 ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Theme");
+                    ui.radio_value(&mut self.preferences_draft.theme, Theme::Dark, "Dark");
+                    ui.radio_value(&mut self.preferences_draft.theme, Theme::Light, "Light");
+                });
+                ui.add_space(12.0);
+                ui.separator();
+                self.debugger_font_preference(ui);
+                ui.add_space(12.0);
+                ui.separator();
                 ui.label("At startup");
                 ui.radio_value(
                     &mut self.preferences_draft.startup,
@@ -3394,7 +3427,95 @@ impl eframe::App for LoadRunnerApp {
 }
 
 impl LoadRunnerApp {
+    /// The saved theme, set on the context only when it changes.
+    fn apply_theme(&mut self, ctx: &egui::Context) {
+        if self.applied_theme != Some(self.preferences.theme) {
+            ctx.set_theme(self.preferences.theme.egui());
+            self.applied_theme = Some(self.preferences.theme);
+        }
+    }
+
+    /// The debugger font, registered with the context only when it changes.
+    fn apply_signal_font(&mut self, ctx: &egui::Context) {
+        if self.applied_signal_font.as_ref() == Some(&self.preferences.debugger_font) {
+            return;
+        }
+        let (fonts, error) = crate::signal_font::apply(ctx, &self.preferences.debugger_font);
+        self.signal_fonts = fonts;
+        self.applied_signal_font = Some(self.preferences.debugger_font.clone());
+        if let Some(error) = error {
+            self.status_message = format!("Using the default debugger font: {error}");
+            self.status_is_error = true;
+        }
+    }
+
+    fn debugger_font_preference(&mut self, ui: &mut egui::Ui) {
+        ui.label("Debugger signal names and values");
+        let draft = &mut self.preferences_draft;
+        ui.horizontal(|ui| {
+            ui.label("Font");
+            let selected = match &draft.debugger_font.font {
+                SignalFont::Default => "Default".to_owned(),
+                SignalFont::Proportional => "Proportional".to_owned(),
+                SignalFont::Monospace => "Monospace".to_owned(),
+                SignalFont::File(path) => file_display_name(path),
+            };
+            egui::ComboBox::from_id_salt("debugger_font")
+                .selected_text(selected)
+                .show_ui(ui, |ui| {
+                    let font = &mut draft.debugger_font.font;
+                    ui.selectable_value(font, SignalFont::Default, "Default")
+                        .on_hover_text("Names proportional, values monospaced");
+                    ui.selectable_value(font, SignalFont::Proportional, "Proportional");
+                    ui.selectable_value(font, SignalFont::Monospace, "Monospace");
+                    if ui
+                        .selectable_label(matches!(font, SignalFont::File(_)), "Font file…")
+                        .clicked()
+                        && let Some(path) = rfd::FileDialog::new()
+                            .add_filter("Fonts", &["ttf", "otf"])
+                            .pick_file()
+                    {
+                        *font = SignalFont::File(path);
+                    }
+                });
+            ui.label("Size");
+            ui.add(
+                egui::DragValue::new(&mut draft.debugger_font.size)
+                    .range(crate::storage::SIGNAL_FONT_SIZES)
+                    .suffix(" pt"),
+            );
+        });
+        // Read when another file is chosen, not at every frame.
+        match &draft.debugger_font.font {
+            SignalFont::File(path)
+                if draft
+                    .font_file
+                    .as_ref()
+                    .is_none_or(|(checked, _)| checked != path) =>
+            {
+                draft.font_file = font_file_check(&draft.debugger_font.font);
+            }
+            SignalFont::File(_) => {}
+            _ => draft.font_file = None,
+        }
+        match draft.font_file.as_ref().map(|(_, result)| result) {
+            Some(Ok(family)) => {
+                ui.small(format!(
+                    "{family}, for anything it lacks the default font is used."
+                ));
+            }
+            Some(Err(error)) => {
+                ui.colored_label(ui.visuals().error_fg_color, error);
+            }
+            None => {
+                ui.small("Applies to the signal tree, watch groups, timeline and signal details.");
+            }
+        }
+    }
+
     fn tick(&mut self, ctx: &egui::Context) {
+        self.apply_theme(ctx);
+        self.apply_signal_font(ctx);
         self.process_events();
         self.firmware_editor.poll(ctx);
         if ctx.input(|input| input.viewport().close_requested()) && !self.close_approved {
@@ -3467,6 +3588,17 @@ fn signature_beside(program: &Path) -> Option<PathBuf> {
         });
     let match_path = matches.next()?;
     matches.next().is_none().then_some(match_path)
+}
+
+/// A chosen font file's family name, or why it cannot be used.
+fn font_file_check(font: &SignalFont) -> Option<(PathBuf, Result<String, String>)> {
+    match font {
+        SignalFont::File(path) => Some((
+            path.clone(),
+            crate::signal_font::read(path).map(|(_, family)| family),
+        )),
+        _ => None,
+    }
 }
 
 fn file_display_name(path: &Path) -> String {

@@ -67,7 +67,7 @@ fn vc4_details_use_rest_tables_and_refresh_never_queues_processor_ssh_commands()
             .any(|s| s == "Program info" || s == "Cresnet" || s.contains("SLOT 1"))
     );
     output.drop_without_applying_deltas();
-    app.remove_selected_address();
+    app.remove_devices(std::slice::from_ref(&id));
     assert!(!app.vc4.contains_key(&id));
 }
 
@@ -2306,6 +2306,131 @@ fn without_a_keyring_the_default_password_lasts_the_session_and_is_never_written
 }
 
 #[test]
+fn the_theme_is_chosen_in_preferences_saved_and_applied() {
+    let dir = TestDir::new();
+    let mut app = app_in(&dir);
+    let ctx = egui::Context::default();
+    app.apply_theme(&ctx);
+    assert!(
+        ctx.global_style().visuals.dark_mode,
+        "dark until chosen otherwise"
+    );
+
+    app.open_preferences();
+    let render = |app: &mut LoadRunnerApp, events| {
+        let mut raw = input();
+        raw.events = events;
+        ctx.run_ui(raw, |ui| app.show(ui))
+    };
+    for _ in 0..3 {
+        render(&mut app, vec![]).drop_without_applying_deltas();
+    }
+    let output = render(&mut app, vec![]);
+    let light = output
+        .shapes
+        .iter()
+        .find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.text() == "Light" => {
+                Some(text.pos + text.galley.size() * 0.5)
+            }
+            _ => None,
+        })
+        .expect("theme choice in Preferences");
+    output.drop_without_applying_deltas();
+    for pressed in [true, false] {
+        render(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(light),
+                egui::Event::PointerButton {
+                    pos: light,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        )
+        .drop_without_applying_deltas();
+    }
+    assert_eq!(app.preferences_draft.theme, Theme::Light);
+    // Nothing changes until Save.
+    app.apply_theme(&ctx);
+    assert!(ctx.global_style().visuals.dark_mode);
+
+    app.save_preferences();
+    assert!(!app.preferences_open);
+    app.apply_theme(&ctx);
+    assert!(!ctx.global_style().visuals.dark_mode);
+    let written = std::fs::read_to_string(dir.path().join("preferences.json")).unwrap();
+    assert!(written.contains(r#""theme": "light""#), "{written}");
+    let reloaded = Preferences::load_from(&dir.path().join("preferences.json")).unwrap();
+    assert_eq!(reloaded.theme, Theme::Light);
+}
+
+#[test]
+fn the_debugger_font_is_checked_on_save_applied_and_given_to_debugger_windows() {
+    use crate::storage::{DebuggerFont, SignalFont};
+    let dir = TestDir::new();
+    let mut app = app_in(&dir);
+    app.devices.push(Device::from_address(&AddressEntry {
+        host: "192.0.2.10".into(),
+        kind: DeviceKind::Processor,
+        model: "CP4".into(),
+        ..Default::default()
+    }));
+    let id = app.devices[0].id.clone();
+    let ctx = egui::Context::default();
+    app.apply_signal_font(&ctx);
+    assert_eq!(app.signal_fonts, crate::signal_font::SignalFonts::default());
+
+    // A file that is not a font is refused, and nothing is saved.
+    let not_a_font = dir.path().join("readme.ttf");
+    std::fs::write(&not_a_font, b"hello").unwrap();
+    app.open_preferences();
+    app.preferences_draft.debugger_font = DebuggerFont {
+        font: SignalFont::File(not_a_font),
+        size: 18,
+    };
+    app.save_preferences();
+    assert!(app.preferences_open);
+    assert!(
+        app.notice
+            .take()
+            .is_some_and(|notice| notice.contains("Cannot use that debugger font"))
+    );
+    assert_eq!(app.preferences.debugger_font, DebuggerFont::default());
+
+    let font = crate::signal_font::tests::font_file(&dir);
+    app.preferences_draft.debugger_font = DebuggerFont {
+        font: SignalFont::File(font.clone()),
+        size: 18,
+    };
+    app.save_preferences();
+    assert!(!app.preferences_open);
+    app.apply_signal_font(&ctx);
+    assert_eq!(app.signal_fonts.name.size, 18.0);
+    assert!(matches!(
+        app.signal_fonts.name.family,
+        egui::FontFamily::Name(_)
+    ));
+    let written = Preferences::load_from(&dir.path().join("preferences.json")).unwrap();
+    assert_eq!(written.debugger_font.font, SignalFont::File(font));
+
+    // Open debugger windows draw with it.
+    app.open_debugger(Some(&id));
+    ctx.run_ui(input(), |ui| app.show_debuggers(ui.ctx()))
+        .drop_without_applying_deltas();
+    assert_eq!(app.debuggers[&id].fonts, app.signal_fonts);
+
+    // Reopening Preferences names the chosen font from the file itself.
+    app.open_preferences();
+    assert!(matches!(
+        &app.preferences_draft.font_file,
+        Some((_, Ok(family))) if family == "Hack"
+    ));
+}
+
+#[test]
 fn the_default_password_is_saved_to_the_vault_and_cleared_from_it() {
     let dir = TestDir::new();
     let mut app = app_in(&dir);
@@ -2809,7 +2934,7 @@ fn console_windows_close_with_the_devices_they_belong_to() {
     app.open_terminal(&id);
     assert!(app.terminals.contains_key(&id));
 
-    app.remove_selected_address();
+    app.remove_devices(std::slice::from_ref(&id));
     assert!(
         !app.terminals.contains_key(&id),
         "a window outlived the device it was for"
@@ -2898,7 +3023,7 @@ fn queued_jobs_block_remove_open_quit_and_promotion_until_drained() {
     app.refresh_device(&id);
     app.refresh_device(&id);
     assert!(app.worker_pool.is_busy(&id));
-    app.remove_selected_address();
+    app.remove_devices(std::slice::from_ref(&id));
     assert_eq!(app.devices.len(), 1);
     let ctx = egui::Context::default();
     app.request_action(PendingAction::Quit, &ctx);
@@ -2913,7 +3038,7 @@ fn queued_jobs_block_remove_open_quit_and_promotion_until_drained() {
         assert!(std::time::Instant::now() < deadline);
         std::thread::yield_now();
     }
-    app.remove_selected_address();
+    app.remove_devices(std::slice::from_ref(&id));
     assert!(app.devices.is_empty());
 
     app.merge_discovered(discovered("192.0.2.2"));

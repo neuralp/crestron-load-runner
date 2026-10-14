@@ -1,6 +1,6 @@
 [package]
 name = "crestron-load-runner"
-version = "26.10.13"
+version = "26.10.14"
 edition = "2024"
 
 [dependencies]
@@ -21,6 +21,9 @@ rustls = { version = "0.23", default-features = false, features = ["std", "ring"
 russh = { version = "0.63", default-features = false, features = ["ring", "rsa", "flate2"] }
 russh-sftp = "3"
 serde = { version = "1.0.229", features = ["derive"] }
+# Validates a chosen font file before egui is given it, since egui panics on
+# one it cannot parse. The version egui itself reads fonts with, so one copy.
+skrifa = "0.44"
 serde_json = "1.0.145"
 sha2 = "0.11.0"
 socket2 = "0.6.1"

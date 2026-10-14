@@ -20,6 +20,58 @@ pub enum StartupBook {
     Specific,
 }
 
+/// How the application looks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Theme {
+    #[default]
+    Dark,
+    Light,
+}
+
+impl Theme {
+    /// Set as the context's preference, so the system's own light or dark
+    /// setting no longer chooses for it.
+    pub fn egui(self) -> eframe::egui::Theme {
+        match self {
+            Self::Dark => eframe::egui::Theme::Dark,
+            Self::Light => eframe::egui::Theme::Light,
+        }
+    }
+}
+
+/// The typeface for signal names and values in the debugger.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignalFont {
+    /// Names proportional and values monospaced.
+    #[default]
+    Default,
+    Proportional,
+    Monospace,
+    /// A TrueType or OpenType file.
+    File(PathBuf),
+}
+
+pub const SIGNAL_FONT_SIZES: std::ops::RangeInclusive<u8> = 8..=32;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DebuggerFont {
+    pub font: SignalFont,
+    /// In points.
+    pub size: u8,
+}
+
+impl Default for DebuggerFont {
+    fn default() -> Self {
+        Self {
+            font: SignalFont::Default,
+            size: 13,
+        }
+    }
+}
+
 /// The address book is a file the user names and owns; this is everything else.
 /// `deny_unknown_fields` matches the rest of this module: an older build
 /// discards a newer build's preferences rather than half-reading them.
@@ -38,6 +90,10 @@ pub struct Preferences {
     pub default_address_book: Option<PathBuf>,
     #[serde(default)]
     pub recent_address_books: Vec<PathBuf>,
+    #[serde(default)]
+    pub theme: Theme,
+    #[serde(default)]
+    pub debugger_font: DebuggerFont,
 }
 
 impl std::fmt::Debug for Preferences {
@@ -48,6 +104,8 @@ impl std::fmt::Debug for Preferences {
             .field("startup", &self.startup)
             .field("default_address_book", &self.default_address_book)
             .field("recent_address_books", &self.recent_address_books)
+            .field("theme", &self.theme)
+            .field("debugger_font", &self.debugger_font)
             .finish()
     }
 }
@@ -642,6 +700,9 @@ mod tests {
         assert_eq!(preferences.startup, StartupBook::Empty);
         assert!(preferences.default_address_book.is_none());
         assert!(preferences.recent_address_books.is_empty());
+        // Written before there was a choice of theme or font.
+        assert_eq!(preferences.theme, Theme::Dark);
+        assert_eq!(preferences.debugger_font, DebuggerFont::default());
     }
 
     #[test]
@@ -654,6 +715,11 @@ mod tests {
             startup: StartupBook::Specific,
             default_address_book: Some(dir.path().join("book.json")),
             recent_address_books: vec![dir.path().join("book.json")],
+            theme: Theme::Light,
+            debugger_font: DebuggerFont {
+                font: SignalFont::File(dir.path().join("Consolas.ttf")),
+                size: 16,
+            },
         };
 
         preferences.save_to(&path).unwrap();

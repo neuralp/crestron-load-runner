@@ -29,19 +29,27 @@ impl Panel {
             });
             ui.label(&self.title);
             ui.separator();
-            egui::ScrollArea::vertical().id_salt("signal_metadata").max_height(180.0).show(ui, |ui| {
+            // One scroll for the whole body, so a long history gets the
+            // modal's full height rather than a box of its own.
+            egui::ScrollArea::vertical()
+                .id_salt(("signal_details_body", signum))
+                .auto_shrink([false, true])
+                .max_height((ctx.content_rect().height() - 140.0).max(200.0))
+                .show(ui, |ui| {
                 egui::Grid::new("signal_detail_fields").num_columns(2).spacing([16.0, 6.0]).show(ui, |ui| {
-                    ui.strong("Signal"); ui.label(self.signal_name(signum)); ui.end_row();
+                    ui.strong("Signal"); ui.label(egui::RichText::new(self.signal_name(signum)).font(self.fonts.name.clone())); ui.end_row();
                     ui.strong("Signal ID"); ui.monospace(format!("0x{signum:08X} ({signum})")); ui.end_row();
+                    let kind = self.signals.iter().find(|signal| signal.signum() == signum).map_or(SignalKind::Unknown, Signal::kind);
+                    ui.strong("Type"); ui.label(kind.label()); ui.end_row();
                     ui.strong("Local debugging");
                     ui.label(if self.disabled_signals.contains(&signum) { "Disabled" } else if self.persistence.pending_disabled.contains(&signum) { "Disable pending initial synchronization" } else { "Enabled" }); ui.end_row();
                     ui.strong("Display format"); ui.label(match mode { ValueDisplay::Ascii => "ASCII", ValueDisplay::Hex => "Hex", ValueDisplay::Mixed => "Mixed" }); ui.end_row();
                     ui.strong("Current value");
-                    ui.monospace(self.values.get(&signum).map(|value| {
+                    ui.label(egui::RichText::new(self.values.get(&signum).map(|value| {
                         if value.is_empty() { "\"\"".into() } else { display_value(value, mode) }
-                    }).unwrap_or_else(|| "Not received".into())); ui.end_row();
+                    }).unwrap_or_else(|| "Not received".into())).font(self.fonts.value.clone())); ui.end_row();
                     if let Some(value) = self.values.get(&signum) {
-                        ui.strong("Raw value"); ui.monospace(value); ui.end_row();
+                        ui.strong("Raw value"); ui.label(egui::RichText::new(value).font(self.fonts.value.clone())); ui.end_row();
                     }
                     if let Some(sample) = history.first() {
                         ui.strong("Last recorded"); ui.label(format_received(sample.at)); ui.end_row();
@@ -57,25 +65,29 @@ impl Panel {
                     ui.monospace(signal.metadata.iter().map(|byte| format!("{byte:02X}")).collect::<Vec<_>>().join(" "));
                 }
                 ui.weak("Metadata is shown as raw signature bytes; unknown fields are not interpreted.");
+                ui.separator();
+                ui.strong(format!("Recorded history · {} updates", history.len()));
+                ui.weak("Newest first · Local receipt time · Includes buffered updates while paused");
+                ui.weak("Only retained timeline records are available; cleared or evicted records are not recoverable.");
+                ui.horizontal(|ui| { ui.add_sized([230.0, 20.0], egui::Label::new(egui::RichText::new("Received (local)").strong()).halign(egui::Align::Min)); ui.strong("Value received"); });
+                if history.is_empty() { ui.label("No recorded changes for this signal"); }
+                // Reserve every row's height but lay out only those in view;
+                // the timeline retains up to 20,000 records.
+                let row = self.fonts.row_height(24.0);
+                let (block, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), row * history.len() as f32), egui::Sense::hover());
+                let clip = ui.clip_rect();
+                let first = (((clip.top() - block.top()) / row).floor().max(0.0) as usize).min(history.len());
+                let last = (((clip.bottom() - block.top()) / row).ceil().max(0.0) as usize).min(history.len());
+                for (index, sample) in history.iter().enumerate().take(last).skip(first) {
+                    let top = block.top() + index as f32 * row;
+                    let time_rect = egui::Rect::from_min_size(egui::pos2(block.left(), top), egui::vec2(230.0, row));
+                    let value_rect = egui::Rect::from_min_max(egui::pos2(block.left() + 238.0, top), egui::pos2(block.right(), top + row));
+                    let value = if sample.value.is_empty() { "\"\"".into() } else { display_value(&sample.value, mode) };
+                    put_left(ui, time_rect, egui::RichText::new(format_received(sample.at)));
+                    put_left(ui, value_rect, egui::RichText::new(&value).font(self.fonts.value.clone()))
+                        .on_hover_text(format!("{value}\nRaw: {}", sample.value));
+                }
             });
-            ui.separator();
-            ui.strong(format!("Recorded history · {} updates", history.len()));
-            ui.weak("Newest first · Local receipt time · Includes buffered updates while paused");
-            ui.weak("Only retained timeline records are available; cleared or evicted records are not recoverable.");
-            ui.horizontal(|ui| { ui.label("Received (local)"); ui.label("Value received"); });
-            if history.is_empty() { ui.label("No recorded changes for this signal"); }
-            egui::ScrollArea::vertical().id_salt(("signal_detail_history", signum))
-                .max_height((ctx.content_rect().height() * 0.4).clamp(80.0, 400.0))
-                .show_rows(ui, 24.0, history.len(), |ui, rows| {
-                    for row in rows {
-                        let sample = history[row];
-                        let value = if sample.value.is_empty() { "\"\"".into() } else { display_value(&sample.value, mode) };
-                        ui.horizontal(|ui| {
-                            ui.add_sized([230.0, 24.0], egui::Label::new(format_received(sample.at)).halign(egui::Align::Min));
-                            ui.add(egui::Label::new(egui::RichText::new(&value).monospace()).truncate()).on_hover_text(format!("{value}\nRaw: {}", sample.value));
-                        });
-                    }
-                });
         });
         if close || response.should_close() {
             self.detail_signal = None;

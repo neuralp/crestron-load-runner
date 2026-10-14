@@ -149,26 +149,43 @@ pub enum WorkerCommand {
     OpenDebugger {
         connection: ConnectionSpec,
         slot: u8,
-        signums: Vec<u32>,
+        signals: DebugSignals,
         input: tokio::sync::mpsc::UnboundedReceiver<DebugCommand>,
         output: tokio::sync::mpsc::Sender<DebugEvent>,
     },
     Stop,
 }
 
+/// The signature's signal numbers, split so that modules' internal signals
+/// are reported by the processor only when asked for.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DebugSignals {
+    pub signals: Vec<u32>,
+    pub modules: Vec<u32>,
+    pub show_modules: bool,
+}
+
 #[derive(Debug)]
 pub enum DebugCommand {
     Stop,
+    /// Ask the processor for these signals' current values. They are
+    /// reported like any other change.
+    Sync(Vec<u32>),
+    /// Start or stop module signals being reported.
+    ShowModules(bool),
 }
 
 #[derive(Debug)]
 pub enum DebugEvent {
     Opened,
     SyncComplete,
-    Progress {
-        processed: usize,
-        total: usize,
-        already_on: usize,
+    /// How the processor is reporting, sent at startup and whenever it changes.
+    Monitoring {
+        /// Global debugging was already on, so every signal reports and
+        /// module signals can only be hidden, not stopped.
+        global: bool,
+        /// Signals whose changes the processor reports.
+        reporting: usize,
     },
     Output {
         bytes: Vec<u8>,
@@ -302,7 +319,7 @@ impl WorkerPool {
         id: &str,
         connection: ConnectionSpec,
         slot: u8,
-        signums: Vec<u32>,
+        signals: DebugSignals,
         input: tokio::sync::mpsc::UnboundedReceiver<DebugCommand>,
         output: tokio::sync::mpsc::Sender<DebugEvent>,
     ) -> Result<(), String> {
@@ -312,7 +329,7 @@ impl WorkerPool {
                 .send(WorkerCommand::OpenDebugger {
                     connection,
                     slot,
-                    signums,
+                    signals,
                     input,
                     output,
                 })
@@ -439,7 +456,7 @@ async fn worker_loop(
                     end_console(&mut console, None).await;
                     open_console(&device, &mut console, connection, input, output, &events).await;
                 }
-                Some(WorkerCommand::OpenDebugger { connection, slot, signums, input, output }) => {
+                Some(WorkerCommand::OpenDebugger { connection, slot, signals, input, output }) => {
                     if debugger.as_ref().is_some_and(|task| !task.is_finished()) {
                         let _ = output.try_send(DebugEvent::Closed("A debugger session is already active".into()));
                     } else {
@@ -447,7 +464,7 @@ async fn worker_loop(
                         let (cancel, cancelled) = tokio::sync::watch::channel(false);
                         debugger_cancel = Some(cancel);
                         debugger = Some(tokio::spawn(async move {
-                            debugger::session(connection, debugger::Target { slot, signums }, input, output, shared, reporter, cancelled).await;
+                            debugger::session(connection, debugger::Target { slot, signals }, input, output, shared, reporter, cancelled).await;
                         }));
                     }
                 }

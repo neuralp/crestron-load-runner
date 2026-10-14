@@ -29,7 +29,9 @@ impl LoadRunnerApp {
                 panel.stop();
             }
         }
+        let fonts = self.signal_fonts.clone();
         for panel in self.debuggers.values_mut() {
+            panel.fonts = fonts.clone();
             if panel.open {
                 panel.show(ctx);
             } else {
@@ -64,20 +66,20 @@ impl LoadRunnerApp {
                     (
                         id.clone(),
                         panel.slot,
-                        crate::debugger::debug_signums(&panel.signals),
+                        crate::debugger::debug_signals(&panel.signals, panel.show_modules()),
                         session,
                     )
                 })
             })
             .collect();
-        for (id, slot, signums, (input, output)) in waiting {
+        for (id, slot, signals, (input, output)) in waiting {
             if let Some(panel) = self.debuggers.get_mut(&id) {
                 panel.session_sent = true;
             }
             if let Some(connection) = self.connection_spec(&id) {
                 if let Err(error) = self
                     .worker_pool
-                    .open_debugger(&id, connection, slot, signums, input, output)
+                    .open_debugger(&id, connection, slot, signals, input, output)
                 {
                     self.notice = Some(error);
                 }

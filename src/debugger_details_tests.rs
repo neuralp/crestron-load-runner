@@ -160,3 +160,88 @@ fn detail_history_ignores_watch_filter_and_includes_paused_records() {
     panel.reset_signals();
     assert_eq!(panel.detail_signal, None);
 }
+
+#[test]
+fn long_history_scrolls_with_the_whole_details_body() {
+    let ctx = egui::Context::default();
+    let mut panel = Panel::new("processor".into(), "Processor");
+    panel.signals = vec![Signal {
+        name: "Busy".into(),
+        metadata: [1, 0, 0, 0, 0, 1],
+    }];
+    let mut frame = b"\x01".to_vec();
+    for n in 0..500 {
+        frame.extend_from_slice(format!("00000001:1=value-{n:03}\r\n").as_bytes());
+    }
+    frame.push(3);
+    panel.ingest(&frame, SystemTime::now());
+    panel.detail_signal = Some(1);
+    let mut time = 0.0;
+    let mut render = |panel: &mut Panel, events| {
+        time += 0.03;
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1600.0, 1000.0),
+                )),
+                time: Some(time),
+                events,
+                ..Default::default()
+            },
+            |ui| panel.contents(ui),
+        );
+        output.textures_delta.clear();
+        output
+    };
+    let texts = |output: &egui::FullOutput| -> Vec<(String, egui::Pos2)> {
+        output
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) => Some((t.galley.text().to_owned(), t.pos)),
+                _ => None,
+            })
+            .collect()
+    };
+    for _ in 0..3 {
+        render(&mut panel, vec![]).drop_without_applying_deltas();
+    }
+    let output = render(&mut panel, vec![]);
+    let shown = texts(&output);
+    let heading = shown
+        .iter()
+        .find(|(text, _)| text == "Signal ID")
+        .expect("details body visible")
+        .1;
+    // The modal's height goes to the history: far more than the old
+    // fixed box of roughly a dozen rows, yet only the rows in view are drawn.
+    let rows = shown
+        .iter()
+        .filter(|(text, _)| text.starts_with("value-"))
+        .count();
+    assert!(rows > 20, "{rows} history rows visible");
+    assert!(rows < 100, "{rows} history rows laid out");
+    assert!(shown.iter().any(|(text, _)| text == "value-499"));
+    assert!(!shown.iter().any(|(text, _)| text == "value-000"));
+
+    // Scrolling anywhere in the body moves the fields and history together.
+    for _ in 0..40 {
+        render(
+            &mut panel,
+            vec![
+                egui::Event::PointerMoved(heading),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -2000.0),
+                    modifiers: egui::Modifiers::NONE,
+                    phase: egui::TouchPhase::Move,
+                },
+            ],
+        )
+        .drop_without_applying_deltas();
+    }
+    let shown = texts(&render(&mut panel, vec![]));
+    assert!(shown.iter().any(|(text, _)| text == "value-000"));
+    assert!(!shown.iter().any(|(text, _)| text == "Signal ID"));
+}

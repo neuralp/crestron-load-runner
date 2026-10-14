@@ -436,26 +436,39 @@ fn input() -> egui::RawInput {
     }
 }
 
-fn click_bar(app: &mut LoadRunnerApp, ctx: &egui::Context, label: &str) {
+type Area = fn(&mut LoadRunnerApp, &mut egui::Ui);
+
+/// Every label `area` draws, with where it is.
+fn labels(app: &mut LoadRunnerApp, ctx: &egui::Context, area: Area) -> Vec<(String, egui::Pos2)> {
     for _ in 0..3 {
-        ctx.run_ui(input(), |ui| app.action_bar(ui))
+        ctx.run_ui(input(), |ui| area(app, ui))
             .drop_without_applying_deltas();
     }
-    let output = ctx.run_ui(input(), |ui| app.action_bar(ui));
-    let position = output
+    let output = ctx.run_ui(input(), |ui| area(app, ui));
+    let labels = output
         .shapes
         .iter()
-        .find_map(|shape| {
-            if let egui::Shape::Text(text) = &shape.shape
-                && text.galley.text() == label
-            {
-                Some(text.pos + text.galley.size() * 0.5)
-            } else {
-                None
-            }
+        .filter_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) => Some((
+                text.galley.text().to_owned(),
+                text.pos + text.galley.size() * 0.5,
+            )),
+            _ => None,
         })
-        .expect("button label");
+        .collect();
     output.drop_without_applying_deltas();
+    labels
+}
+
+fn shows(app: &mut LoadRunnerApp, ctx: &egui::Context, area: Area, label: &str) -> bool {
+    labels(app, ctx, area).iter().any(|(text, _)| text == label)
+}
+
+fn click(app: &mut LoadRunnerApp, ctx: &egui::Context, area: Area, label: &str) {
+    let position = labels(app, ctx, area)
+        .into_iter()
+        .find_map(|(text, position)| (text == label).then_some(position))
+        .unwrap_or_else(|| panic!("no {label} button"));
     for pressed in [true, false] {
         let mut raw = input();
         raw.events.push(egui::Event::PointerMoved(position));
@@ -465,22 +478,64 @@ fn click_bar(app: &mut LoadRunnerApp, ctx: &egui::Context, label: &str) {
             pressed,
             modifiers: egui::Modifiers::NONE,
         });
-        ctx.run_ui(raw, |ui| app.action_bar(ui))
+        ctx.run_ui(raw, |ui| area(app, ui))
             .drop_without_applying_deltas();
     }
 }
 
 #[test]
-fn toolbar_button_is_gated_and_opens_the_assignment_window() {
+fn processor_details_open_ipids_and_the_debugger_in_place_of_the_toolbar() {
     let mut app = app();
     let ctx = egui::Context::default();
+    let bar = labels(&mut app, &ctx, LoadRunnerApp::action_bar);
+    assert!(
+        !bar.iter()
+            .any(|(text, _)| text.starts_with("Assign IPIDs") || text.starts_with("Debug Signals")),
+        "{bar:?}"
+    );
+
+    // The details act on the device shown, whatever the target checkboxes say.
     for device in &mut app.devices {
         device.selected = false;
     }
-    click_bar(&mut app, &ctx, "Assign IPIDs");
-    assert!(app.ipid_assignment.is_none());
-    app.device_mut("192.0.2.10:22").unwrap().selected = true;
-    click_bar(&mut app, &ctx, "Assign IPIDs");
+    let id = "192.0.2.10:22".to_owned();
+    app.selected_id = Some(id.clone());
+    let details = LoadRunnerApp::details_panel;
+    let shown = labels(&mut app, &ctx, details);
+    let position = |label: &str| {
+        shown
+            .iter()
+            .find(|(text, _)| text == label)
+            .map(|(_, at)| *at)
+    };
+    let log = position("Device log…").expect("device log button");
+    for label in ["Assign IPIDs…", "Debug Signals…"] {
+        let at = position(label).unwrap_or_else(|| panic!("no {label} button"));
+        assert!(
+            (at.y - log.y).abs() < 1.0 && at.x > log.x,
+            "{label} beside Device log…"
+        );
+    }
+    assert!(
+        position("Remove").is_none(),
+        "removing is on the right-click menu"
+    );
+    click(&mut app, &ctx, details, "Assign IPIDs…");
     assert!(app.ipid_assignment.is_some());
+    click(&mut app, &ctx, details, "Debug Signals…");
+    assert!(app.debuggers.contains_key(&id));
+    assert!(app.devices.iter().all(|device| !device.selected));
     assert!(!app.worker_pool.has_pending());
+
+    // Only processors have them; a touchpanel's details do not.
+    app.devices.push(Device::from_address(&AddressEntry {
+        host: "192.0.2.30".into(),
+        kind: DeviceKind::Touchpanel,
+        model: "TSW-1070".into(),
+        ..Default::default()
+    }));
+    app.selected_id = Some("192.0.2.30:22".into());
+    assert!(shows(&mut app, &ctx, details, "Device log…"));
+    assert!(!shows(&mut app, &ctx, details, "Assign IPIDs…"));
+    assert!(!shows(&mut app, &ctx, details, "Debug Signals…"));
 }

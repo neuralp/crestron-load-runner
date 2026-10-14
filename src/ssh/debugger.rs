@@ -1,11 +1,12 @@
 //! Read the uploaded signature and control signal-specific console debugging.
 use super::*;
+use std::collections::HashSet;
 
 const MAX_SIGNATURE: usize = 16 * 1024 * 1024;
 
 pub(super) struct Target {
     pub slot: u8,
-    pub signums: Vec<u32>,
+    pub signals: DebugSignals,
 }
 
 pub(super) async fn read_signature(
@@ -71,6 +72,84 @@ fn command(slot: u8, verb: &str) -> String {
     format!("MDBGSIGNAL:{slot} -A:{verb}\r")
 }
 
+/// A processor accepted 120 signal numbers (740 characters) on one line and
+/// rejected 160 (980 characters), so lines stay well inside both.
+const MAX_SIGNAL_TERMS: usize = 100;
+const MAX_SIGNAL_LINE: usize = 600;
+
+/// Listing every flag of a large program takes the console several seconds.
+const FLAG_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// `MDBGSIGNAL -S:<verb>` lines naming exactly these signals. Consecutive
+/// numbers become `first:last` ranges, and long lists are split across lines.
+fn signal_commands(slot: u8, verb: &str, signums: &[u32]) -> Vec<String> {
+    let mut sorted = signums.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut terms = Vec::new();
+    let mut rest = sorted.as_slice();
+    while let [first, ..] = rest {
+        let run = 1 + rest
+            .windows(2)
+            .take_while(|pair| pair[0].checked_add(1) == Some(pair[1]))
+            .count();
+        let last = rest[run - 1];
+        terms.push(if run == 1 {
+            format!("0x{first:X}")
+        } else {
+            format!("0x{first:X}:0x{last:X}")
+        });
+        rest = &rest[run..];
+    }
+    let prefix = format!("MDBGSIGNAL:{slot} -S:{verb}");
+    let mut commands = Vec::new();
+    let mut line = prefix.clone();
+    let mut count = 0;
+    for term in terms {
+        if count == MAX_SIGNAL_TERMS || (count > 0 && line.len() + 1 + term.len() > MAX_SIGNAL_LINE)
+        {
+            commands.push(format!("{line}\r"));
+            line = prefix.clone();
+            count = 0;
+        }
+        line.push(' ');
+        line.push_str(&term);
+        count += 1;
+    }
+    if count > 0 {
+        commands.push(format!("{line}\r"));
+    }
+    commands
+}
+
+/// Requests that arrive while the console is busy, applied once it is free.
+#[derive(Default)]
+struct Pending {
+    sync: Vec<u32>,
+    show_modules: Option<bool>,
+}
+
+impl Pending {
+    /// Keep a request for later; false for Stop or the window going away.
+    fn keep(&mut self, command: Option<DebugCommand>) -> bool {
+        match command {
+            Some(DebugCommand::Sync(signums)) => self.sync.extend(signums),
+            Some(DebugCommand::ShowModules(show)) => self.show_modules = Some(show),
+            None | Some(DebugCommand::Stop) => return false,
+        }
+        true
+    }
+}
+
+/// Wait for Stop or for the window to go away, keeping other requests that
+/// arrive meanwhile.
+async fn stopped(
+    input: &mut tokio::sync::mpsc::UnboundedReceiver<DebugCommand>,
+    pending: &mut Pending,
+) {
+    while pending.keep(input.recv().await) {}
+}
+
 async fn send(channel: &russh::Channel<client::Msg>, text: &str) -> Result<(), String> {
     channel
         .data(text.as_bytes())
@@ -78,16 +157,25 @@ async fn send(channel: &russh::Channel<client::Msg>, text: &str) -> Result<(), S
         .map_err(|e| format!("Debugger console write failed: {e}"))
 }
 
-/// Read the slot's global flag without changing per-signal flags.
-async fn show(
+async fn send_all(channel: &russh::Channel<client::Msg>, lines: &[String]) -> Result<(), String> {
+    for line in lines {
+        send(channel, line).await?;
+    }
+    Ok(())
+}
+
+/// Read the console until the global flag's status arrives, handing every
+/// other line outside a value report to `line`. What arrives is forwarded to
+/// `output`, so value reports received meanwhile are kept.
+async fn until_global(
     channel: &mut russh::Channel<client::Msg>,
-    slot: u8,
     output: Option<&tokio::sync::mpsc::Sender<DebugEvent>>,
+    timeout: Duration,
+    mut line: impl FnMut(&str),
 ) -> Result<bool, String> {
-    send(channel, &command(slot, "SHOW")).await?;
-    let prefix = "GLOBAL:";
-    let answer = tokio::time::timeout(SSH_TIMEOUT, async {
-        let mut received = Vec::new();
+    const PREFIX: &str = "GLOBAL:";
+    tokio::time::timeout(timeout, async {
+        let mut text = Vec::new();
         let mut in_frame = false;
         loop {
             match channel.wait().await {
@@ -106,37 +194,73 @@ async fn show(
                         match byte {
                             1 => in_frame = true,
                             3 => in_frame = false,
-                            _ if !in_frame => received.push(byte),
+                            _ if in_frame => {}
+                            b'\r' | b'\n' => {
+                                let current = String::from_utf8_lossy(&text);
+                                if let Some(position) = current.find(PREFIX) {
+                                    let value = &current[position + PREFIX.len()..];
+                                    if value.starts_with("ON") {
+                                        return Ok(true);
+                                    }
+                                    if value.starts_with("OFF") {
+                                        return Ok(false);
+                                    }
+                                }
+                                line(&current);
+                                text.clear();
+                            }
+                            // No console line is this long; never grow unbounded.
+                            _ if text.len() < 4096 => text.push(byte),
                             _ => {}
-                        }
-                    }
-                    if received.len() > 16 * 1024 {
-                        // Reports can arrive while asking for status. Keep the
-                        // newest bytes (including a reply split across reads),
-                        // without accumulating an unbounded high-rate stream.
-                        received.drain(..received.len() - 16 * 1024);
-                    }
-                    let text = String::from_utf8_lossy(&received);
-                    if let Some(position) = text.find(prefix) {
-                        let value = &text[position + prefix.len()..];
-                        if value.starts_with("ON") {
-                            return Ok(true);
-                        }
-                        if value.starts_with("OFF") {
-                            return Ok(false);
                         }
                     }
                 }
                 Some(ChannelMsg::Eof | ChannelMsg::Close) | None => {
-                    return Err::<bool, String>("Debugger console closed".into());
+                    return Err("Debugger console closed".to_owned());
                 }
                 Some(_) => {}
             }
         }
     })
     .await
-    .map_err(|_| "Timed out asking for signal status".to_owned())??;
-    Ok(answer)
+    .map_err(|_| "Timed out waiting for the processor's debug status".to_owned())?
+}
+
+/// Read the slot's global flag without changing any flags.
+async fn show(
+    channel: &mut russh::Channel<client::Msg>,
+    slot: u8,
+    output: Option<&tokio::sync::mpsc::Sender<DebugEvent>>,
+) -> Result<bool, String> {
+    send(channel, &command(slot, "SHOW")).await?;
+    until_global(channel, output, SSH_TIMEOUT, |_| {}).await
+}
+
+/// Which of `signums` have their signal-specific debug flag on. A global
+/// status request after the listing marks its end.
+async fn flags_on(
+    channel: &mut russh::Channel<client::Msg>,
+    slot: u8,
+    signums: &[u32],
+    output: Option<&tokio::sync::mpsc::Sender<DebugEvent>>,
+) -> Result<HashSet<u32>, String> {
+    let mut on = HashSet::new();
+    if signums.is_empty() {
+        return Ok(on);
+    }
+    send_all(channel, &signal_commands(slot, "SHOW", signums)).await?;
+    send(channel, &command(slot, "SHOW")).await?;
+    // Lines look like `00000020:DEBUG=ON:IGNORE=OFF`, the first after a prompt.
+    until_global(channel, output, FLAG_TIMEOUT, |line| {
+        if let Some(end) = line.find(":DEBUG=ON")
+            && let Some(number) = end.checked_sub(8).and_then(|start| line.get(start..end))
+            && let Ok(signum) = u32::from_str_radix(number, 16)
+        {
+            on.insert(signum);
+        }
+    })
+    .await?;
+    Ok(on)
 }
 
 pub(super) async fn session(
@@ -166,44 +290,112 @@ pub(super) async fn session(
             return;
         }
     };
-    let Target { slot, signums } = target;
-    let mut owned = false;
-    let total = signums.len();
+    let Target {
+        slot,
+        signals:
+            DebugSignals {
+                signals,
+                modules,
+                mut show_modules,
+            },
+    } = target;
+    // With global debugging already on every signal reports and nothing is
+    // changed. Otherwise only the wanted signals' own flags are turned on,
+    // which leaves module signals unreported until they are asked for.
+    let mut global = false;
+    // Flags found on, which belong to someone else and are left alone.
+    let mut preexisting = HashSet::new();
+    // Flags this session turned on, and so turns off again.
+    let mut enabled = HashSet::new();
+    let mut pending = Pending::default();
     let result = async {
         channel.request_pty(true, "xterm", 80, 24, 0, 0, &[]).await.map_err(|e| e.to_string())?;
         channel.request_shell(true).await.map_err(|e| e.to_string())?;
         let _ = output.try_send(DebugEvent::Opened);
-        if *cancelled.borrow() || input.try_recv().is_ok() || input.is_closed() {
+        if *cancelled.borrow() {
             return Ok(());
         }
-        let already_on = show(&mut channel, slot, Some(&output)).await?;
-        if !already_on {
-            owned = true;
-            send(&channel, &command(slot, "ON")).await?;
-            if !show(&mut channel, slot, Some(&output)).await? {
-                return Err("Processor did not enable global debugging".into());
+        loop {
+            match input.try_recv() {
+                Ok(command) => {
+                    if !pending.keep(Some(command)) {
+                        return Ok(());
+                    }
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return Ok(()),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
             }
         }
+        if let Some(show) = pending.show_modules.take() {
+            show_modules = show;
+        }
+        global = show(&mut channel, slot, Some(&output)).await?;
+        if !global {
+            let all: Vec<u32> = signals.iter().chain(&modules).copied().collect();
+            preexisting = flags_on(&mut channel, slot, &all, Some(&output)).await?;
+            let wanted: Vec<u32> = signals
+                .iter()
+                .chain(modules.iter().filter(|_| show_modules))
+                .filter(|signum| !preexisting.contains(signum))
+                .copied()
+                .collect();
+            send_all(&channel, &signal_commands(slot, "ON", &wanted)).await?;
+            enabled.extend(wanted);
+        }
+        let reporting = |show_modules: bool, preexisting: &HashSet<u32>| {
+            if global {
+                signals.len() + modules.len()
+            } else {
+                signals.len()
+                    + modules
+                        .iter()
+                        .filter(|signum| show_modules || preexisting.contains(signum))
+                        .count()
+            }
+        };
         // A command response after SYNC fences the snapshot. Signature entries
         // (e.g. module/internal signals) need not all produce value reports.
         send(&channel, &command(slot, "SYNC")).await?;
-        output.try_send(DebugEvent::Progress { processed: total, total, already_on: if already_on { total } else { 0 } }).map_err(|_| "Debugger output queue full or disconnected".to_owned())?;
+        output
+            .try_send(DebugEvent::Monitoring { global, reporting: reporting(show_modules, &preexisting) })
+            .map_err(|_| "Debugger output queue full or disconnected".to_owned())?;
         tokio::select! {
             _ = cancelled.changed() => return Ok(()),
-            _ = input.recv() => return Ok(()),
+            _ = stopped(&mut input, &mut pending) => return Ok(()),
             result = async {
-                if !show(&mut channel, slot, Some(&output)).await? {
-                    return Err("Global debugging stopped during initial synchronization".to_owned());
-                }
+                show(&mut channel, slot, Some(&output)).await?;
                 output.send(DebugEvent::SyncComplete).await.map_err(|_| "Debugger output receiver disconnected".to_owned())
             } => result?,
         }
         loop {
+            if let Some(show) = pending.show_modules.take()
+                && show != show_modules
+            {
+                show_modules = show;
+                if !global {
+                    if show {
+                        let on: Vec<u32> = modules
+                            .iter()
+                            .filter(|signum| !preexisting.contains(signum) && !enabled.contains(signum))
+                            .copied()
+                            .collect();
+                        send_all(&channel, &signal_commands(slot, "ON", &on)).await?;
+                        enabled.extend(on);
+                    } else {
+                        let off: Vec<u32> = modules.iter().filter(|signum| enabled.contains(signum)).copied().collect();
+                        send_all(&channel, &signal_commands(slot, "OFF", &off)).await?;
+                        for signum in off {
+                            enabled.remove(&signum);
+                        }
+                    }
+                }
+                let _ = output.try_send(DebugEvent::Monitoring { global, reporting: reporting(show_modules, &preexisting) });
+            }
+            // Replies arrive as ordinary value reports on this channel.
+            send_all(&channel, &signal_commands(slot, "SYNC", &std::mem::take(&mut pending.sync))).await?;
             tokio::select! {
                 _ = cancelled.changed() => break,
-                action = input.recv() => match action {
-                    None | Some(DebugCommand::Stop) => break,
-                },
+                action = input.recv() => if !pending.keep(action) { break },
                 message = channel.wait() => match message {
                     Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => {
                         let event = DebugEvent::Output {
@@ -212,7 +404,7 @@ pub(super) async fn session(
                         };
                         tokio::select! {
                             _ = cancelled.changed() => break,
-                            _ = input.recv() => break,
+                            _ = stopped(&mut input, &mut pending) => break,
                             result = output.send(event) => if result.is_err() { break; },
                         }
                     }
@@ -225,18 +417,20 @@ pub(super) async fn session(
         Ok(())
     }.await;
     let mut failure = result.err();
-    if owned {
+    if !enabled.is_empty() {
         let cleanup = async {
-            send(&channel, &command(slot, "OFF")).await?;
-            if show(&mut channel, slot, None).await? {
-                return Err("Global debugging remains ON".to_owned());
+            let enabled: Vec<u32> = enabled.iter().copied().collect();
+            send_all(&channel, &signal_commands(slot, "OFF", &enabled)).await?;
+            let remaining = flags_on(&mut channel, slot, &enabled, None).await?;
+            if !remaining.is_empty() {
+                return Err(format!("{} signals remain in debug mode", remaining.len()));
             }
             Ok::<(), String>(())
         }
         .await;
         if let Err(error) = cleanup {
             failure = Some(format!(
-                "{}; global debug cleanup was not confirmed: {error}",
+                "{}; signal debug cleanup was not confirmed: {error}",
                 failure.unwrap_or_else(|| "Debugger stopped".into())
             ));
         }
@@ -252,6 +446,7 @@ pub(super) async fn session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn debugger_commands_are_scoped_to_slot_and_cr_terminated() {
@@ -262,109 +457,397 @@ mod tests {
     }
 
     #[test]
-    fn global_startup_and_cleanup_are_constant_command_count() {
-        global_session(false, 5975);
+    fn signal_commands_name_only_the_requested_signals_in_bounded_lines() {
+        assert_eq!(
+            signal_commands(2, "SYNC", &[0x14, 0x10, 0x11, 0x12, 0x12, 0x20]),
+            ["MDBGSIGNAL:2 -S:SYNC 0x10:0x12 0x14 0x20\r"]
+        );
+        assert_eq!(signal_commands(1, "ON", &[7]), ["MDBGSIGNAL:1 -S:ON 0x7\r"]);
+        assert!(signal_commands(1, "OFF", &[]).is_empty());
+        assert_eq!(
+            signal_commands(1, "SHOW", &[u32::MAX - 1, u32::MAX]),
+            ["MDBGSIGNAL:1 -S:SHOW 0xFFFFFFFE:0xFFFFFFFF\r"]
+        );
+
+        // Every other number, so nothing merges into a range.
+        let scattered: Vec<u32> = (0..1_000).map(|n| 0x1000 + n * 2).collect();
+        let lines = signal_commands(3, "SYNC", &scattered);
+        let mut named = Vec::new();
+        for line in &lines {
+            assert!(
+                line.len() <= MAX_SIGNAL_LINE + 1,
+                "{} characters",
+                line.len()
+            );
+            let terms: Vec<_> = line
+                .strip_prefix("MDBGSIGNAL:3 -S:SYNC ")
+                .and_then(|rest| rest.strip_suffix('\r'))
+                .unwrap()
+                .split(' ')
+                .collect();
+            assert!(terms.len() <= MAX_SIGNAL_TERMS);
+            named.extend(
+                terms
+                    .iter()
+                    .map(|term| u32::from_str_radix(term.trim_start_matches("0x"), 16).unwrap()),
+            );
+        }
+        assert_eq!(named, scattered);
+        // A whole contiguous block is one short line however many it covers.
+        let block: Vec<u32> = (0x20..0x7000).collect();
+        assert_eq!(
+            signal_commands(1, "SYNC", &block),
+            ["MDBGSIGNAL:1 -S:SYNC 0x20:0x6FFF\r"]
+        );
+    }
+
+    const SIGNALS: u32 = 5975;
+    const MODULE: u32 = 0x9000;
+
+    fn signals(show_modules: bool) -> DebugSignals {
+        DebugSignals {
+            signals: (0..SIGNALS).collect(),
+            modules: (MODULE..MODULE + 0x100).collect(),
+            show_modules,
+        }
+    }
+
+    fn set(signums: impl IntoIterator<Item = u32>) -> HashSet<u32> {
+        signums.into_iter().collect()
+    }
+
+    /// What the simulated console holds.
+    #[derive(Default)]
+    struct State {
+        global: bool,
+        flags: HashSet<u32>,
+        commands: Vec<String>,
+        /// Ignore `-S:OFF`, as a console that lost the request would.
+        stuck: bool,
+    }
+
+    struct Scenario {
+        global: bool,
+        preexisting: HashSet<u32>,
+        signals: DebugSignals,
+        /// Ask for signals before the session opens, which must wait for the
+        /// initial synchronization rather than be taken as Stop, and again
+        /// while monitoring.
+        sync: bool,
+        /// Ticks and unticks of Show module signals while monitoring.
+        toggles: Vec<bool>,
+        stuck: bool,
+    }
+
+    impl Default for Scenario {
+        fn default() -> Self {
+            Self {
+                global: false,
+                preexisting: HashSet::new(),
+                signals: signals(false),
+                sync: false,
+                toggles: Vec::new(),
+                stuck: false,
+            }
+        }
+    }
+
+    struct Outcome {
+        /// Flags on once the initial synchronization completed.
+        monitoring: HashSet<u32>,
+        /// Flags on after each toggle.
+        toggled: Vec<HashSet<u32>>,
+        reports: Vec<(bool, usize)>,
+        closed: String,
+        state: State,
+    }
+
+    fn label(command: &str) -> String {
+        command.trim_end_matches('\r').to_owned()
     }
 
     #[test]
-    fn preexisting_global_debug_is_not_disabled() {
-        global_session(true, 5975);
+    fn only_non_module_signals_are_turned_on_and_exactly_those_turned_off() {
+        let outcome = run(Scenario {
+            preexisting: set([5, MODULE + 5]),
+            ..Default::default()
+        });
+        assert_eq!(outcome.closed, "");
+        assert_eq!(outcome.monitoring, set((0..SIGNALS).chain([MODULE + 5])));
+        // Flags someone else set stay; global debugging is never touched.
+        assert_eq!(outcome.state.flags, set([5, MODULE + 5]));
+        assert!(!outcome.state.global);
+        assert_eq!(outcome.reports, [(false, SIGNALS as usize + 1)]);
+        let commands: Vec<_> = outcome.state.commands.iter().map(|c| label(c)).collect();
+        assert_eq!(
+            commands,
+            [
+                "MDBGSIGNAL:1 -A:SHOW",
+                "MDBGSIGNAL:1 -S:SHOW 0x0:0x1756 0x9000:0x90FF",
+                "MDBGSIGNAL:1 -A:SHOW",
+                "MDBGSIGNAL:1 -S:ON 0x0:0x4 0x6:0x1756",
+                "MDBGSIGNAL:1 -A:SYNC",
+                "MDBGSIGNAL:1 -A:SHOW",
+                "MDBGSIGNAL:1 -S:OFF 0x0:0x4 0x6:0x1756",
+                "MDBGSIGNAL:1 -S:SHOW 0x0:0x4 0x6:0x1756",
+                "MDBGSIGNAL:1 -A:SHOW",
+            ]
+        );
+    }
+
+    #[test]
+    fn module_signals_are_reported_only_while_shown() {
+        let outcome = run(Scenario {
+            preexisting: set([MODULE + 5]),
+            toggles: vec![true, false],
+            ..Default::default()
+        });
+        assert_eq!(outcome.closed, "");
+        let plain = set((0..SIGNALS).chain([MODULE + 5]));
+        assert_eq!(outcome.monitoring, plain);
+        assert_eq!(
+            outcome.toggled[0],
+            set((0..SIGNALS).chain(MODULE..MODULE + 0x100))
+        );
+        // Unticking turns off only what ticking turned on.
+        assert_eq!(outcome.toggled[1], plain);
+        assert_eq!(outcome.state.flags, set([MODULE + 5]));
+        assert_eq!(
+            outcome.reports,
+            [
+                (false, SIGNALS as usize + 1),
+                (false, SIGNALS as usize + 0x100),
+                (false, SIGNALS as usize + 1)
+            ]
+        );
+    }
+
+    #[test]
+    fn module_signals_shown_from_the_start_are_turned_on_and_off() {
+        let outcome = run(Scenario {
+            signals: signals(true),
+            ..Default::default()
+        });
+        assert_eq!(outcome.closed, "");
+        assert_eq!(
+            outcome.monitoring,
+            set((0..SIGNALS).chain(MODULE..MODULE + 0x100))
+        );
+        assert!(outcome.state.flags.is_empty());
+    }
+
+    #[test]
+    fn preexisting_global_debug_changes_no_flags() {
+        let outcome = run(Scenario {
+            global: true,
+            preexisting: set([7]),
+            toggles: vec![true, false],
+            ..Default::default()
+        });
+        assert_eq!(outcome.closed, "");
+        assert!(outcome.state.global);
+        assert_eq!(outcome.state.flags, set([7]));
+        let total = SIGNALS as usize + 0x100;
+        assert_eq!(
+            outcome.reports,
+            [(true, total), (true, total), (true, total)]
+        );
+        let commands: Vec<_> = outcome.state.commands.iter().map(|c| label(c)).collect();
+        assert_eq!(
+            commands,
+            [
+                "MDBGSIGNAL:1 -A:SHOW",
+                "MDBGSIGNAL:1 -A:SYNC",
+                "MDBGSIGNAL:1 -A:SHOW"
+            ]
+        );
+    }
+
+    #[test]
+    fn requested_signals_are_synchronized_without_stopping_the_session() {
+        for global in [false, true] {
+            let outcome = run(Scenario {
+                global,
+                sync: true,
+                ..Default::default()
+            });
+            assert_eq!(outcome.closed, "");
+            let commands: Vec<_> = outcome.state.commands.iter().map(|c| label(c)).collect();
+            let syncs: Vec<_> = commands
+                .iter()
+                .filter(|command| command.contains("-S:SYNC"))
+                .collect();
+            assert_eq!(
+                syncs,
+                [
+                    "MDBGSIGNAL:1 -S:SYNC 0x9000:0x9001",
+                    "MDBGSIGNAL:1 -S:SYNC 0x9002 0x9010"
+                ]
+            );
+            // Both after the initial synchronization's closing status request.
+            let fence = commands
+                .iter()
+                .position(|command| command.ends_with("-A:SYNC"))
+                .unwrap()
+                + 1;
+            assert!(commands[fence].ends_with("-A:SHOW"));
+            assert!(commands[fence + 1].contains("-S:SYNC"));
+        }
     }
 
     #[test]
     fn initial_sync_completes_when_signature_entries_do_not_report_values() {
-        global_session(false, 6000);
+        let outcome = run(Scenario {
+            signals: DebugSignals {
+                signals: (0..6000).collect(),
+                ..signals(false)
+            },
+            ..Default::default()
+        });
+        assert_eq!(outcome.closed, "");
+        assert!(outcome.state.flags.is_empty());
     }
 
-    fn global_session(initially_on: bool, signature_count: u32) {
-        use std::sync::{Arc, Mutex};
+    #[test]
+    fn flags_left_on_are_reported_as_unconfirmed_cleanup() {
+        let outcome = run(Scenario {
+            stuck: true,
+            ..Default::default()
+        });
+        assert!(
+            outcome
+                .closed
+                .contains(&format!("{SIGNALS} signals remain in debug mode")),
+            "{}",
+            outcome.closed
+        );
+    }
 
-        #[derive(Clone)]
-        struct Console {
-            commands: Arc<Mutex<Vec<String>>>,
-            enabled: bool,
+    fn signums(terms: &str) -> Vec<u32> {
+        let number = |text: &str| u32::from_str_radix(text.trim_start_matches("0x"), 16).unwrap();
+        terms
+            .split(' ')
+            .flat_map(|term| {
+                let (first, last) = term.split_once(':').unwrap_or((term, term));
+                number(first)..=number(last)
+            })
+            .collect()
+    }
+
+    #[derive(Clone)]
+    struct Console(Arc<Mutex<State>>);
+
+    impl russh::server::Handler for Console {
+        type Error = russh::Error;
+
+        async fn auth_password(
+            &mut self,
+            _: &str,
+            _: &str,
+        ) -> Result<russh::server::Auth, Self::Error> {
+            Ok(russh::server::Auth::Accept)
         }
-        impl russh::server::Handler for Console {
-            type Error = russh::Error;
-
-            async fn auth_password(
-                &mut self,
-                _: &str,
-                _: &str,
-            ) -> Result<russh::server::Auth, Self::Error> {
-                Ok(russh::server::Auth::Accept)
-            }
-            async fn channel_open_session(
-                &mut self,
-                _: russh::Channel<russh::server::Msg>,
-                reply: russh::server::ChannelOpenHandle,
-                _: &mut russh::server::Session,
-            ) -> Result<(), Self::Error> {
-                reply.accept().await;
-                Ok(())
-            }
-            async fn pty_request(
-                &mut self,
-                id: russh::ChannelId,
-                _: &str,
-                _: u32,
-                _: u32,
-                _: u32,
-                _: u32,
-                _: &[(russh::Pty, u32)],
-                session: &mut russh::server::Session,
-            ) -> Result<(), Self::Error> {
-                session.channel_success(id)?;
-                Ok(())
-            }
-            async fn shell_request(
-                &mut self,
-                id: russh::ChannelId,
-                session: &mut russh::server::Session,
-            ) -> Result<(), Self::Error> {
-                session.channel_success(id)?;
-                Ok(())
-            }
-            async fn data(
-                &mut self,
-                id: russh::ChannelId,
-                data: &[u8],
-                session: &mut russh::server::Session,
-            ) -> Result<(), Self::Error> {
-                let command = String::from_utf8_lossy(data).into_owned();
-                self.commands.lock().unwrap().push(command.clone());
-                let verb = command
-                    .split("-A:")
-                    .nth(1)
-                    .unwrap()
-                    .split(' ')
-                    .next()
-                    .unwrap()
-                    .trim();
+        async fn channel_open_session(
+            &mut self,
+            _: russh::Channel<russh::server::Msg>,
+            reply: russh::server::ChannelOpenHandle,
+            _: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            reply.accept().await;
+            Ok(())
+        }
+        async fn pty_request(
+            &mut self,
+            id: russh::ChannelId,
+            _: &str,
+            _: u32,
+            _: u32,
+            _: u32,
+            _: u32,
+            _: &[(russh::Pty, u32)],
+            session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            session.channel_success(id)?;
+            Ok(())
+        }
+        async fn shell_request(
+            &mut self,
+            id: russh::ChannelId,
+            session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            session.channel_success(id)?;
+            Ok(())
+        }
+        async fn data(
+            &mut self,
+            id: russh::ChannelId,
+            data: &[u8],
+            session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            let command = String::from_utf8_lossy(data).into_owned();
+            let mut state = self.0.lock().unwrap();
+            state.commands.push(command.clone());
+            let line = command.trim_end_matches('\r');
+            if let Some(rest) = line.strip_prefix("MDBGSIGNAL:1 -S:") {
+                let (verb, terms) = rest.split_once(' ').unwrap();
+                let signums = signums(terms);
                 match verb {
-                    "ON" => {
-                        self.enabled = true;
-                        session.data(id, "\x01\r\n00001011:1=42\r\n\x03".to_owned())?;
-                    }
+                    "ON" => state.flags.extend(signums),
+                    "OFF" if state.stuck => {}
                     "OFF" => {
-                        self.enabled = false;
-                    }
-                    "SYNC" => {
-                        session.data(id, "\x0100000000:1=GLOBAL:OFF\r\n\x03".to_owned())?;
-                        for signum in 0..5975 {
-                            session.data(id, format!("\x01\r\n{signum:08X}:1={signum}\r\n\x03"))?;
+                        for signum in signums {
+                            state.flags.remove(&signum);
                         }
                     }
                     "SHOW" => {
-                        let state = if self.enabled { "ON" } else { "OFF" };
-                        session.data(id, format!("GLOBAL:{state}\r\n"))?;
+                        // The console runs the first line on from its prompt,
+                        // and a value report can arrive in the middle.
+                        let mut reply = String::from("\r\n\r\nCP3>");
+                        for (index, signum) in signums.iter().enumerate() {
+                            let on = if state.flags.contains(signum) {
+                                "ON"
+                            } else {
+                                "OFF"
+                            };
+                            reply.push_str(&format!("{signum:08X}:DEBUG={on}:IGNORE=OFF\r\n"));
+                            if index == 1 {
+                                reply.push_str("\x01\r\n00000002:1=GLOBAL:ON\r\n\x03");
+                            }
+                        }
+                        session.data(id, reply)?;
+                    }
+                    "SYNC" => {
+                        for signum in signums {
+                            session.data(id, format!("\x01\r\n{signum:08X}:1=synced\r\n\x03"))?;
+                        }
                     }
                     _ => panic!("unexpected command {command:?}"),
                 }
-                Ok(())
+                return Ok(());
             }
+            match line.strip_prefix("MDBGSIGNAL:1 -A:") {
+                Some("ON") => {
+                    state.global = true;
+                    session.data(id, "\x01\r\n00001011:1=42\r\n\x03".to_owned())?;
+                }
+                Some("OFF") => state.global = false,
+                Some("SYNC") => {
+                    session.data(id, "\x0100000000:1=GLOBAL:OFF\r\n\x03".to_owned())?;
+                    for signum in 0..SIGNALS {
+                        session.data(id, format!("\x01\r\n{signum:08X}:1={signum}\r\n\x03"))?;
+                    }
+                }
+                Some("SHOW") => {
+                    let global = if state.global { "ON" } else { "OFF" };
+                    session.data(id, format!("\r\nCP3>\r\nGLOBAL:{global}\r\n"))?;
+                }
+                _ => panic!("unexpected command {command:?}"),
+            }
+            Ok(())
         }
+    }
 
+    fn run(scenario: Scenario) -> Outcome {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -381,14 +864,15 @@ mod tests {
                 });
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let port = listener.local_addr().unwrap().port();
-                let commands = Arc::new(Mutex::new(Vec::new()));
-                let server_commands = commands.clone();
+                let state = Arc::new(Mutex::new(State {
+                    global: scenario.global,
+                    flags: scenario.preexisting.clone(),
+                    stuck: scenario.stuck,
+                    ..Default::default()
+                }));
+                let console = Console(state.clone());
                 let server = tokio::spawn(async move {
                     let (stream, _) = listener.accept().await.unwrap();
-                    let console = Console {
-                        commands: server_commands,
-                        enabled: initially_on,
-                    };
                     let running = russh::server::run_stream(config, stream, console)
                         .await
                         .unwrap();
@@ -406,13 +890,18 @@ mod tests {
                 };
                 let (events, _event_rx) = mpsc::channel();
                 let (sender, input) = tokio::sync::mpsc::unbounded_channel();
+                if scenario.sync {
+                    sender
+                        .send(DebugCommand::Sync(vec![0x9001, 0x9000]))
+                        .unwrap();
+                }
                 let (output, mut receiver) = tokio::sync::mpsc::channel(256);
                 let (_cancel, cancelled) = tokio::sync::watch::channel(false);
                 let task = tokio::spawn(session(
                     spec,
                     Target {
                         slot: 1,
-                        signums: (0..signature_count).collect(),
+                        signals: scenario.signals,
                     },
                     input,
                     output,
@@ -421,60 +910,89 @@ mod tests {
                     cancelled,
                 ));
                 let mut frames = Vec::new();
-                tokio::time::timeout(Duration::from_secs(5), async {
-                    loop {
-                        match receiver.try_recv() {
-                            Ok(DebugEvent::Progress { .. }) => {}
-                            Ok(DebugEvent::Output { bytes, .. }) => {
-                                frames.extend(bytes);
+                let mut reports = Vec::new();
+                // Until the event `done` accepts, keeping value reports.
+                async fn until(
+                    receiver: &mut tokio::sync::mpsc::Receiver<DebugEvent>,
+                    frames: &mut Vec<u8>,
+                    reports: &mut Vec<(bool, usize)>,
+                    mut done: impl FnMut(&DebugEvent, &[u8]) -> bool,
+                ) -> DebugEvent {
+                    tokio::time::timeout(Duration::from_secs(10), async {
+                        loop {
+                            let event = receiver.recv().await.expect("debugger events");
+                            match &event {
+                                DebugEvent::Output { bytes, .. } => frames.extend(bytes),
+                                DebugEvent::Monitoring { global, reporting } => {
+                                    reports.push((*global, *reporting))
+                                }
+                                _ => {}
                             }
-                            Ok(DebugEvent::SyncComplete) => break,
-                            Ok(DebugEvent::Closed(error)) => {
-                                panic!("debugger closed early: {error}")
+                            if done(&event, frames) {
+                                return event;
                             }
-                            _ => tokio::time::sleep(Duration::from_millis(5)).await,
+                            if let DebugEvent::Closed(error) = event {
+                                panic!("debugger closed early: {error}");
+                            }
                         }
-                    }
+                    })
+                    .await
+                    .expect("debugger event in time")
+                }
+                until(&mut receiver, &mut frames, &mut reports, |event, _| {
+                    matches!(event, DebugEvent::SyncComplete)
                 })
-                .await
-                .unwrap();
-                assert!(
-                    initially_on
-                        || frames
-                            .windows(b"00001011:1=42".len())
-                            .any(|slice| slice == b"00001011:1=42")
-                );
-                sender.send(DebugCommand::Stop).unwrap();
-                let snapshot = String::from_utf8_lossy(&frames);
-                for signum in 0..5975 {
+                .await;
+                let snapshot = String::from_utf8_lossy(&frames).into_owned();
+                for signum in 0..SIGNALS {
                     assert!(snapshot.contains(&format!("{signum:08X}:1={signum}\r\n")));
                 }
-                tokio::time::timeout(Duration::from_secs(5), async {
-                    loop {
-                        match receiver.try_recv() {
-                            Ok(DebugEvent::Closed(error)) => {
-                                assert!(error.is_empty(), "{error}");
-                                break;
-                            }
-                            _ => tokio::time::sleep(Duration::from_millis(5)).await,
-                        }
-                    }
+                let monitoring = state.lock().unwrap().flags.clone();
+                let mut toggled = Vec::new();
+                for show in scenario.toggles {
+                    let before = reports.len();
+                    sender.send(DebugCommand::ShowModules(show)).unwrap();
+                    until(&mut receiver, &mut frames, &mut reports, |event, _| {
+                        matches!(event, DebugEvent::Monitoring { .. })
+                    })
+                    .await;
+                    assert_eq!(reports.len(), before + 1);
+                    // The commands were written before the report; give the
+                    // console a moment to read them.
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    toggled.push(state.lock().unwrap().flags.clone());
+                }
+                if scenario.sync {
+                    sender
+                        .send(DebugCommand::Sync(vec![0x9010, 0x9002]))
+                        .unwrap();
+                    let wanted = [0x9000, 0x9001, 0x9002, 0x9010]
+                        .map(|signum| format!("{signum:08X}:1=synced\r\n"));
+                    until(&mut receiver, &mut frames, &mut reports, |_, frames| {
+                        let text = String::from_utf8_lossy(frames);
+                        wanted.iter().all(|reply| text.contains(reply))
+                    })
+                    .await;
+                }
+                sender.send(DebugCommand::Stop).unwrap();
+                let closed = match until(&mut receiver, &mut frames, &mut reports, |event, _| {
+                    matches!(event, DebugEvent::Closed(_))
                 })
                 .await
-                .unwrap();
+                {
+                    DebugEvent::Closed(error) => error,
+                    _ => unreachable!(),
+                };
                 task.await.unwrap();
-                let commands = commands.lock().unwrap();
-                let expected: Vec<_> = if initially_on {
-                    vec!["SHOW", "SYNC", "SHOW"]
-                } else {
-                    vec!["SHOW", "ON", "SHOW", "SYNC", "SHOW", "OFF", "SHOW"]
-                }
-                .into_iter()
-                .map(|verb| command(1, verb))
-                .collect();
-                assert_eq!(*commands, expected);
-                drop(commands);
                 server.abort();
-            });
+                let state = std::mem::take(&mut *state.lock().unwrap());
+                Outcome {
+                    monitoring,
+                    toggled,
+                    reports,
+                    closed,
+                    state,
+                }
+            })
     }
 }

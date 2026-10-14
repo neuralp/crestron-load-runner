@@ -21,6 +21,7 @@ mod popout;
 mod puf;
 mod resources;
 mod scripts;
+mod signal_font;
 mod ssh;
 mod storage;
 mod terminal;

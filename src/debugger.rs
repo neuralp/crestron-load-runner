@@ -1,5 +1,5 @@
 //! Processor signal debugger: signature records, bounded traces, and a popout.
-use crate::ssh::{DebugCommand, DebugEvent};
+use crate::ssh::{DebugCommand, DebugEvent, DebugSignals};
 use eframe::egui;
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
@@ -22,6 +22,52 @@ pub(crate) struct Signal {
 impl Signal {
     pub fn signum(&self) -> u32 {
         u32::from_le_bytes(self.metadata[..4].try_into().expect("four bytes"))
+    }
+
+    /// The fifth metadata byte. Across three programs, every name ending in
+    /// `$` had 2, and processors reported only 0 or 1 for 0, numbers for 1
+    /// and strings for 2. The high bit marks the constant `0` and `1` signals.
+    pub fn kind(&self) -> SignalKind {
+        match self.metadata[4] & 0x7f {
+            0 => SignalKind::Digital,
+            1 => SignalKind::Analog,
+            2 => SignalKind::Serial,
+            _ => SignalKind::Unknown,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SignalKind {
+    Digital,
+    Analog,
+    Serial,
+    Unknown,
+}
+
+impl SignalKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Digital => "Digital",
+            Self::Analog => "Analog",
+            Self::Serial => "Serial",
+            Self::Unknown => "Unknown type",
+        }
+    }
+
+    /// Blue for digital, red for analog and plain for serial, in shades that
+    /// keep their contrast against the theme's background. None leaves an
+    /// unrecognized type in the ordinary text colour.
+    pub fn color(self, dark: bool) -> Option<egui::Color32> {
+        Some(match (self, dark) {
+            (Self::Digital, true) => egui::Color32::from_rgb(130, 180, 255),
+            (Self::Digital, false) => egui::Color32::from_rgb(25, 85, 190),
+            (Self::Analog, true) => egui::Color32::from_rgb(255, 140, 130),
+            (Self::Analog, false) => egui::Color32::from_rgb(175, 40, 40),
+            (Self::Serial, true) => egui::Color32::from_rgb(240, 240, 240),
+            (Self::Serial, false) => egui::Color32::from_rgb(20, 20, 20),
+            (Self::Unknown, _) => return None,
+        })
     }
 }
 
@@ -79,6 +125,24 @@ pub(crate) fn debug_signums(signals: &[Signal]) -> Vec<u32> {
         .collect()
 }
 
+/// The signature's signal numbers for a session. A number counts as a module
+/// signal only when every name it has is one.
+pub(crate) fn debug_signals(signals: &[Signal], show_modules: bool) -> DebugSignals {
+    let plain: HashSet<u32> = signals
+        .iter()
+        .filter(|signal| !is_module_signal(&signal.name))
+        .map(Signal::signum)
+        .collect();
+    let (signals, modules) = debug_signums(signals)
+        .into_iter()
+        .partition(|signum| plain.contains(signum));
+    DebugSignals {
+        signals,
+        modules,
+        show_modules,
+    }
+}
+
 pub(crate) fn choose_signature(
     slot: u8,
     entries: &[String],
@@ -117,6 +181,7 @@ pub(crate) fn choose_signature(
 }
 
 const MAX_SIGNALS_PER_LEAF: usize = 50;
+const MODULES: &str = "Module signals";
 const MAX_BRANCH_CHILDREN: usize = 10;
 
 /// Alphabetically ordered name ranges. Equal names keep distinct record indices.
@@ -144,14 +209,24 @@ fn range_label(signals: &[Signal], first: usize, last: usize, count: usize) -> S
     }
 }
 
-fn signal_tree(signals: &[Signal], query: &str) -> Vec<SignalTree> {
+/// Names beginning `::` belong to modules' internal signals.
+fn is_module_signal(name: &str) -> bool {
+    name.starts_with("::")
+}
+
+/// Module signals are left out unless `include_modules`, and then share one
+/// root of their own after the others.
+fn signal_tree(signals: &[Signal], query: &str, include_modules: bool) -> Vec<SignalTree> {
     let needle = query.to_lowercase();
     let names: Vec<_> = signals
         .iter()
         .map(|signal| signal.name.to_lowercase())
         .collect();
     let mut indices: Vec<_> = (0..signals.len())
-        .filter(|&index| !signals[index].name.starts_with("::") && names[index].contains(&needle))
+        .filter(|&index| {
+            (include_modules || !is_module_signal(&signals[index].name))
+                && names[index].contains(&needle)
+        })
         .collect();
     indices.sort_by(|&a, &b| {
         names[a]
@@ -163,6 +238,7 @@ fn signal_tree(signals: &[Signal], query: &str) -> Vec<SignalTree> {
     let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for index in indices {
         let label = match names[index].chars().next() {
+            _ if is_module_signal(&signals[index].name) => MODULES.to_owned(),
             Some('0'..='9') => "0–9".to_owned(),
             Some(letter @ 'a'..='z') => letter.to_ascii_uppercase().to_string(),
             _ => "Other".to_owned(),
@@ -170,9 +246,13 @@ fn signal_tree(signals: &[Signal], query: &str) -> Vec<SignalTree> {
         groups.entry(label).or_default().push(index);
     }
     let other = groups.remove("Other");
+    let modules = groups.remove(MODULES);
     let mut groups: Vec<_> = groups.into_iter().collect();
     if let Some(indices) = other {
         groups.push(("Other".into(), indices));
+    }
+    if let Some(indices) = modules {
+        groups.push((MODULES.into(), indices));
     }
     groups
         .into_iter()
@@ -375,6 +455,18 @@ struct SignalSelection {
     anchor: Option<u32>,
 }
 
+/// A label at the left of `rect`, centred vertically and cut short with an
+/// ellipsis when it does not fit. `Ui::put` would centre it horizontally.
+fn put_left(ui: &mut egui::Ui, rect: egui::Rect, text: egui::RichText) -> egui::Response {
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        |ui| ui.add(egui::Label::new(text).selectable(false).truncate()),
+    )
+    .inner
+}
+
 fn update_selection(
     selected: &mut HashSet<u32>,
     anchor: &mut Option<u32>,
@@ -424,8 +516,17 @@ pub(crate) struct Panel {
     pub signals: Vec<Signal>,
     signal_lookup: Option<HashMap<u32, usize>>,
     pub search: String,
+    /// Show `::` module signals in the tree and timeline, and have the
+    /// processor report them.
+    show_modules: bool,
+    /// How the processor is reporting: (global debugging was already on,
+    /// signals reporting). None until a session says.
+    monitoring: Option<(bool, usize)>,
     tree: Option<Vec<SignalTree>>,
     tree_query: String,
+    tree_modules: bool,
+    /// Signal names and values, from Preferences.
+    pub fonts: crate::signal_font::SignalFonts,
     pub status: String,
     pub groups: BTreeMap<String, Vec<u32>>,
     new_group: String,
@@ -450,8 +551,13 @@ pub(crate) struct Panel {
     pub cleanup_error: Option<String>,
 }
 impl Panel {
+    pub fn show_modules(&self) -> bool {
+        self.show_modules
+    }
+
     pub fn reset_signals(&mut self) {
         self.suspend_settings();
+        self.monitoring = None;
         self.signals.clear();
         self.signal_lookup = None;
         self.tree = None;
@@ -487,8 +593,12 @@ impl Panel {
             signals: Vec::new(),
             signal_lookup: None,
             search: String::new(),
+            show_modules: false,
+            monitoring: None,
             tree: None,
             tree_query: String::new(),
+            tree_modules: false,
+            fonts: Default::default(),
             status: "Choose a program slot and press Start".into(),
             groups: BTreeMap::from([("Watched".into(), Vec::new())]),
             new_group: String::new(),
@@ -577,27 +687,19 @@ impl Panel {
             match event {
                 DebugEvent::Opened => {
                     self.running = true;
-                    self.status = "Connected — enabling all signals…".into();
+                    self.status = "Connected — reading debug flags…".into();
                 }
                 DebugEvent::SyncComplete => {
                     self.restore_exclusions_after_sync();
                     self.status = format!(
-                        "Initial sync complete — monitoring; {} exclusions restored",
+                        "Initial sync complete — {}; {} exclusions restored",
+                        self.monitoring_summary(),
                         self.disabled_signals.len()
                     );
                 }
-                DebugEvent::Progress {
-                    processed,
-                    total,
-                    already_on,
-                } => {
-                    self.status = if processed == total {
-                        format!("Monitoring {total} signals ({already_on} already in debug mode)")
-                    } else {
-                        format!(
-                            "Enabling signals: {processed}/{total} ({already_on} already active)"
-                        )
-                    };
+                DebugEvent::Monitoring { global, reporting } => {
+                    self.monitoring = Some((global, reporting));
+                    self.status = format!("Monitoring — {}", self.monitoring_summary());
                 }
                 DebugEvent::Output { bytes, received_at } => self.ingest(&bytes, received_at),
                 DebugEvent::Closed(error) => {
@@ -617,6 +719,30 @@ impl Panel {
             }
         }
     }
+    fn monitoring_summary(&self) -> String {
+        match self.monitoring {
+            Some((true, _)) => "global debugging was already on, so every signal reports".into(),
+            Some((false, reporting)) => format!(
+                "processor reporting {reporting} signals{}",
+                if self.show_modules {
+                    ""
+                } else {
+                    ", module signals off"
+                }
+            ),
+            None => "monitoring".into(),
+        }
+    }
+
+    /// Have the processor start or stop reporting module signals, when a
+    /// session is running; they are shown or hidden either way.
+    fn set_show_modules(&mut self, show: bool) {
+        self.show_modules = show;
+        if let Some(input) = &self.input {
+            let _ = input.send(DebugCommand::ShowModules(show));
+        }
+    }
+
     fn connect(&mut self) {
         let (input, commands) = tokio::sync::mpsc::unbounded_channel();
         let (reply, output) = tokio::sync::mpsc::channel(256);
@@ -633,6 +759,18 @@ impl Panel {
             self.signal_lookup = Some(lookup);
         }
     }
+    fn signal_kind(&self, signum: u32) -> SignalKind {
+        self.signal_lookup
+            .as_ref()
+            .and_then(|lookup| lookup.get(&signum))
+            .map_or(SignalKind::Unknown, |&index| self.signals[index].kind())
+    }
+
+    /// The tree's value column, wide enough for a value in the chosen font.
+    fn value_column_width(&self) -> f32 {
+        (self.fonts.value.size * 8.5).max(110.0)
+    }
+
     fn signal_name(&self, signum: u32) -> &str {
         self.signal_lookup
             .as_ref()
@@ -651,9 +789,11 @@ impl Panel {
         (0..self.samples.len())
             .rev()
             .filter(|&index| {
+                let signum = self.samples[index].signum;
                 members
                     .as_ref()
-                    .is_none_or(|members| members.contains(&self.samples[index].signum))
+                    .is_none_or(|members| members.contains(&signum))
+                    && (self.show_modules || !is_module_signal(self.signal_name(signum)))
             })
             .collect()
     }
@@ -825,8 +965,10 @@ impl Panel {
     fn show_signal_row(&mut self, ui: &mut egui::Ui, index: usize) {
         // Preserve full scroll geometry, but do no text layout/decoding for
         // off-screen rows. All branches share the one parent scroll area.
-        let (rect, _) =
-            ui.allocate_exact_size(egui::vec2(ui.available_width(), 24.0), egui::Sense::hover());
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), self.fonts.row_height(24.0)),
+            egui::Sense::hover(),
+        );
         if !ui.is_rect_visible(rect) {
             return;
         }
@@ -841,7 +983,7 @@ impl Panel {
             let additive = modifiers.command || modifiers.ctrl;
             if modifiers.shift && !response.secondary_clicked() {
                 let mut order = Vec::new();
-                for node in signal_tree(&self.signals, self.signal_filter()) {
+                for node in signal_tree(&self.signals, self.signal_filter(), self.show_modules) {
                     node.ordered_signums(&self.signals, &mut order);
                 }
                 update_selection(
@@ -883,7 +1025,7 @@ impl Panel {
                 if text.is_empty() { "\"\"".into() } else { text }
             })
             .unwrap_or_else(|| "Not received".into());
-        let split = (rect.right() - 110.0).max(rect.left() + 30.0);
+        let split = (rect.right() - self.value_column_width()).max(rect.left() + 30.0);
         let name_rect = egui::Rect::from_min_max(
             rect.min + egui::vec2(5.0, 0.0),
             egui::pos2(split - 6.0, rect.bottom()),
@@ -892,17 +1034,14 @@ impl Panel {
             egui::pos2(split + 6.0, rect.top()),
             rect.max - egui::vec2(4.0, 0.0),
         );
-        let mut text = egui::RichText::new(name);
+        let kind = self.signals[index].kind();
+        let mut text = egui::RichText::new(name).font(self.fonts.name.clone());
         if self.disabled_signals.contains(&signum) {
             text = text.weak().strikethrough();
+        } else if let Some(color) = kind.color(ui.visuals().dark_mode) {
+            text = text.color(color);
         }
-        ui.put(
-            name_rect,
-            egui::Label::new(text)
-                .halign(egui::Align::Min)
-                .selectable(false)
-                .truncate(),
-        );
+        put_left(ui, name_rect, text);
         ui.painter().line_segment(
             [
                 egui::pos2(split, rect.top() + 4.0),
@@ -910,19 +1049,13 @@ impl Panel {
             ],
             ui.visuals().widgets.noninteractive.bg_stroke,
         );
-        let mut text = egui::RichText::new(&value).monospace();
+        let mut text = egui::RichText::new(&value).font(self.fonts.value.clone());
         if !self.values.contains_key(&signum) {
             text = text.weak();
         }
-        ui.put(
-            value_rect,
-            egui::Label::new(text)
-                .halign(egui::Align::Min)
-                .selectable(false)
-                .truncate(),
-        );
+        put_left(ui, value_rect, text);
         response
-            .on_hover_text(format!("{name}\n{value}"))
+            .on_hover_text(format!("{name}\n{}\n{value}", kind.label()))
             .context_menu(|ui| self.tree_context_menu(ui));
     }
 
@@ -960,8 +1093,41 @@ impl Panel {
             }
         });
     }
+    /// Ask the processor for the current value of every selected signal. The
+    /// replies update current values and the timeline like any other report.
+    fn synchronize_tree_selection(&mut self) {
+        let Some(input) = &self.input else {
+            return;
+        };
+        let mut signums: Vec<_> = self.tree_selection.iter().copied().collect();
+        signums.sort_unstable();
+        let count = signums.len();
+        if count == 0 {
+            return;
+        }
+        self.status = if input.send(DebugCommand::Sync(signums)).is_ok() {
+            format!(
+                "Synchronizing {count} {}…",
+                if count == 1 { "signal" } else { "signals" }
+            )
+        } else {
+            "Could not synchronize: the debugger session has ended".into()
+        };
+    }
+
     fn tree_context_menu(&mut self, ui: &mut egui::Ui) {
         ui.weak(format!("{} selected signals", self.tree_selection.len()));
+        let connected = self.input.is_some() && !self.stopping;
+        if ui
+            .add_enabled(connected, egui::Button::new("Synchronize state"))
+            .on_disabled_hover_text("Start the debugger to read values from the processor")
+            .on_hover_text("Read the current value of the selected signals from the processor")
+            .clicked()
+        {
+            self.synchronize_tree_selection();
+            ui.close();
+        }
+        ui.separator();
         if ui.button("Disable debugging locally").clicked() {
             self.disabled_signals
                 .extend(self.tree_selection.iter().copied());
@@ -1019,6 +1185,15 @@ impl Panel {
                     self.awaiting_session = true;
                     self.status = "Reading remote signature…".into();
                 }
+                let mut show_modules = self.show_modules;
+                let hover = if self.monitoring.is_some_and(|(global, _)| global) {
+                    "Signals whose names begin with :: belong to modules. Global debugging was already on, so the processor reports them anyway; this only shows or hides them."
+                } else {
+                    "Signals whose names begin with :: belong to modules. When checked, the processor reports them and they appear in the signal tree and timeline; when unchecked, the processor is not asked to report them."
+                };
+                if ui.checkbox(&mut show_modules, "Show module signals").on_hover_text(hover).changed() {
+                    self.set_show_modules(show_modules);
+                }
                 ui.label(&self.status);
             });
             self.settings_ui(ui);
@@ -1050,15 +1225,28 @@ impl Panel {
                     self.values.len(),
                     self.signal_lookup.as_ref().map_or(0, HashMap::len)
                 ));
+                ui.horizontal(|ui| {
+                    let dark = ui.visuals().dark_mode;
+                    for kind in [SignalKind::Digital, SignalKind::Analog, SignalKind::Serial] {
+                        let color = kind.color(dark).unwrap_or_else(|| ui.visuals().text_color());
+                        ui.label(egui::RichText::new(kind.label()).small().color(color));
+                    }
+                })
+                .response
+                .on_hover_text("Signal names are coloured by type");
                 self.signal_search(ui);
                 ui.horizontal(|ui| {
-                    ui.add_sized([(ui.available_width() - 110.0).max(40.0), 20.0], egui::Label::new(egui::RichText::new("Signal name").strong()));
+                    ui.add_sized([(ui.available_width() - self.value_column_width()).max(40.0), 20.0], egui::Label::new(egui::RichText::new("Signal name").strong()));
                     ui.strong("Current value");
                 }).response.on_hover_text("Ctrl/Cmd-click to toggle selection · Shift-click for range · Right-click for actions");
                 ui.separator();
-                if self.tree.is_none() || self.tree_query != self.signal_filter() {
-                    self.tree = Some(signal_tree(&self.signals, self.signal_filter()));
+                if self.tree.is_none()
+                    || self.tree_query != self.signal_filter()
+                    || self.tree_modules != self.show_modules
+                {
+                    self.tree = Some(signal_tree(&self.signals, self.signal_filter(), self.show_modules));
                     self.tree_query = self.signal_filter().to_owned();
+                    self.tree_modules = self.show_modules;
                 }
                 let tree = self.tree.take().unwrap_or_default();
                 egui::ScrollArea::vertical().show(ui, |ui| {
@@ -1119,10 +1307,18 @@ impl Panel {
                                 .show(ui, |ui| {
                                     for &signum in members {
                                         ui.horizontal(|ui| {
-                                            if ui.small_button("✕").clicked() {
-                                                remove.push((group.clone(), signum));
+                                            // Removing is on the right-click menu.
+                                            let mut name =
+                                                egui::RichText::new(self.signal_name(signum))
+                                                    .font(self.fonts.name.clone());
+                                            if self.disabled_signals.contains(&signum) {
+                                                name = name.weak().strikethrough();
+                                            } else if let Some(color) = self
+                                                .signal_kind(signum)
+                                                .color(ui.visuals().dark_mode)
+                                            {
+                                                name = name.color(color);
                                             }
-                                            let name = self.signal_name(signum).to_owned();
                                             let selection = self
                                                 .watch_selections
                                                 .entry(group.clone())
@@ -1151,7 +1347,13 @@ impl Panel {
                                                 );
                                             }
                                             response.context_menu(|ui| {
-                                                if ui.button("Remove selected signals").clicked() {
+                                                let count = selection.selected.len();
+                                                let label = if count == 1 {
+                                                    "Remove from group".to_owned()
+                                                } else {
+                                                    format!("Remove {count} signals from group")
+                                                };
+                                                if ui.button(label).clicked() {
                                                     remove.extend(
                                                         selection
                                                             .selected
@@ -1162,13 +1364,16 @@ impl Panel {
                                                 }
                                             });
                                             if let Some(value) = self.values.get(&signum) {
-                                                ui.monospace(display_value(
-                                                    value,
-                                                    self.display_types
-                                                        .get(&signum)
-                                                        .copied()
-                                                        .unwrap_or_default(),
-                                                ));
+                                                ui.label(
+                                                    egui::RichText::new(display_value(
+                                                        value,
+                                                        self.display_types
+                                                            .get(&signum)
+                                                            .copied()
+                                                            .unwrap_or_default(),
+                                                    ))
+                                                    .font(self.fonts.value.clone()),
+                                                );
                                             }
                                         });
                                     }
@@ -1240,10 +1445,12 @@ impl Panel {
                 ui.weak("Received values appear here automatically while monitoring.");
             }
             let count = visible.len();
+            let row_height = self.fonts.row_height(30.0);
+            let (name_font, value_font) = (self.fonts.name.clone(), self.fonts.value.clone());
             egui::ScrollArea::vertical()
                 .id_salt(("signal_changes", &self.timeline_group))
                 .auto_shrink([false, false])
-                .show_rows(ui, 30.0, count, |ui, rows| {
+                .show_rows(ui, row_height, count, |ui, rows| {
                     for row in rows {
                         let sample = &self.samples[visible[row]];
                         let signum = sample.signum;
@@ -1251,7 +1458,7 @@ impl Panel {
                         let name = self.signal_name(signum).to_owned();
                         let mode = self.display_types.get(&signum).copied().unwrap_or_default();
                         let displayed = display_value(&sample.value, mode);
-                        let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 30.0), egui::Sense::hover());
+                        let (rect, _) = ui.allocate_exact_size(egui::vec2(width, row_height), egui::Sense::hover());
                         let response = ui.interact(rect, ui.id().with(("signal_sample", sample.id)), egui::Sense::click());
                         let selected = self.selected_sample == Some(sample.id);
                         let fill = if selected { ui.visuals().selection.bg_fill }
@@ -1261,15 +1468,14 @@ impl Panel {
                         ui.painter().rect_filled(rect, 4.0, fill);
                         let color = if selected { ui.visuals().selection.stroke.color } else if disabled { ui.visuals().weak_text_color() } else { ui.visuals().text_color() };
                         let cells = [
-                            (0.0, 220.0, format_received(sample.at), false),
-                            (228.0, name_width, name.clone(), false),
-                            (236.0 + name_width, value_width, displayed.clone(), true),
+                            (0.0, 220.0, format_received(sample.at), egui::FontId::proportional(13.0)),
+                            (228.0, name_width, name.clone(), name_font.clone()),
+                            (236.0 + name_width, value_width, displayed.clone(), value_font.clone()),
                         ];
-                        for (offset, cell_width, text, mono) in cells {
-                            let cell = egui::Rect::from_min_size(rect.min + egui::vec2(offset + 6.0, 0.0), egui::vec2(cell_width - 12.0, 30.0));
+                        for (offset, cell_width, text, font) in cells {
+                            let cell = egui::Rect::from_min_size(rect.min + egui::vec2(offset + 6.0, 0.0), egui::vec2(cell_width - 12.0, row_height));
                             ui.painter().with_clip_rect(cell.intersect(ui.clip_rect())).text(
-                                cell.left_center(), egui::Align2::LEFT_CENTER, text,
-                                if mono { egui::FontId::monospace(13.0) } else { egui::FontId::proportional(13.0) }, color,
+                                cell.left_center(), egui::Align2::LEFT_CENTER, text, font, color,
                             );
                         }
                         let response = response.on_hover_text(format!("{name}\n0x{signum:08X}\n{}{}", displayed, if disabled { "\nDisabled locally; historical value" } else { "" }));

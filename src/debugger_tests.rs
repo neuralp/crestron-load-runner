@@ -62,7 +62,7 @@ fn parse_processor_example_if_present() {
         assert_eq!(signals.len(), 5975);
         assert_eq!(signals[0].signum(), 0x1010);
         assert!(signals[0].name.starts_with("::not_held_pre_pulse:"));
-        let tree = signal_tree(&signals, "");
+        let tree = signal_tree(&signals, "", false);
         let mut leaves = Vec::new();
         tree_indices(&tree, &mut leaves);
         assert!(leaves.iter().all(|leaf| leaf.len() <= 50));
@@ -102,7 +102,7 @@ fn signal_tree_has_only_populated_initial_roots_and_excludes_modules() {
         metadata: [0; 6],
     })
     .collect();
-    let tree = signal_tree(&signals, "");
+    let tree = signal_tree(&signals, "", false);
     let labels: Vec<_> = tree
         .iter()
         .map(|node| match node {
@@ -121,8 +121,8 @@ fn signal_tree_has_only_populated_initial_roots_and_excludes_modules() {
     let mut leaves = Vec::new();
     tree_indices(&tree, &mut leaves);
     assert_eq!(leaves, [vec![4, 3], vec![2, 1], vec![0], vec![6]]);
-    assert!(signal_tree(&signals, "::").is_empty());
-    let filtered = signal_tree(&signals, "apple");
+    assert!(signal_tree(&signals, "::", false).is_empty());
+    let filtered = signal_tree(&signals, "apple", false);
     assert_eq!(filtered.len(), 1);
     assert!(
         matches!(&filtered[0], SignalTree::Leaf { label, indices } if label == "A · 1 signal" && indices == &[1])
@@ -140,7 +140,7 @@ fn expanded_tree_leaves_use_the_parent_scroll_area_without_height_caps() {
         })
         .collect();
     panel.search = "Signal".into();
-    let tree = signal_tree(&panel.signals, &panel.search);
+    let tree = signal_tree(&panel.signals, &panel.search, false);
     for pass in 0..3 {
         let output = ctx.run_ui(
             egui::RawInput {
@@ -217,7 +217,7 @@ fn tree_group_targets_include_all_descendants_without_modules_or_duplicates() {
         name: "::module".into(),
         metadata: [255, 0, 0, 0, 0, 1],
     });
-    let tree = signal_tree(&signals, "");
+    let tree = signal_tree(&signals, "", false);
     assert_eq!(tree.len(), 1);
     assert_eq!(tree[0].signums(&signals), (0..120).collect());
     if let SignalTree::Branch { children, .. } = &tree[0] {
@@ -247,76 +247,78 @@ fn tree_selection_preserves_context_targets_and_deduplicates_watches() {
     assert!(panel.tree_selection.is_empty());
 }
 
+/// Renders the tree rows and range nodes alone, for context-menu tests.
+fn tree_frame(
+    ctx: &egui::Context,
+    panel: &mut Panel,
+    events: Vec<egui::Event>,
+    modifiers: egui::Modifiers,
+) -> egui::FullOutput {
+    let events = std::iter::once(egui::Event::ModifiersChanged(modifiers))
+        .chain(events)
+        .collect();
+    let mut output = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            events,
+            ..Default::default()
+        },
+        |ui| {
+            for index in 0..panel.signals.len() {
+                panel.show_signal_row(ui, index);
+            }
+            let tree = signal_tree(&panel.signals, "", false);
+            panel.show_signal_nodes(ui, &tree);
+        },
+    );
+    output.textures_delta.clear();
+    output
+}
+fn tree_click(
+    ctx: &egui::Context,
+    panel: &mut Panel,
+    text: &str,
+    button: egui::PointerButton,
+    modifiers: egui::Modifiers,
+) {
+    for _ in 0..3 {
+        tree_frame(ctx, panel, vec![], modifiers).drop_without_applying_deltas();
+    }
+    let output = tree_frame(ctx, panel, vec![], modifiers);
+    let pos = output
+        .shapes
+        .iter()
+        .find_map(|shape| match &shape.shape {
+            egui::epaint::Shape::Text(label) if label.galley.text() == text => {
+                Some(label.pos + label.galley.size() * 0.5)
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("missing {text}"));
+    for pressed in [true, false] {
+        tree_frame(
+            ctx,
+            panel,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button,
+                    pressed,
+                    modifiers,
+                },
+            ],
+            modifiers,
+        )
+        .drop_without_applying_deltas();
+    }
+}
+
 #[test]
 fn tree_context_menu_bulk_disables_and_adds_to_chosen_watch_group() {
-    fn frame(
-        ctx: &egui::Context,
-        panel: &mut Panel,
-        events: Vec<egui::Event>,
-        modifiers: egui::Modifiers,
-    ) -> egui::FullOutput {
-        let events = std::iter::once(egui::Event::ModifiersChanged(modifiers))
-            .chain(events)
-            .collect();
-        let mut output = ctx.run_ui(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(800.0, 600.0),
-                )),
-                events,
-                ..Default::default()
-            },
-            |ui| {
-                for index in 0..panel.signals.len() {
-                    panel.show_signal_row(ui, index);
-                }
-                let tree = signal_tree(&panel.signals, "");
-                panel.show_signal_nodes(ui, &tree);
-            },
-        );
-        output.textures_delta.clear();
-        output
-    }
-    fn click(
-        ctx: &egui::Context,
-        panel: &mut Panel,
-        text: &str,
-        button: egui::PointerButton,
-        modifiers: egui::Modifiers,
-    ) {
-        for _ in 0..3 {
-            frame(ctx, panel, vec![], modifiers).drop_without_applying_deltas();
-        }
-        let output = frame(ctx, panel, vec![], modifiers);
-        let pos = output
-            .shapes
-            .iter()
-            .find_map(|shape| match &shape.shape {
-                egui::epaint::Shape::Text(label) if label.galley.text() == text => {
-                    Some(label.pos + label.galley.size() * 0.5)
-                }
-                _ => None,
-            })
-            .unwrap_or_else(|| panic!("missing {text}"));
-        for pressed in [true, false] {
-            frame(
-                ctx,
-                panel,
-                vec![
-                    egui::Event::PointerMoved(pos),
-                    egui::Event::PointerButton {
-                        pos,
-                        button,
-                        pressed,
-                        modifiers,
-                    },
-                ],
-                modifiers,
-            )
-            .drop_without_applying_deltas();
-        }
-    }
     let ctx = egui::Context::default();
     let mut panel = Panel::new("processor".into(), "Processor");
     panel.signals = ["Alpha", "Bravo", "Charlie"]
@@ -333,14 +335,14 @@ fn tree_context_menu_bulk_disables_and_adds_to_chosen_watch_group() {
         ctrl: true,
         ..Default::default()
     };
-    click(
+    tree_click(
         &ctx,
         &mut panel,
         "Alpha",
         egui::PointerButton::Primary,
         plain,
     );
-    click(
+    tree_click(
         &ctx,
         &mut panel,
         "Bravo",
@@ -348,14 +350,14 @@ fn tree_context_menu_bulk_disables_and_adds_to_chosen_watch_group() {
         ctrl,
     );
     assert_eq!(panel.tree_selection, HashSet::from([0, 1]));
-    click(
+    tree_click(
         &ctx,
         &mut panel,
         "Alpha",
         egui::PointerButton::Secondary,
         plain,
     );
-    click(
+    tree_click(
         &ctx,
         &mut panel,
         "Disable debugging locally",
@@ -363,21 +365,21 @@ fn tree_context_menu_bulk_disables_and_adds_to_chosen_watch_group() {
         plain,
     );
     assert_eq!(panel.disabled_signals, HashSet::from([0, 1]));
-    click(
+    tree_click(
         &ctx,
         &mut panel,
         "Bravo",
         egui::PointerButton::Secondary,
         plain,
     );
-    click(
+    tree_click(
         &ctx,
         &mut panel,
         "Add to watch group",
         egui::PointerButton::Primary,
         plain,
     );
-    click(
+    tree_click(
         &ctx,
         &mut panel,
         "Custom",
@@ -387,14 +389,14 @@ fn tree_context_menu_bulk_disables_and_adds_to_chosen_watch_group() {
     assert_eq!(panel.groups["Custom"], [0, 1]);
     assert!(panel.groups["Watched"].is_empty());
     assert!(!panel.disabled_signals.contains(&2));
-    click(
+    tree_click(
         &ctx,
         &mut panel,
         "C · 1 signal",
         egui::PointerButton::Secondary,
         plain,
     );
-    click(
+    tree_click(
         &ctx,
         &mut panel,
         "Disable debugging locally",
@@ -403,21 +405,21 @@ fn tree_context_menu_bulk_disables_and_adds_to_chosen_watch_group() {
     );
     assert!(panel.disabled_signals.contains(&2));
     assert_eq!(panel.tree_selection, HashSet::from([2]));
-    click(
+    tree_click(
         &ctx,
         &mut panel,
         "C · 1 signal",
         egui::PointerButton::Secondary,
         plain,
     );
-    click(
+    tree_click(
         &ctx,
         &mut panel,
         "Add to watch group",
         egui::PointerButton::Primary,
         plain,
     );
-    click(
+    tree_click(
         &ctx,
         &mut panel,
         "Custom",
@@ -425,6 +427,100 @@ fn tree_context_menu_bulk_disables_and_adds_to_chosen_watch_group() {
         plain,
     );
     assert_eq!(panel.groups["Custom"], [0, 1, 2]);
+}
+
+#[test]
+fn tree_context_menu_synchronizes_signals_and_nodes_into_timeline_and_values() {
+    let ctx = egui::Context::default();
+    let plain = egui::Modifiers::NONE;
+    let mut panel = Panel::new("processor".into(), "Processor");
+    panel.signals = ["Alpha", "Apple", "Bravo"]
+        .into_iter()
+        .enumerate()
+        .map(|(i, name)| Signal {
+            name: name.into(),
+            metadata: [0x10 + i as u8, 0, 0, 0, 0, 1],
+        })
+        .collect();
+
+    // Without a session there is nothing to ask, so the action is disabled.
+    tree_click(
+        &ctx,
+        &mut panel,
+        "Bravo",
+        egui::PointerButton::Secondary,
+        plain,
+    );
+    tree_click(
+        &ctx,
+        &mut panel,
+        "Synchronize state",
+        egui::PointerButton::Primary,
+        plain,
+    );
+    assert!(panel.status.starts_with("Choose a program slot"));
+
+    panel.connect();
+    let (mut commands, output) = panel.pending_session.take().unwrap();
+    // An individual signal.
+    tree_click(
+        &ctx,
+        &mut panel,
+        "Bravo",
+        egui::PointerButton::Secondary,
+        plain,
+    );
+    tree_click(
+        &ctx,
+        &mut panel,
+        "Synchronize state",
+        egui::PointerButton::Primary,
+        plain,
+    );
+    assert!(matches!(commands.try_recv(), Ok(DebugCommand::Sync(signums)) if signums == [0x12]));
+    assert_eq!(panel.status, "Synchronizing 1 signal…");
+    // Every signal under a tree node.
+    tree_click(
+        &ctx,
+        &mut panel,
+        "A · 2 signals",
+        egui::PointerButton::Secondary,
+        plain,
+    );
+    tree_click(
+        &ctx,
+        &mut panel,
+        "Synchronize state",
+        egui::PointerButton::Primary,
+        plain,
+    );
+    assert!(
+        matches!(commands.try_recv(), Ok(DebugCommand::Sync(signums)) if signums == [0x10, 0x11])
+    );
+    assert_eq!(panel.status, "Synchronizing 2 signals…");
+    assert!(commands.try_recv().is_err());
+
+    // The replies are ordinary reports: current value and timeline both.
+    output
+        .try_send(DebugEvent::Output {
+            bytes: b"\x01\r\n00000010:1=0\r\n\x03\x01\r\n00000011:1=7\r\n\x03".to_vec(),
+            received_at: SystemTime::now(),
+        })
+        .unwrap();
+    panel.poll();
+    assert_eq!(panel.values[&0x10], "0");
+    assert_eq!(panel.values[&0x11], "7");
+    let timeline: Vec<_> = panel
+        .timeline_indices()
+        .into_iter()
+        .map(|index| {
+            (
+                panel.samples[index].signum,
+                panel.samples[index].value.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(timeline, [(0x11, "7"), (0x10, "0")]);
 }
 
 #[test]
@@ -437,7 +533,7 @@ fn signal_tree_alphabetical_order_ignores_case() {
         })
         .collect();
     let mut leaves = Vec::new();
-    tree_indices(&signal_tree(&signals, ""), &mut leaves);
+    tree_indices(&signal_tree(&signals, "", false), &mut leaves);
     let names: Vec<_> = leaves
         .into_iter()
         .flatten()
@@ -553,7 +649,7 @@ fn expanded_signal_tree_only_lays_out_visible_signal_text() {
             }
         })
         .collect();
-    let tree = signal_tree(&panel.signals, "Signal");
+    let tree = signal_tree(&panel.signals, "Signal", false);
     for offset in [0.0, 50000.0] {
         for _ in 0..3 {
             let mut output = ctx.run_ui(
@@ -710,6 +806,484 @@ fn watch_group_members_collapse_without_changing_timeline_filter() {
         assert_eq!(panel.timeline_group.as_deref(), Some("Watched"));
         assert_eq!(panel.groups["Watched"], [1]);
     }
+}
+
+#[test]
+fn module_signals_are_shown_after_the_others_only_when_asked_for() {
+    let signals: Vec<_> = ["Zebra", "::Module", "_other", "::another"]
+        .into_iter()
+        .map(|name| Signal {
+            name: name.into(),
+            metadata: [0; 6],
+        })
+        .collect();
+    let tree = signal_tree(&signals, "", true);
+    let labels: Vec<_> = tree
+        .iter()
+        .map(|node| match node {
+            SignalTree::Branch { label, .. } | SignalTree::Leaf { label, .. } => label.as_str(),
+        })
+        .collect();
+    assert_eq!(
+        labels,
+        [
+            "Z · 1 signal",
+            "Other · 1 signal",
+            "Module signals · 2 signals"
+        ]
+    );
+    let mut leaves = Vec::new();
+    tree_indices(&tree, &mut leaves);
+    assert_eq!(leaves, [vec![0], vec![2], vec![3, 1]]);
+    assert_eq!(signal_tree(&signals, "::", true).len(), 1);
+    assert!(signal_tree(&signals, "::", false).is_empty());
+}
+
+#[test]
+fn debug_signals_split_module_signals_and_carry_the_checkbox() {
+    let signals: Vec<_> = [
+        ("Alpha", 1),
+        ("::inner", 2),
+        // A number with any ordinary name is not a module signal.
+        ("::alias", 3),
+        ("Named", 3),
+        ("Alpha again", 1),
+        ("::other", 4),
+    ]
+    .into_iter()
+    .map(|(name, signum)| Signal {
+        name: name.into(),
+        metadata: [signum, 0, 0, 0, 0, 1],
+    })
+    .collect();
+    assert_eq!(
+        debug_signals(&signals, false),
+        DebugSignals {
+            signals: vec![1, 3],
+            modules: vec![2, 4],
+            show_modules: false,
+        }
+    );
+    assert!(debug_signals(&signals, true).show_modules);
+}
+
+#[test]
+fn signal_types_come_from_the_signature_and_are_coloured_legibly_in_both_themes() {
+    let signal = |kind: u8| Signal {
+        name: "x".into(),
+        metadata: [1, 0, 0, 0, kind, 3],
+    };
+    assert_eq!(signal(0x00).kind(), SignalKind::Digital);
+    assert_eq!(signal(0x01).kind(), SignalKind::Analog);
+    assert_eq!(signal(0x02).kind(), SignalKind::Serial);
+    // The constant 0 and 1 signals.
+    assert_eq!(signal(0x80).kind(), SignalKind::Digital);
+    assert_eq!(signal(0x05).kind(), SignalKind::Unknown);
+    assert_eq!(SignalKind::Unknown.color(true), None);
+
+    /// WCAG contrast ratio between two opaque colours.
+    fn contrast(a: egui::Color32, b: egui::Color32) -> f32 {
+        let luminance = |color: egui::Color32| {
+            let channel = |value: u8| {
+                let value = f32::from(value) / 255.0;
+                if value <= 0.04045 {
+                    value / 12.92
+                } else {
+                    ((value + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * channel(color.r()) + 0.7152 * channel(color.g()) + 0.0722 * channel(color.b())
+        };
+        let (light, dark) = {
+            let (a, b) = (luminance(a), luminance(b));
+            (a.max(b), a.min(b))
+        };
+        (light + 0.05) / (dark + 0.05)
+    }
+    for visuals in [egui::Visuals::dark(), egui::Visuals::light()] {
+        let background = visuals.panel_fill;
+        let mut shades = Vec::new();
+        for kind in [SignalKind::Digital, SignalKind::Analog, SignalKind::Serial] {
+            let color = kind.color(visuals.dark_mode).unwrap();
+            let ratio = contrast(color, background);
+            assert!(
+                ratio >= 4.5,
+                "{kind:?} is {ratio:.1}:1 in dark={}",
+                visuals.dark_mode
+            );
+            shades.push(color);
+        }
+        shades.dedup();
+        assert_eq!(shades.len(), 3, "each type has its own shade");
+    }
+    // Serial is the near-white shade in the dark theme.
+    let serial = SignalKind::Serial.color(true).unwrap();
+    assert!(serial.r() == serial.g() && serial.g() == serial.b() && serial.r() >= 230);
+
+    // The tree draws each name in its type's shade, and a locally disabled
+    // signal stays weak however it is typed.
+    let ctx = egui::Context::default();
+    let mut panel = Panel::new("processor".into(), "Processor");
+    panel.signals = [
+        ("Power_On", 0x00),
+        ("Volume", 0x01),
+        ("Label$", 0x02),
+        ("Muted", 0x00),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(i, (name, kind))| Signal {
+        name: name.into(),
+        metadata: [0x10 + i as u8, 0, 0, 0, kind, 3],
+    })
+    .collect();
+    panel.disabled_signals.insert(0x13);
+    for dark in [true, false] {
+        ctx.set_theme(if dark {
+            egui::Theme::Dark
+        } else {
+            egui::Theme::Light
+        });
+        let output = ctx.run_ui(Default::default(), |ui| {
+            for index in 0..panel.signals.len() {
+                panel.show_signal_row(ui, index);
+            }
+        });
+        let color = |name: &str| {
+            output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text) if text.galley.text() == name => {
+                        Some(text.galley.job.sections[0].format.color)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{name} drawn"))
+        };
+        assert_eq!(color("Power_On"), SignalKind::Digital.color(dark).unwrap());
+        assert_eq!(color("Volume"), SignalKind::Analog.color(dark).unwrap());
+        assert_eq!(color("Label$"), SignalKind::Serial.color(dark).unwrap());
+        assert_eq!(color("Muted"), ctx.global_style().visuals.weak_text_color());
+        output.drop_without_applying_deltas();
+    }
+}
+
+#[test]
+fn tree_names_and_values_sit_at_the_left_of_their_columns() {
+    let ctx = egui::Context::default();
+    let mut panel = Panel::new("processor".into(), "Processor");
+    panel.signals = vec![Signal {
+        name: "On".into(),
+        metadata: [0x10, 0, 0, 0, 0, 3],
+    }];
+    panel.ensure_signal_lookup();
+    panel.values.insert(0x10, "1".into());
+    let mut row = egui::Rect::NOTHING;
+    let mut output = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(600.0, 200.0),
+            )),
+            ..Default::default()
+        },
+        |ui| {
+            row = ui.available_rect_before_wrap();
+            panel.show_signal_row(ui, 0);
+        },
+    );
+    // Cleared now, so a failed assertion below reports rather than aborts.
+    output.textures_delta.clear();
+    let left_of = |label: &str| {
+        output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) if text.galley.text() == label => Some(text.pos.x),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{label} drawn"))
+    };
+    let name = left_of("On");
+    assert!(
+        name - row.left() < 12.0,
+        "name starts {:.0}px in",
+        name - row.left()
+    );
+    let split = row.right() - panel.value_column_width();
+    let value = left_of("1");
+    assert!(
+        value > split && value - split < 12.0,
+        "value starts {:.0}px into its column",
+        value - split
+    );
+}
+
+#[test]
+fn the_chosen_font_reaches_every_view_and_watch_names_are_coloured_by_type() {
+    let ctx = egui::Context::default();
+    let mut panel = Panel::new("processor".into(), "Processor");
+    panel.signals = [("Power_On", 0x00), ("Volume", 0x01), ("Label$", 0x02)]
+        .into_iter()
+        .enumerate()
+        .map(|(i, (name, kind))| Signal {
+            name: name.into(),
+            metadata: [0x10 + i as u8, 0, 0, 0, kind, 3],
+        })
+        .collect();
+    panel
+        .groups
+        .get_mut("Watched")
+        .unwrap()
+        .extend([0x10, 0x11, 0x12]);
+
+    panel.ingest(
+        b"\x01\r\n00000010:1=1\r\n00000011:1=42\r\n00000012:1=hello\r\n\x03",
+        SystemTime::now(),
+    );
+    panel.fonts = crate::signal_font::SignalFonts {
+        name: egui::FontId::monospace(19.0),
+        value: egui::FontId::proportional(17.0),
+    };
+    // Every name and value, wherever it is drawn: (text, font, colour).
+    let mut drawn: Vec<(String, egui::FontId, egui::Color32)> = Vec::new();
+    for _ in 0..3 {
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1600.0, 900.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                panel.contents(ui);
+                // The tree's ranges start collapsed; draw its rows directly.
+                egui::Window::new("rows").show(ui.ctx(), |ui| {
+                    for index in 0..panel.signals.len() {
+                        panel.show_signal_row(ui, index);
+                    }
+                });
+            },
+        );
+        drawn = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) => {
+                    let format = &text.galley.job.sections[0].format;
+                    Some((
+                        text.galley.text().to_owned(),
+                        format.font_id.clone(),
+                        format.color,
+                    ))
+                }
+                _ => None,
+            })
+            .collect();
+        output.drop_without_applying_deltas();
+    }
+    let fonts_of = |label: &str| -> Vec<egui::FontId> {
+        drawn
+            .iter()
+            .filter(|(text, ..)| text == label)
+            .map(|(_, font, _)| font.clone())
+            .collect()
+    };
+    // Tree row, watch group and timeline each draw the name and value.
+    for name in ["Power_On", "Volume", "Label$"] {
+        let fonts = fonts_of(name);
+        assert!(fonts.len() >= 3, "{name} drawn {} times", fonts.len());
+        assert!(
+            fonts
+                .iter()
+                .all(|font| *font == egui::FontId::monospace(19.0)),
+            "{name}: {fonts:?}"
+        );
+    }
+    for value in ["42", "hello"] {
+        let fonts = fonts_of(value);
+        assert!(fonts.len() >= 3, "{value} drawn {} times", fonts.len());
+        assert!(
+            fonts
+                .iter()
+                .all(|font| *font == egui::FontId::proportional(17.0)),
+            "{value}: {fonts:?}"
+        );
+    }
+    // Watch-group names are coloured the way the tree's are: each type's
+    // colour appears on its name in both places.
+    let dark = ctx.global_style().visuals.dark_mode;
+    for (name, kind) in [
+        ("Power_On", SignalKind::Digital),
+        ("Volume", SignalKind::Analog),
+        ("Label$", SignalKind::Serial),
+    ] {
+        let coloured = drawn
+            .iter()
+            .filter(|(text, _, color)| text == name && Some(*color) == kind.color(dark))
+            .count();
+        assert!(
+            coloured >= 2,
+            "{name} coloured in tree and watch group, found {coloured}"
+        );
+    }
+    assert!(
+        !drawn.iter().any(|(text, ..)| text == "✕"),
+        "no per-row remove button"
+    );
+}
+
+#[test]
+fn show_module_signals_asks_a_running_session_and_reports_how_signals_are_monitored() {
+    fn click_checkbox(ctx: &egui::Context, panel: &mut Panel) {
+        let render = |panel: &mut Panel, events| {
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1600.0, 900.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| panel.contents(ui),
+            )
+        };
+        for _ in 0..2 {
+            render(panel, vec![]).drop_without_applying_deltas();
+        }
+        let output = render(panel, vec![]);
+        let pos = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) if text.galley.text() == "Show module signals" => {
+                    Some(text.pos + text.galley.size() * 0.5)
+                }
+                _ => None,
+            })
+            .expect("checkbox");
+        output.drop_without_applying_deltas();
+        for pressed in [true, false] {
+            render(
+                panel,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            )
+            .drop_without_applying_deltas();
+        }
+    }
+    let ctx = egui::Context::default();
+    let mut panel = Panel::new("processor".into(), "Processor");
+
+    // Without a session it only shows or hides them.
+    click_checkbox(&ctx, &mut panel);
+    assert!(panel.show_modules());
+    click_checkbox(&ctx, &mut panel);
+    assert!(!panel.show_modules());
+
+    panel.connect();
+    let (mut commands, output) = panel.pending_session.take().unwrap();
+    output
+        .try_send(DebugEvent::Monitoring {
+            global: false,
+            reporting: 3157,
+        })
+        .unwrap();
+    panel.poll();
+    assert_eq!(
+        panel.status,
+        "Monitoring — processor reporting 3157 signals, module signals off"
+    );
+    click_checkbox(&ctx, &mut panel);
+    assert!(matches!(
+        commands.try_recv(),
+        Ok(DebugCommand::ShowModules(true))
+    ));
+    output
+        .try_send(DebugEvent::Monitoring {
+            global: false,
+            reporting: 5361,
+        })
+        .unwrap();
+    panel.poll();
+    assert_eq!(
+        panel.status,
+        "Monitoring — processor reporting 5361 signals"
+    );
+    click_checkbox(&ctx, &mut panel);
+    assert!(matches!(
+        commands.try_recv(),
+        Ok(DebugCommand::ShowModules(false))
+    ));
+
+    output
+        .try_send(DebugEvent::Monitoring {
+            global: true,
+            reporting: 5361,
+        })
+        .unwrap();
+    output.try_send(DebugEvent::SyncComplete).unwrap();
+    panel.poll();
+    assert_eq!(
+        panel.status,
+        "Initial sync complete — global debugging was already on, so every signal reports; 0 exclusions restored"
+    );
+}
+
+#[test]
+fn module_signals_stay_out_of_tree_and_timeline_until_the_checkbox_is_ticked() {
+    let ctx = egui::Context::default();
+    let mut panel = Panel::new("processor".into(), "Processor");
+    panel.signals = ["Alpha", "::module"]
+        .into_iter()
+        .enumerate()
+        .map(|(i, name)| Signal {
+            name: name.into(),
+            metadata: [i as u8, 0, 0, 0, 0, 1],
+        })
+        .collect();
+    panel.ingest(
+        b"\x0100000000:1=111\r\n00000001:1=222\r\n\x03",
+        SystemTime::now(),
+    );
+    let tree_signums = |panel: &Panel| {
+        let mut order = Vec::new();
+        for node in panel.tree.as_ref().unwrap() {
+            node.ordered_signums(&panel.signals, &mut order);
+        }
+        order
+    };
+
+    assert!(!panel.show_modules);
+    ctx.run_ui(Default::default(), |ui| panel.contents(ui))
+        .drop_without_applying_deltas();
+    assert_eq!(tree_signums(&panel), [0]);
+    assert_eq!(panel.timeline_indices(), [0]);
+    // Hidden module signals still keep their current value and history.
+    assert_eq!(panel.values[&1], "222");
+    assert_eq!(panel.samples.len(), 2);
+
+    panel.show_modules = true;
+    ctx.run_ui(Default::default(), |ui| panel.contents(ui))
+        .drop_without_applying_deltas();
+    assert_eq!(tree_signums(&panel), [0, 1]);
+    assert_eq!(panel.timeline_indices(), [1, 0]);
+
+    panel.show_modules = false;
+    ctx.run_ui(Default::default(), |ui| panel.contents(ui))
+        .drop_without_applying_deltas();
+    assert_eq!(tree_signums(&panel), [0]);
+    assert_eq!(panel.timeline_indices(), [0]);
 }
 
 #[test]
@@ -886,7 +1460,7 @@ fn signal_tree_sorts_names_and_splits_every_leaf_at_fifty() {
             metadata: [index as u8, 0, 0, 0, 0, 1],
         })
         .collect();
-    let tree = signal_tree(&signals, "");
+    let tree = signal_tree(&signals, "", false);
     let mut leaves = Vec::new();
     tree_indices(&tree, &mut leaves);
     assert_eq!(
@@ -911,11 +1485,11 @@ fn signal_tree_search_preserves_duplicate_records_and_balances_branches() {
             metadata: [index as u8, (index >> 8) as u8, 0, 0, 0, 1],
         })
         .collect();
-    let tree = signal_tree(&signals, "sAm");
+    let tree = signal_tree(&signals, "sAm", false);
     let mut leaves = Vec::new();
     tree_indices(&tree, &mut leaves);
     assert_eq!(leaves, vec![vec![0, 1, 2]]);
-    let tree = signal_tree(&signals, "");
+    let tree = signal_tree(&signals, "", false);
     assert!(tree.len() <= 10);
     let mut leaves = Vec::new();
     tree_indices(&tree, &mut leaves);
@@ -934,10 +1508,10 @@ fn signal_tree_boundary_and_empty_search() {
             count
         ];
         let mut leaves = Vec::new();
-        tree_indices(&signal_tree(&signals, ""), &mut leaves);
+        tree_indices(&signal_tree(&signals, "", false), &mut leaves);
         assert_eq!(leaves.len(), count.div_ceil(50));
         assert!(leaves.iter().all(|leaf| leaf.len() <= 50));
-        assert!(signal_tree(&signals, "missing").is_empty());
+        assert!(signal_tree(&signals, "missing", false).is_empty());
     }
 }
 
