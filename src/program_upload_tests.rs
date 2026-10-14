@@ -107,10 +107,19 @@ impl russh_sftp::server::Handler for SignatureServer {
         _: u64,
         data: Vec<u8>,
     ) -> Result<Status, Self::Error> {
+        // A signature arrives zipped, as SIMPL leaves it; record what it holds.
+        let data = if handle.ends_with(".zig") {
+            let member = crate::archive::sole_member(&data, "sig", 1 << 20).unwrap();
+            let name_length = usize::from(u16::from_le_bytes([data[26], data[27]]));
+            let name = String::from_utf8_lossy(&data[30..30 + name_length]);
+            format!("zip[{name}]:{}", String::from_utf8_lossy(&member))
+        } else {
+            String::from_utf8_lossy(&data).into_owned()
+        };
         self.steps
             .lock()
             .unwrap()
-            .push(format!("write:{handle}:{}", String::from_utf8_lossy(&data)));
+            .push(format!("write:{handle}:{data}"));
         Ok(ok_status(id))
     }
 
@@ -223,7 +232,7 @@ fn program_upload_orders_signature_after_load_and_reports_failures() {
                     "close:/program03/room.lpz",
                     "exec:progload -p:3",
                     "open:/program03/room.zig",
-                    "write:/program03/room.zig:signature",
+                    "write:/program03/room.zig:zip[room.sig]:signature",
                     "close:/program03/room.zig",
                 ]
             } else {

@@ -10,6 +10,9 @@ use std::{
 
 const HEADER: &[u8] = b"[LOGOSSIG001.000]";
 const MAX_EVENTS: usize = 20_000;
+/// Large programs' signatures run to a few MiB; this only stops a hostile
+/// archive from expanding without bound.
+const MAX_EXPANDED_SIGNATURE: u64 = 256 << 20;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Signal {
@@ -22,7 +25,18 @@ impl Signal {
     }
 }
 
+/// A raw `.sig`, or the zip archive holding one that SIMPL and Toolbox leave
+/// on the processor as the `.zig`.
 pub(crate) fn parse_signals(bytes: &[u8]) -> Result<Vec<Signal>, String> {
+    if bytes.starts_with(b"PK\x03\x04") {
+        let signature = crate::archive::sole_member(bytes, "sig", MAX_EXPANDED_SIGNATURE)
+            .map_err(|error| format!("Could not read the zipped signature: {error}"))?;
+        return parse_records(&signature);
+    }
+    parse_records(bytes)
+}
+
+fn parse_records(bytes: &[u8]) -> Result<Vec<Signal>, String> {
     if !bytes.starts_with(HEADER) {
         return Err("Unknown signature format".into());
     }

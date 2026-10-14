@@ -1325,6 +1325,9 @@ struct Transfer {
     local: PathBuf,
     remote: String,
     display: String,
+    /// Sent as a zip archive holding the local file under this name, rather
+    /// than as the file itself.
+    zipped_as: Option<String>,
 }
 
 impl Transfer {
@@ -1333,6 +1336,14 @@ impl Transfer {
             local: local.into(),
             remote,
             display,
+            zipped_as: None,
+        }
+    }
+
+    fn zipped_as(self, member: String) -> Self {
+        Self {
+            zipped_as: Some(member),
+            ..self
         }
     }
 }
@@ -1470,7 +1481,8 @@ async fn upload_staged(
 }
 
 /// Load the program first, then leave its signature in the slot directory as
-/// `.zig`. `progload` must not run after the signature has been transferred.
+/// `.zig`: a zip archive holding the `.sig`, as SIMPL and Toolbox leave it.
+/// `progload` must not run after the signature has been transferred.
 async fn upload_program(
     spec: &ConnectionSpec,
     local_path: &Path,
@@ -1488,17 +1500,18 @@ async fn upload_program(
         file_name.clone(),
     );
     let signature = if let Some(signature) = signature {
-        let remote_name = signature_remote_name(&file_name).ok_or_else(|| {
+        let unsafe_name = || {
             message(
                 spec,
                 "The program's signature has an unsafe or missing file name",
             )
-        })?;
-        Some(Transfer::new(
-            signature,
-            format!("{directory}/{remote_name}"),
-            remote_name,
-        ))
+        };
+        let remote_name = signature_remote_name(&file_name).ok_or_else(unsafe_name)?;
+        let member = safe_remote_file_name(signature).ok_or_else(unsafe_name)?;
+        Some(
+            Transfer::new(signature, format!("{directory}/{remote_name}"), remote_name)
+                .zipped_as(member),
+        )
     } else {
         None
     };
@@ -1839,7 +1852,7 @@ async fn stage(
     Ok(Staged::Ready(sftp))
 }
 
-type UploadSource = (Transfer, tokio::fs::File, u64);
+type UploadSource = (Transfer, Box<dyn tokio::io::AsyncRead + Send + Unpin>, u64);
 
 async fn open_upload_source(
     spec: &ConnectionSpec,
@@ -1853,12 +1866,29 @@ async fn open_upload_source(
                 format!("Could not open {}: {error}", transfer.local.display()),
             )
         })?;
-    let length = file
+    let metadata = file
         .metadata()
         .await
-        .map_err(|error| message(spec, error.to_string()))?
-        .len();
-    Ok((transfer, file, length))
+        .map_err(|error| message(spec, error.to_string()))?;
+    let Some(member) = &transfer.zipped_as else {
+        return Ok((transfer, Box::new(file), metadata.len()));
+    };
+    // Signatures run to a few MiB, so the archive is built in memory.
+    let mut data = Vec::new();
+    let mut file = file;
+    file.read_to_end(&mut data).await.map_err(|error| {
+        message(
+            spec,
+            format!("Could not read {}: {error}", transfer.local.display()),
+        )
+    })?;
+    let modified = metadata
+        .modified()
+        .unwrap_or_else(|_| std::time::SystemTime::now());
+    let zipped = crate::archive::single_member(member, &data, modified)
+        .map_err(|error| message(spec, error))?;
+    let length = zipped.len() as u64;
+    Ok((transfer, Box::new(std::io::Cursor::new(zipped)), length))
 }
 
 async fn send_upload_source(

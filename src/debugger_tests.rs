@@ -26,6 +26,36 @@ fn parse_signals_preserves_name_and_number() {
 }
 
 #[test]
+fn parse_signals_reads_the_zipped_signature_a_processor_keeps() {
+    use crate::test_support::{stamp, zip};
+    let sig = fixture("Zipped", [0x10, 0x10, 0, 0, 0, 1]);
+    let when = stamp(2026, 10, 13, 20, 26);
+    for deflate in [true, false] {
+        let zig = zip(&[("training.sig", &sig, deflate, when)]);
+        let signals = parse_signals(&zig).unwrap();
+        assert_eq!(signals[0].name, "Zipped");
+        assert_eq!(signals[0].signum(), 0x1010);
+    }
+    let alongside = zip(&[
+        ("readme.txt", b"not a signature", false, when),
+        ("Program.SIG", &sig, true, when),
+    ]);
+    assert_eq!(parse_signals(&alongside).unwrap()[0].name, "Zipped");
+
+    let none = zip(&[("readme.txt", b"text", false, when)]);
+    assert!(parse_signals(&none).unwrap_err().contains("no .sig"));
+    let two = zip(&[("a.sig", &sig, true, when), ("b.sig", &sig, true, when)]);
+    assert!(parse_signals(&two).unwrap_err().contains("more than one"));
+    let wrong = zip(&[("bad.sig", b"[OTHER]", true, when)]);
+    assert_eq!(
+        parse_signals(&wrong).unwrap_err(),
+        "Unknown signature format"
+    );
+    let zig = zip(&[("training.sig", &sig, true, when)]);
+    assert!(parse_signals(&zig[..zig.len() - 8]).is_err());
+}
+
+#[test]
 fn parse_processor_example_if_present() {
     if let Ok(bytes) = std::fs::read("rmc3_test.sig") {
         let signals = parse_signals(&bytes).unwrap();

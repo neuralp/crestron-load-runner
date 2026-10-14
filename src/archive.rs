@@ -4,6 +4,9 @@
 //! describing the build, and a `.zip` update carries nothing but its files.
 //! Only the central directory and, at most, one small entry are ever read, so
 //! this stays cheap on a firmware image of any size.
+//!
+//! A program's signature travels as a zip too: the `.zig` on a processor is
+//! an archive of one `.sig`, written and read here in memory.
 
 use std::{
     fs::File,
@@ -102,6 +105,165 @@ pub fn read(path: &Path) -> Result<Archive, String> {
         archive.package = package_section(&entry.read(&mut file)?);
     }
     Ok(archive)
+}
+
+/// The one member of an in-memory archive whose name ends in `.extension`,
+/// expanded. A processor keeps a program's signature this way, as a `.zig`
+/// holding the `.sig`. `limit` caps the expanded size.
+pub fn sole_member(bytes: &[u8], extension: &str, limit: u64) -> Result<Vec<u8>, String> {
+    let start = (0..=bytes.len().saturating_sub(22))
+        .rev()
+        .take(22 + usize::from(u16::MAX))
+        .find(|&index| u32_at(bytes, index) == Some(END_OF_CENTRAL_DIRECTORY))
+        .ok_or("Not a zip archive: no end-of-central-directory record")?;
+    let record = &bytes[start..];
+    let entries = field(u16_at(record, 10))? as usize;
+    let offset = field(u32_at(record, 16))? as usize;
+    let suffix = format!(".{}", extension.to_ascii_lowercase());
+    let mut found = Vec::new();
+    let mut cursor = offset;
+    for _ in 0..entries {
+        let header = bytes
+            .get(cursor..)
+            .filter(|header| header.len() >= 46)
+            .ok_or("Truncated zip central directory")?;
+        if u32_at(header, 0) != Some(CENTRAL_FILE_HEADER) {
+            return Err("Damaged zip central directory".into());
+        }
+        let name_length = field(u16_at(header, 28))? as usize;
+        let extra_length = field(u16_at(header, 30))? as usize;
+        let comment_length = field(u16_at(header, 32))? as usize;
+        let name = header
+            .get(46..46 + name_length)
+            .ok_or("Truncated zip entry name")?;
+        if String::from_utf8_lossy(name)
+            .to_ascii_lowercase()
+            .ends_with(&suffix)
+        {
+            found.push(Entry {
+                method: field(u16_at(header, 10))?,
+                compressed: u64::from(field(u32_at(header, 20))?),
+                uncompressed: u64::from(field(u32_at(header, 24))?),
+                offset: u64::from(field(u32_at(header, 42))?),
+            });
+        }
+        cursor += 46 + name_length + extra_length + comment_length;
+    }
+    let entry = match found.as_slice() {
+        [one] => one,
+        [] => return Err(format!("Archive holds no .{extension} file")),
+        _ => return Err(format!("Archive holds more than one .{extension} file")),
+    };
+    if entry.uncompressed > limit {
+        return Err(format!("Archived .{extension} is implausibly large"));
+    }
+    let header = usize::try_from(entry.offset)
+        .ok()
+        .and_then(|offset| bytes.get(offset..))
+        .filter(|header| header.len() >= 30)
+        .ok_or("Truncated zip entry header")?;
+    if u32_at(header, 0) != Some(LOCAL_FILE_HEADER) {
+        return Err("Damaged zip entry header".into());
+    }
+    let skip = 30 + field(u16_at(header, 26))? as usize + field(u16_at(header, 28))? as usize;
+    let compressed = header
+        .get(skip..)
+        .and_then(|data| data.get(..usize::try_from(entry.compressed).ok()?))
+        .ok_or("Truncated zip entry")?;
+    let expanded = match entry.method {
+        0 => compressed.to_vec(),
+        8 => {
+            let mut expanded = Vec::new();
+            flate2::read::DeflateDecoder::new(compressed)
+                .take(limit + 1)
+                .read_to_end(&mut expanded)
+                .map_err(|error| format!("Could not expand the .{extension}: {error}"))?;
+            expanded
+        }
+        method => return Err(format!(".{extension} uses compression method {method}")),
+    };
+    if expanded.len() as u64 != entry.uncompressed {
+        return Err(format!(
+            "Archived .{extension} does not match its recorded size"
+        ));
+    }
+    Ok(expanded)
+}
+
+/// A zip archive of one deflated member, the way SIMPL and Toolbox leave a
+/// program's `.sig` on the processor as its `.zig`. `modified` is when the
+/// member was last written; zip records it as local wall-clock time.
+pub fn single_member(name: &str, data: &[u8], modified: SystemTime) -> Result<Vec<u8>, String> {
+    use std::io::Write as _;
+    let too_large = || format!("{name} is too large to archive");
+    let name_length = u16::try_from(name.len()).map_err(|_| format!("{name}: name too long"))?;
+    let size = u32::try_from(data.len()).map_err(|_| too_large())?;
+    let mut encoder =
+        flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder
+        .write_all(data)
+        .map_err(|error| format!("Could not compress {name}: {error}"))?;
+    let compressed = encoder
+        .finish()
+        .map_err(|error| format!("Could not compress {name}: {error}"))?;
+    let compressed_size = u32::try_from(compressed.len()).map_err(|_| too_large())?;
+    let mut crc = flate2::Crc::new();
+    crc.update(data);
+    let (date, time) = dos_timestamp(modified);
+    // Version needed, flags, method (deflate), time, date, CRC, sizes, name length.
+    let common = |bytes: &mut Vec<u8>| {
+        for value in [20u16, 0, 8, time, date] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        for value in [crc.sum(), compressed_size, size] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes.extend_from_slice(&name_length.to_le_bytes());
+    };
+
+    let mut bytes = Vec::with_capacity(compressed.len() + 2 * name.len() + 98);
+    bytes.extend_from_slice(&LOCAL_FILE_HEADER.to_le_bytes());
+    common(&mut bytes);
+    bytes.extend_from_slice(&0u16.to_le_bytes()); // extra length
+    bytes.extend_from_slice(name.as_bytes());
+    bytes.extend_from_slice(&compressed);
+
+    let directory = u32::try_from(bytes.len()).map_err(|_| too_large())?;
+    bytes.extend_from_slice(&CENTRAL_FILE_HEADER.to_le_bytes());
+    bytes.extend_from_slice(&20u16.to_le_bytes()); // version made by
+    common(&mut bytes);
+    // Extra and comment lengths, disk, internal and external attributes.
+    for value in [0u16, 0, 0, 0] {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // local header offset
+    bytes.extend_from_slice(name.as_bytes());
+    let directory_size = u32::try_from(bytes.len()).map_err(|_| too_large())? - directory;
+
+    bytes.extend_from_slice(&END_OF_CENTRAL_DIRECTORY.to_le_bytes());
+    for value in [0u16, 0, 1, 1] {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes.extend_from_slice(&directory_size.to_le_bytes());
+    bytes.extend_from_slice(&directory.to_le_bytes());
+    bytes.extend_from_slice(&0u16.to_le_bytes()); // comment length
+    Ok(bytes)
+}
+
+/// MS-DOS date and time, which cannot express anything before 1980.
+fn dos_timestamp(at: SystemTime) -> (u16, u16) {
+    use chrono::{Datelike as _, Timelike as _};
+    let local: chrono::DateTime<chrono::Local> = at.into();
+    if local.year() < 1980 {
+        return ((1 << 5) | 1, 0);
+    }
+    let date = ((local.year() - 1980).min(127) as u16) << 9
+        | (local.month() as u16) << 5
+        | local.day() as u16;
+    let time =
+        (local.hour() as u16) << 11 | (local.minute() as u16) << 5 | (local.second() as u16 / 2);
+    (date, time)
 }
 
 struct Entry {
@@ -247,6 +409,7 @@ fn u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
 mod tests {
     use super::*;
     use crate::test_support::{TestDir, stamp, zip};
+    use chrono::TimeZone as _;
 
     fn written(dir: &TestDir, name: &str, bytes: &[u8]) -> std::path::PathBuf {
         let path = dir.path().join(name);
@@ -328,6 +491,26 @@ mod tests {
             read(&path).unwrap().package,
             [("Name".to_owned(), "TSW-1070".to_owned())]
         );
+    }
+
+    #[test]
+    fn a_single_member_archive_round_trips_with_its_checksum_and_time() {
+        let data: Vec<u8> = (0..50_000u32).map(|n| (n % 251) as u8).collect();
+        let at = chrono::Local
+            .with_ymd_and_hms(2026, 10, 13, 20, 26, 58)
+            .unwrap()
+            .into();
+        let bytes = single_member("training.sig", &data, at).unwrap();
+        assert_eq!(sole_member(&bytes, "sig", 1 << 20).unwrap(), data);
+        let mut crc = flate2::Crc::new();
+        crc.update(&data);
+        assert_eq!(u32_at(&bytes, 14), Some(crc.sum()));
+
+        let dir = TestDir::new();
+        let archive = read(&written(&dir, "training.zig", &bytes)).unwrap();
+        assert_eq!(archive.entries, 1);
+        assert_eq!(archive.newest.as_deref(), Some("2026-10-13 20:26"));
+        assert_eq!(dos_timestamp(UNIX_EPOCH), (0x21, 0));
     }
 
     #[test]
