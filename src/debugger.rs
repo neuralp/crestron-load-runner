@@ -538,6 +538,9 @@ pub(crate) struct Panel {
     next_sample_id: u64,
     selected_sample: Option<u64>,
     detail_signal: Option<u32>,
+    editor: control::Editor,
+    write_ready: bool,
+    held_signal: Option<u32>,
     disabled_signals: HashSet<u32>,
     tree_selection: HashSet<u32>,
     tree_anchor: Option<u32>,
@@ -556,6 +559,9 @@ impl Panel {
     }
 
     pub fn reset_signals(&mut self) {
+        self.release_held();
+        self.editor = Default::default();
+        self.write_ready = false;
         self.suspend_settings();
         self.monitoring = None;
         self.signals.clear();
@@ -610,6 +616,9 @@ impl Panel {
             next_sample_id: 0,
             selected_sample: None,
             detail_signal: None,
+            editor: Default::default(),
+            write_ready: false,
+            held_signal: None,
             disabled_signals: HashSet::new(),
             tree_selection: HashSet::new(),
             tree_anchor: None,
@@ -624,6 +633,8 @@ impl Panel {
         }
     }
     pub fn stop(&mut self) {
+        self.release_held();
+        self.write_ready = false;
         self.save_settings();
         if let Some(input) = self.input.take() {
             let _ = input.send(DebugCommand::Stop);
@@ -672,6 +683,11 @@ impl Panel {
                 Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                     if self.session_sent {
                         self.running = false;
+                        self.write_ready = false;
+                        if self.held_signal.take().is_some() {
+                            self.editor.status =
+                                "Disconnected: held signal release could not be confirmed".into();
+                        }
                         self.stopping = false;
                         self.session_sent = false;
                         self.input = None;
@@ -690,6 +706,7 @@ impl Panel {
                     self.status = "Connected — reading debug flags…".into();
                 }
                 DebugEvent::SyncComplete => {
+                    self.write_ready = true;
                     self.restore_exclusions_after_sync();
                     self.status = format!(
                         "Initial sync complete — {}; {} exclusions restored",
@@ -701,9 +718,22 @@ impl Panel {
                     self.monitoring = Some((global, reporting));
                     self.status = format!("Monitoring — {}", self.monitoring_summary());
                 }
+                DebugEvent::WriteResult { signum, result } => {
+                    if self.editor.signum == Some(signum) {
+                        self.editor.status = result.map_or_else(
+                            |error| format!("Write failed: {error}"),
+                            |_| "Command sent — see received value/history for the result".into(),
+                        );
+                    }
+                }
                 DebugEvent::Output { bytes, received_at } => self.ingest(&bytes, received_at),
                 DebugEvent::Closed(error) => {
                     self.running = false;
+                    self.write_ready = false;
+                    self.held_signal = None;
+                    if !error.is_empty() {
+                        self.editor.status = error.clone();
+                    }
                     self.input = None;
                     self.stopping = false;
                     self.session_sent = false;
@@ -744,6 +774,7 @@ impl Panel {
     }
 
     fn connect(&mut self) {
+        self.write_ready = false;
         let (input, commands) = tokio::sync::mpsc::unbounded_channel();
         let (reply, output) = tokio::sync::mpsc::channel(256);
         self.input = Some(input);
@@ -1524,6 +1555,9 @@ impl Panel {
 
 #[path = "debugger_details.rs"]
 mod details;
+
+#[path = "debugger_control.rs"]
+mod control;
 
 #[path = "debugger_state.rs"]
 mod persistence;

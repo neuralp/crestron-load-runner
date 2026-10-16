@@ -77,14 +77,40 @@ fn double_click_opens_details_from_each_signal_view() {
             render(&mut panel, vec![]).drop_without_applying_deltas();
         }
         let output = render(&mut panel, vec![]);
-        for label in [
-            "Signal details",
-            "Signal ID",
-            "Raw value",
-            "Recorded history · 2 updates",
-            "before",
-            "after",
-        ] {
+        for label in ["Signal details", "Signal ID", "Raw value"] {
+            assert!(
+                output.shapes.iter().any(
+                    |s| matches!(&s.shape, egui::epaint::Shape::Text(t) if t.galley.text() == label)
+                ),
+                "missing {label} from {source}"
+            );
+        }
+        // Controls add content above the history; scroll the shared body.
+        let body = output
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) if t.galley.text() == "Signal ID" => Some(t.pos),
+                _ => None,
+            })
+            .unwrap();
+        for _ in 0..10 {
+            render(
+                &mut panel,
+                vec![
+                    egui::Event::PointerMoved(body),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0.0, -500.0),
+                        modifiers: egui::Modifiers::NONE,
+                        phase: egui::TouchPhase::Move,
+                    },
+                ],
+            )
+            .drop_without_applying_deltas();
+        }
+        let output = render(&mut panel, vec![]);
+        for label in ["Recorded history · 2 updates", "before", "after"] {
             assert!(
                 output.shapes.iter().any(
                     |s| matches!(&s.shape, egui::epaint::Shape::Text(t) if t.galley.text() == label)
@@ -209,6 +235,17 @@ fn long_history_scrolls_with_the_whole_details_body() {
     }
     let output = render(&mut panel, vec![]);
     let shown = texts(&output);
+    let controls: Vec<_> = shown
+        .iter()
+        .filter(|(text, _)| {
+            matches!(
+                text.as_str(),
+                "Set signal" | "High" | "Low" | "Pulse" | "Push and hold" | "Release"
+            )
+        })
+        .cloned()
+        .collect();
+    assert_eq!(controls.len(), 6);
     let heading = shown
         .iter()
         .find(|(text, _)| text == "Signal ID")
@@ -244,4 +281,14 @@ fn long_history_scrolls_with_the_whole_details_body() {
     let shown = texts(&render(&mut panel, vec![]));
     assert!(shown.iter().any(|(text, _)| text == "value-000"));
     assert!(!shown.iter().any(|(text, _)| text == "Signal ID"));
+    for (label, position) in controls {
+        let after = shown
+            .iter()
+            .find(|(text, _)| text == &label)
+            .unwrap_or_else(|| panic!("header control {label} scrolled away"));
+        assert!(
+            (after.1.y - position.y).abs() < 1.0,
+            "header control {label} moved"
+        );
+    }
 }

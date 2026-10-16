@@ -15,26 +15,46 @@ impl Panel {
     }
 
     pub(super) fn show_signal_details(&mut self, ctx: &egui::Context) {
+        if self.held_signal.is_some()
+            && (self.held_signal != self.detail_signal
+                || !ctx.input(|i| i.focused && i.pointer.primary_down() && i.pointer.has_pointer()))
+        {
+            self.release_held();
+        }
         let Some(signum) = self.detail_signal else {
             return;
         };
+        if self.editor.signum != Some(signum) {
+            self.editor = control::Editor::default();
+            self.editor.signum = Some(signum);
+        }
+        let kind = self.writable_kind(signum);
+        let enabled =
+            self.running && self.write_ready && !self.stopping && kind != SignalKind::Unknown;
+        let held = self.held_signal == Some(signum);
+        let mut editor = std::mem::take(&mut self.editor);
+        let mut action = None;
         let mode = self.display_types.get(&signum).copied().unwrap_or_default();
         let history = self.signal_history(signum);
         let mut close = false;
         let response = egui::Modal::new(egui::Id::new(("signal_details", &self.title, signum))).show(ctx, |ui| {
             ui.set_width(640.0_f32.min((ctx.content_rect().width() - 48.0).max(240.0)));
+            let header_top = ui.cursor().top();
             ui.horizontal(|ui| {
                 ui.heading("Signal details");
                 close = ui.button("Close").clicked();
             });
             ui.label(&self.title);
             ui.separator();
-            // One scroll for the whole body, so a long history gets the
-            // modal's full height rather than a box of its own.
+            action = editor.show(ui, kind, enabled, held);
+            ui.separator();
+            let header_height = ui.cursor().top() - header_top;
+            // Controls stay in the header while metadata and history share
+            // the remaining space in one scrolling body.
             egui::ScrollArea::vertical()
                 .id_salt(("signal_details_body", signum))
                 .auto_shrink([false, true])
-                .max_height((ctx.content_rect().height() - 140.0).max(200.0))
+                .max_height((ctx.content_rect().height() - header_height - 80.0).max(80.0))
                 .show(ui, |ui| {
                 egui::Grid::new("signal_detail_fields").num_columns(2).spacing([16.0, 6.0]).show(ui, |ui| {
                     ui.strong("Signal"); ui.label(egui::RichText::new(self.signal_name(signum)).font(self.fonts.name.clone())); ui.end_row();
@@ -89,8 +109,12 @@ impl Panel {
                 }
             });
         });
+        self.editor = editor;
         if close || response.should_close() {
+            self.release_held();
             self.detail_signal = None;
+        } else if let Some(value) = action {
+            self.set_signal(signum, value);
         }
     }
 }

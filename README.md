@@ -106,6 +106,16 @@ Monitoring first reads the slot's global flag with `MDBGSIGNAL:<slot> -A:SHOW`. 
 - An address book cannot overwrite the preferences file or anything in the firmware storage directory, including through symlink aliases. Trusting a key on an address-book device marks the address book as changed; save it to persist the fingerprint. A discovered-only device's key remains trusted for the session and is persisted if the device is subsequently added to the address book and saved.
 - SSH handshake, authentication, and SFTP calls have a 20-second blocking-call timeout. Load-command calls allow up to five minutes. A timeout does not prove a device-side load stopped; check the device before retrying.
 
+### Setting signals in the debugger
+
+Double-click a signal to open its details and **Set signal** controls. Controls are enabled after initial synchronization; constants and unknown/conflicting signal types are read-only.
+
+- **Digital:** High, Low, adjustable **Pulse** (1–65535 ms, default 100 ms), and **Push and hold**. Mouse-up, focus loss, closing/changing details, and Stop request a release. The SSH worker also releases held signals during shutdown. High is deliberately persistent; unlike Hold it is not automatically lowered. A network loss or application crash can prevent release—check the processor if cleanup is uncertain.
+- **Analog:** **Set value** accepts 0–65535, or −32768–32767 with **Signed** checked. Signed values are sent as their 16-bit two’s-complement bit patterns; changing the checkbox preserves those bits.
+- **Serial:** enter literal text and press **Send string**. Empty strings are allowed. Unicode is encoded as UTF-8 bytes; quotes, backslashes and control characters are escaped so text cannot become another console command. Overlong encoded commands are rejected rather than truncated.
+
+Writes use the existing authenticated SSH debugger channel and slot-scoped `SETSIGNAL:<slot>` commands. A sent command is not a fabricated timeline event: values/history only change on processor reports, and the running program may immediately change a value again. Serial signals may be transient and return empty on a later synchronization. Console command syntax, digital transitions/pulses, analog writes, and escaped serial reports were checked on an RMC3; UI and loopback tests cover validation and held-signal cleanup.
+
 ## Firmware library
 
 Open **Devices → Firmware Editor…**, which opens in its own window: a tree of the catalog on the left and the selected model on the right. The tree branches on the assigned firmware file, so every model sharing a file sits under it and models with nothing assigned stay at the root. Select a model there or enter one above, then choose **Choose firmware file…** to assign or replace its firmware. Models are remembered across restarts and are not removed by **Clear Devices**. The editor does not infer models from filenames.

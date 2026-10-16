@@ -77,6 +77,8 @@ impl Timings {
 const CHUNK: usize = 64 * 1024;
 
 mod debugger;
+mod debugger_write;
+pub use debugger_write::{SignalValue, SignalWrite};
 mod ipid_assignment;
 
 #[cfg(test)]
@@ -173,12 +175,17 @@ pub enum DebugCommand {
     Sync(Vec<u32>),
     /// Start or stop module signals being reported.
     ShowModules(bool),
+    Write(SignalWrite),
 }
 
 #[derive(Debug)]
 pub enum DebugEvent {
     Opened,
     SyncComplete,
+    WriteResult {
+        signum: u32,
+        result: Result<(), String>,
+    },
     /// How the processor is reporting, sent at startup and whenever it changes.
     Monitoring {
         /// Global debugging was already on, so every signal reports and

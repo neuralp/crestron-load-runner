@@ -127,6 +127,7 @@ fn signal_commands(slot: u8, verb: &str, signums: &[u32]) -> Vec<String> {
 struct Pending {
     sync: Vec<u32>,
     show_modules: Option<bool>,
+    writes: VecDeque<SignalWrite>,
 }
 
 impl Pending {
@@ -135,6 +136,7 @@ impl Pending {
         match command {
             Some(DebugCommand::Sync(signums)) => self.sync.extend(signums),
             Some(DebugCommand::ShowModules(show)) => self.show_modules = Some(show),
+            Some(DebugCommand::Write(write)) => self.writes.push_back(write),
             None | Some(DebugCommand::Stop) => return false,
         }
         true
@@ -164,6 +166,23 @@ async fn send_all(channel: &russh::Channel<client::Msg>, lines: &[String]) -> Re
     Ok(())
 }
 
+fn global_status(line: &str) -> Option<bool> {
+    let line = line.trim();
+    let line = if let Some((prompt, rest)) = line.split_once('>') {
+        if prompt.chars().any(char::is_whitespace) {
+            return None;
+        }
+        rest.trim()
+    } else {
+        line
+    };
+    match line {
+        "GLOBAL:ON" => Some(true),
+        "GLOBAL:OFF" => Some(false),
+        _ => None,
+    }
+}
+
 /// Read the console until the global flag's status arrives, handing every
 /// other line outside a value report to `line`. What arrives is forwarded to
 /// `output`, so value reports received meanwhile are kept.
@@ -173,7 +192,6 @@ async fn until_global(
     timeout: Duration,
     mut line: impl FnMut(&str),
 ) -> Result<bool, String> {
-    const PREFIX: &str = "GLOBAL:";
     tokio::time::timeout(timeout, async {
         let mut text = Vec::new();
         let mut in_frame = false;
@@ -197,14 +215,8 @@ async fn until_global(
                             _ if in_frame => {}
                             b'\r' | b'\n' => {
                                 let current = String::from_utf8_lossy(&text);
-                                if let Some(position) = current.find(PREFIX) {
-                                    let value = &current[position + PREFIX.len()..];
-                                    if value.starts_with("ON") {
-                                        return Ok(true);
-                                    }
-                                    if value.starts_with("OFF") {
-                                        return Ok(false);
-                                    }
+                                if let Some(global) = global_status(&current) {
+                                    return Ok(global);
                                 }
                                 line(&current);
                                 text.clear();
@@ -263,6 +275,43 @@ async fn flags_on(
     Ok(on)
 }
 
+/// SETSIGNAL executes asynchronously in the program. Read back after a short
+/// delay, preserving received reports rather than inventing a local value.
+async fn write_signal(
+    channel: &mut russh::Channel<client::Msg>,
+    slot: u8,
+    write: &SignalWrite,
+    output: Option<&tokio::sync::mpsc::Sender<DebugEvent>>,
+) -> Result<(), String> {
+    let text = write.command(slot)?;
+    tokio::time::timeout(SSH_TIMEOUT, async {
+        send(channel, &text).await?;
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        send_all(channel, &signal_commands(slot, "SYNC", &[write.signum])).await?;
+        send(channel, &command(slot, "SHOW")).await?;
+        let mut error = None;
+        until_global(channel, output, SSH_TIMEOUT, |line| {
+            let lower = line.to_ascii_lowercase();
+            // With console echo enabled the serial argument can contain
+            // words such as "error"; that is not a processor rejection.
+            if lower.contains("setsignal:") || lower.contains("mdbgsignal:") {
+                return;
+            }
+            if lower.contains("error")
+                || lower.contains("invalid")
+                || lower.contains("bad or incomplete")
+                || lower.contains("out of range")
+            {
+                error = Some(line.trim().to_owned());
+            }
+        })
+        .await?;
+        error.map_or(Ok(()), Err)
+    })
+    .await
+    .map_err(|_| "Timed out sending signal value; its state is uncertain".to_owned())?
+}
+
 pub(super) async fn session(
     spec: ConnectionSpec,
     target: Target,
@@ -308,6 +357,7 @@ pub(super) async fn session(
     // Flags this session turned on, and so turns off again.
     let mut enabled = HashSet::new();
     let mut pending = Pending::default();
+    let mut held = HashSet::new();
     let result = async {
         channel.request_pty(true, "xterm", 80, 24, 0, 0, &[]).await.map_err(|e| e.to_string())?;
         channel.request_shell(true).await.map_err(|e| e.to_string())?;
@@ -393,6 +443,37 @@ pub(super) async fn session(
             }
             // Replies arrive as ordinary value reports on this channel.
             send_all(&channel, &signal_commands(slot, "SYNC", &std::mem::take(&mut pending.sync))).await?;
+            if let Some(write) = pending.writes.pop_front() {
+                if !signals.contains(&write.signum) && !modules.contains(&write.signum) {
+                    let _ = output.try_send(DebugEvent::WriteResult { signum: write.signum, result: Err("Signal is not in this session's signature".into()) });
+                    continue;
+                }
+                if matches!(write.value, SignalValue::Hold) {
+                    // Track before sending: cancellation can occur after the
+                    // processor received High but before its reply arrived.
+                    held.insert(write.signum);
+                }
+                let result = tokio::select! {
+                    _ = cancelled.changed() => break,
+                    _ = stopped(&mut input, &mut pending) => break,
+                    result = write_signal(&mut channel, slot, &write, Some(&output)) => result,
+                };
+                if result.is_ok() && matches!(write.value, SignalValue::Release | SignalValue::Digital(_) | SignalValue::Pulse(_)) {
+                    held.remove(&write.signum);
+                }
+                let failure = result.as_ref().err().cloned();
+                tokio::select! {
+                    _ = cancelled.changed() => break,
+                    _ = stopped(&mut input, &mut pending) => break,
+                    sent = output.send(DebugEvent::WriteResult { signum: write.signum, result }) => if sent.is_err() { break; },
+                }
+                if let Some(error) = failure {
+                    // A failed fence leaves command ordering uncertain. Stop
+                    // rather than send more user writes on that console.
+                    return Err(format!("Signal write failed: {error}"));
+                }
+                continue;
+            }
             tokio::select! {
                 _ = cancelled.changed() => break,
                 action = input.recv() => if !pending.keep(action) { break },
@@ -417,6 +498,18 @@ pub(super) async fn session(
         Ok(())
     }.await;
     let mut failure = result.err();
+    for signum in held {
+        let release = SignalWrite {
+            signum,
+            value: SignalValue::Release,
+        };
+        if let Err(error) = write_signal(&mut channel, slot, &release, None).await {
+            failure = Some(format!(
+                "{}; held signal 0x{signum:08X} release could not be confirmed: {error}",
+                failure.unwrap_or_else(|| "Debugger stopped".into())
+            ));
+        }
+    }
     if !enabled.is_empty() {
         let cleanup = async {
             let enabled: Vec<u32> = enabled.iter().copied().collect();
@@ -454,6 +547,19 @@ mod tests {
         assert_eq!(command(3, "ON"), "MDBGSIGNAL:3 -A:ON\r");
         assert_eq!(command(3, "OFF"), "MDBGSIGNAL:3 -A:OFF\r");
         assert_eq!(command(3, "SYNC"), "MDBGSIGNAL:3 -A:SYNC\r");
+    }
+
+    #[test]
+    fn echoed_serial_text_cannot_be_mistaken_for_a_command_fence() {
+        assert_eq!(global_status("GLOBAL:ON"), Some(true));
+        assert_eq!(global_status(" RMC3>GLOBAL:OFF "), Some(false));
+        for text in [
+            "SETSIGNAL:1 0x1 \"GLOBAL:ON\"",
+            "RMC3>SETSIGNAL:1 0x1 \"GLOBAL:OFF\"",
+            "SETSIGNAL:1 0x1 \">GLOBAL:ON\"",
+        ] {
+            assert_eq!(global_status(text), None);
+        }
     }
 
     #[test]
@@ -522,8 +628,10 @@ mod tests {
         global: bool,
         flags: HashSet<u32>,
         commands: Vec<String>,
+        values: std::collections::HashMap<u32, String>,
         /// Ignore `-S:OFF`, as a console that lost the request would.
         stuck: bool,
+        reject_release: bool,
     }
 
     struct Scenario {
@@ -537,6 +645,9 @@ mod tests {
         /// Ticks and unticks of Show module signals while monitoring.
         toggles: Vec<bool>,
         stuck: bool,
+        writes: Vec<SignalWrite>,
+        shutdown: u8,
+        reject_release: bool,
     }
 
     impl Default for Scenario {
@@ -548,6 +659,9 @@ mod tests {
                 sync: false,
                 toggles: Vec::new(),
                 stuck: false,
+                writes: Vec::new(),
+                shutdown: 0,
+                reject_release: false,
             }
         }
     }
@@ -564,6 +678,69 @@ mod tests {
 
     fn label(command: &str) -> String {
         command.trim_end_matches('\r').to_owned()
+    }
+
+    #[test]
+    fn failed_held_release_is_reported_while_debug_flags_are_still_cleaned_up() {
+        let outcome = run(Scenario {
+            writes: vec![SignalWrite {
+                signum: 3,
+                value: SignalValue::Hold,
+            }],
+            reject_release: true,
+            ..Default::default()
+        });
+        assert!(outcome.closed.contains("release could not be confirmed"));
+        assert!(outcome.closed.contains("release rejected"));
+        assert_eq!(outcome.state.values[&3], "1");
+        assert!(outcome.state.flags.is_empty());
+    }
+
+    #[test]
+    fn typed_writes_reach_console_and_held_signals_release_on_every_shutdown_path() {
+        for shutdown in 0..3 {
+            let values = [
+                SignalValue::Digital(true),
+                SignalValue::Digital(false),
+                SignalValue::Pulse(100),
+                SignalValue::Analog(65535),
+                SignalValue::Serial("a\"\r\nb".into()),
+                SignalValue::Hold,
+                SignalValue::Release,
+                SignalValue::Hold,
+            ];
+            let writes: Vec<_> = values
+                .into_iter()
+                .map(|value| SignalWrite { signum: 3, value })
+                .collect();
+            let mut expected: Vec<_> = writes.iter().map(|w| w.command(1).unwrap()).collect();
+            expected.push(
+                SignalWrite {
+                    signum: 3,
+                    value: SignalValue::Release,
+                }
+                .command(1)
+                .unwrap(),
+            );
+            let outcome = run(Scenario {
+                writes,
+                shutdown,
+                ..Default::default()
+            });
+            assert_eq!(outcome.closed, "");
+            assert_eq!(outcome.state.values[&3], "0");
+            assert_eq!(
+                outcome
+                    .state
+                    .commands
+                    .iter()
+                    .filter(|c| c.starts_with("SETSIGNAL"))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert!(outcome.state.flags.is_empty());
+        }
     }
 
     #[test]
@@ -788,6 +965,17 @@ mod tests {
             let mut state = self.0.lock().unwrap();
             state.commands.push(command.clone());
             let line = command.trim_end_matches('\r');
+            if let Some(rest) = line.strip_prefix("SETSIGNAL:1 ") {
+                let (number, value) = rest.split_once(' ').unwrap();
+                let signum = u32::from_str_radix(number.trim_start_matches("0x"), 16).unwrap();
+                if state.reject_release && value == "0" {
+                    session.data(id, "\r\nERROR: release rejected\r\n".to_owned())?;
+                    return Ok(());
+                }
+                state.values.insert(signum, value.to_owned());
+                session.data(id, format!("\x01\r\n{signum:08X}:1={value}\r\n\x03"))?;
+                return Ok(());
+            }
             if let Some(rest) = line.strip_prefix("MDBGSIGNAL:1 -S:") {
                 let (verb, terms) = rest.split_once(' ').unwrap();
                 let signums = signums(terms);
@@ -868,6 +1056,7 @@ mod tests {
                     global: scenario.global,
                     flags: scenario.preexisting.clone(),
                     stuck: scenario.stuck,
+                    reject_release: scenario.reject_release,
                     ..Default::default()
                 }));
                 let console = Console(state.clone());
@@ -896,7 +1085,7 @@ mod tests {
                         .unwrap();
                 }
                 let (output, mut receiver) = tokio::sync::mpsc::channel(256);
-                let (_cancel, cancelled) = tokio::sync::watch::channel(false);
+                let (cancel, cancelled) = tokio::sync::watch::channel(false);
                 let task = tokio::spawn(session(
                     spec,
                     Target {
@@ -974,7 +1163,24 @@ mod tests {
                     })
                     .await;
                 }
-                sender.send(DebugCommand::Stop).unwrap();
+                for write in scenario.writes {
+                    sender.send(DebugCommand::Write(write)).unwrap();
+                    let result = until(&mut receiver, &mut frames, &mut reports, |event, _| {
+                        matches!(event, DebugEvent::WriteResult { .. })
+                    })
+                    .await;
+                    assert!(
+                        matches!(result, DebugEvent::WriteResult { result: Ok(()), .. }),
+                        "{result:?}"
+                    );
+                }
+                match scenario.shutdown {
+                    1 => drop(sender),
+                    2 => {
+                        cancel.send(true).unwrap();
+                    }
+                    _ => sender.send(DebugCommand::Stop).unwrap(),
+                }
                 let closed = match until(&mut receiver, &mut frames, &mut reports, |event, _| {
                     matches!(event, DebugEvent::Closed(_))
                 })
