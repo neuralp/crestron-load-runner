@@ -515,7 +515,7 @@ fn tree_context_menu_synchronizes_signals_and_nodes_into_timeline_and_values() {
         .into_iter()
         .map(|index| {
             (
-                panel.samples[index].signum,
+                panel.samples[index].signum.unwrap(),
                 panel.samples[index].value.as_str(),
             )
         })
@@ -1649,7 +1649,7 @@ fn loaded_signature_monitors_every_unique_signum_without_selection() {
     panel.signals = parse_signals(&bytes).unwrap();
     assert_eq!(debug_signums(&panel.signals), [0x1010, 0x1011]);
     panel.ingest(b"\x01\r\n00001011:1=42\r\n\x03", SystemTime::now());
-    assert_eq!(panel.samples[0].signum, 0x1011);
+    assert_eq!(panel.samples[0].signum, Some(0x1011));
     assert_eq!(panel.samples[0].value, "42");
     assert!(panel.groups["Watched"].is_empty());
 }
@@ -1950,7 +1950,7 @@ fn timeline_shows_newest_changes_in_a_virtualized_table() {
     for n in 0..MAX_EVENTS {
         panel.samples.push_back(Sample {
             id: n as u64,
-            signum: 0x1010,
+            signum: Some(0x1010),
             value: format!("change-{n:05}"),
             at: SystemTime::now(),
         });
@@ -2123,4 +2123,20 @@ fn window_renders_three_panels_and_program_slot() {
         .collect();
     output.drop_without_applying_deltas();
     assert!(missing.is_empty(), "missing {missing:?}: {text:?}");
+}
+
+#[test]
+fn only_digitals_without_the_settable_flag_are_read_only() {
+    // Metadata as read from a CP3 program's signature.
+    let signal = |name: &str, metadata: [u8; 6]| Signal {
+        name: name.into(),
+        metadata,
+    };
+    assert!(!signal("biamp_debug", [0xd5, 7, 0, 0, 0, 1]).settable());
+    assert!(signal("biamp_debug_on", [0xd3, 7, 0, 0, 0, 3]).settable());
+    assert!(signal("biamp_debug_off", [0xd4, 7, 0, 0, 0, 3]).settable());
+    assert!(!signal("//unused", [0x54, 9, 0, 0, 0, 0]).settable());
+    // Analog and serial signals can always be set, whatever the byte says.
+    assert!(signal("level", [1, 0, 0, 0, 1, 7]).settable());
+    assert!(signal("source06_rx$", [0x41, 5, 0, 0, 2, 4]).settable());
 }

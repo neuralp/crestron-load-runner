@@ -22,7 +22,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::{
     device_log::Direction,
-    model::{Credentials, DeviceDetails, DeviceKind},
+    model::{Credentials, DeviceDetails, DeviceKind, RunningProgram},
 };
 
 /// Long enough for a processor on a slow link, short enough that an
@@ -1198,6 +1198,11 @@ async fn refresh_for_kind(
         (session, _) = device.acquire(spec, Announce::OnTheCard, events).await?;
         disk_free = run_command(spec, &session, "free", SSH_TIMEOUT, events).await;
     }
+    let (programs, unreadable_programs) = if kind == DeviceKind::Processor {
+        running_programs(spec, &session, events).await
+    } else {
+        Default::default()
+    };
     let details = DeviceDetails {
         disk_free: section_result(disk_free),
         ram_free: section_result(run_command(spec, &session, "ramfree", SSH_TIMEOUT, events).await),
@@ -1207,17 +1212,18 @@ async fn refresh_for_kind(
             section_result(run_command(spec, &session, "ver -v", SSH_TIMEOUT, events).await)
         ),
         network: section_result(run_command(spec, &session, "ipconfig", SSH_TIMEOUT, events).await),
-        programs: if kind == DeviceKind::Touchpanel {
-            String::new()
-        } else {
-            section_result(run_command(spec, &session, "progcomments", SSH_TIMEOUT, events).await)
-        },
+        programs,
+        unreadable_programs,
         project_info: if kind == DeviceKind::Touchpanel {
             section_result(run_command(spec, &session, "projectinfo", SSH_TIMEOUT, events).await)
         } else {
             String::new()
         },
-        ip_table: section_result(run_command(spec, &session, "ipt -t", SSH_TIMEOUT, events).await),
+        ip_table: if kind == DeviceKind::Processor {
+            String::new()
+        } else {
+            section_result(run_command(spec, &session, "ipt -t", SSH_TIMEOUT, events).await)
+        },
         cresnet: if kind == DeviceKind::Touchpanel {
             None
         } else {
@@ -1233,6 +1239,45 @@ async fn refresh_for_kind(
         })
         .map_err(|error| message(spec, error.to_string()))?;
     Ok(())
+}
+
+/// Every program slot is asked for its `progcomments`. A slot with nothing
+/// loaded answers `Bad or Incomplete Command (progcomments:N)` and is left
+/// out; each running program's IP table is read with it.
+async fn running_programs(
+    spec: &ConnectionSpec,
+    session: &Handle<TrustOnFirstUse>,
+    events: &Sender<WorkerEvent>,
+) -> (Vec<RunningProgram>, Vec<(u8, String)>) {
+    let mut programs = Vec::new();
+    let mut unreadable = Vec::new();
+    for slot in 1..=10u8 {
+        let command = format!("progcomments:{slot}");
+        match run_command(spec, session, &command, SSH_TIMEOUT, events).await {
+            Ok(comments) if is_running_program(&comments) => {
+                let command = format!("ipt -p:{slot} -t");
+                let ip_table =
+                    section_result(run_command(spec, session, &command, SSH_TIMEOUT, events).await);
+                programs.push(RunningProgram {
+                    slot,
+                    comments,
+                    ip_table,
+                });
+            }
+            Ok(_) => {}
+            Err(error) => unreadable.push((slot, error)),
+        }
+    }
+    (programs, unreadable)
+}
+
+/// Whether a `progcomments:N` answer describes a program, rather than the
+/// console's refusal for an empty slot.
+fn is_running_program(answer: &str) -> bool {
+    !answer.trim().is_empty()
+        && !answer
+            .to_ascii_lowercase()
+            .contains("bad or incomplete command")
 }
 
 async fn run_command(
@@ -2265,7 +2310,15 @@ mod tests {
             let command = String::from_utf8_lossy(data).into_owned();
             self.received.lock().unwrap().push(command.clone());
             session.channel_success(channel)?;
-            session.data(channel, format!("output for {command}"))?;
+            // Programs run in slots 1 and 2; the rest are refused, as a
+            // processor refuses an empty slot.
+            let reply = match command.strip_prefix("progcomments:") {
+                Some(slot) if slot.parse::<u8>().is_ok_and(|slot| slot > 2) => {
+                    format!("Bad or Incomplete Command ({command})\r\n")
+                }
+                _ => format!("output for {command}"),
+            };
+            session.data(channel, reply)?;
             session.exit_status_request(channel, 0)?;
             session.eof(channel)?;
             session.close(channel)?;
@@ -2388,6 +2441,18 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_program_slot_is_told_from_a_running_program() {
+        // As a CP3 answered.
+        assert!(!is_running_program(
+            "Bad or Incomplete Command (progcomments:10)\r\n"
+        ));
+        assert!(!is_running_program("\r\n"));
+        assert!(is_running_program(
+            "\r\nProgram Boot Directory: \\simpl\\app02\r\nProgram File: Basement Stone.smw\r\n"
+        ));
+    }
+
+    #[test]
     fn touchpanel_refresh_requests_projectinfo_only_for_touchpanels() {
         runtime().block_on(async {
             let server = Loopback::start(31, false).await;
@@ -2416,12 +2481,11 @@ mod tests {
                     .count(),
                 1
             );
-            assert!(
-                !server
-                    .received()
-                    .iter()
-                    .any(|command| matches!(command.as_str(), "progcomments" | "REPORTCRESNET"))
-            );
+            assert!(!server.received().iter().any(|command| {
+                command.starts_with("progcomments") || command == "REPORTCRESNET"
+            }));
+            assert!(details.programs.is_empty());
+            assert_eq!(details.ip_table, "output for ipt -t");
 
             refresh_for_kind(&spec, DeviceKind::Processor, &device, &events)
                 .await
@@ -2437,6 +2501,29 @@ mod tests {
                 })
                 .expect("processor details received");
             assert!(details.project_info.is_empty());
+            // Every slot is asked; only the running ones are kept, each with
+            // its own IP table, and the device-wide one is not asked for.
+            assert_eq!(
+                details.programs,
+                [1, 2].map(|slot| RunningProgram {
+                    slot,
+                    comments: format!("output for progcomments:{slot}"),
+                    ip_table: format!("output for ipt -p:{slot} -t"),
+                })
+            );
+            assert!(details.unreadable_programs.is_empty());
+            assert!(details.ip_table.is_empty());
+            let received = server.received();
+            for slot in 1..=10 {
+                assert!(received.contains(&format!("progcomments:{slot}")), "{slot}");
+            }
+            // Only the touchpanel asked.
+            assert_eq!(received.iter().filter(|c| *c == "ipt -t").count(), 1);
+            assert!(
+                !received
+                    .iter()
+                    .any(|command| command.starts_with("ipt -p:3"))
+            );
             assert_eq!(
                 server
                     .received()

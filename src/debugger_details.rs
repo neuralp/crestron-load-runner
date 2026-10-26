@@ -10,17 +10,12 @@ impl Panel {
             .iter()
             .chain(self.pending_samples.iter())
             .rev()
-            .filter(|sample| sample.signum == signum)
+            .filter(|sample| sample.signum == Some(signum))
             .collect()
     }
 
     pub(super) fn show_signal_details(&mut self, ctx: &egui::Context) {
-        if self.held_signal.is_some()
-            && (self.held_signal != self.detail_signal
-                || !ctx.input(|i| i.focused && i.pointer.primary_down() && i.pointer.has_pointer()))
-        {
-            self.release_held();
-        }
+        self.release_stale_hold(ctx);
         let Some(signum) = self.detail_signal else {
             return;
         };
@@ -29,9 +24,9 @@ impl Panel {
             self.editor.signum = Some(signum);
         }
         let kind = self.writable_kind(signum);
-        let enabled =
-            self.running && self.write_ready && !self.stopping && kind != SignalKind::Unknown;
+        let enabled = self.can_write() && kind != SignalKind::Unknown;
         let held = self.held_signal == Some(signum);
+        let read_only = self.read_only_reason(signum);
         let mut editor = std::mem::take(&mut self.editor);
         let mut action = None;
         let mode = self.display_types.get(&signum).copied().unwrap_or_default();
@@ -46,7 +41,7 @@ impl Panel {
             });
             ui.label(&self.title);
             ui.separator();
-            action = editor.show(ui, kind, enabled, held);
+            action = editor.show(ui, kind, enabled, held, read_only);
             ui.separator();
             let header_height = ui.cursor().top() - header_top;
             // Controls stay in the header while metadata and history share
@@ -60,7 +55,7 @@ impl Panel {
                     ui.strong("Signal"); ui.label(egui::RichText::new(self.signal_name(signum)).font(self.fonts.name.clone())); ui.end_row();
                     ui.strong("Signal ID"); ui.monospace(format!("0x{signum:08X} ({signum})")); ui.end_row();
                     let kind = self.signals.iter().find(|signal| signal.signum() == signum).map_or(SignalKind::Unknown, Signal::kind);
-                    ui.strong("Type"); ui.label(kind.label()); ui.end_row();
+                    ui.strong("Type"); ui.label(if read_only.is_some() && kind != SignalKind::Unknown { format!("{} (read-only)", kind.label()) } else { kind.label().into() }); ui.end_row();
                     ui.strong("Local debugging");
                     ui.label(if self.disabled_signals.contains(&signum) { "Disabled" } else if self.persistence.pending_disabled.contains(&signum) { "Disable pending initial synchronization" } else { "Enabled" }); ui.end_row();
                     ui.strong("Display format"); ui.label(match mode { ValueDisplay::Ascii => "ASCII", ValueDisplay::Hex => "Hex", ValueDisplay::Mixed => "Mixed" }); ui.end_row();

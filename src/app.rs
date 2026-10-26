@@ -196,6 +196,8 @@ pub struct LoadRunnerApp {
     terminals: BTreeMap<String, crate::terminal::Terminal>,
     debuggers: BTreeMap<String, crate::debugger::Panel>,
     vc4: HashMap<String, crate::vc4::Panel>,
+    /// The program whose IP table each processor's details show.
+    ip_table_programs: HashMap<String, u8>,
     discovery_events: Receiver<DiscoveryEvent>,
     discovery_sender: std::sync::mpsc::Sender<DiscoveryEvent>,
     discovery_spawner: fn(mpsc::Sender<DiscoveryEvent>),
@@ -381,6 +383,7 @@ impl LoadRunnerApp {
             terminals: BTreeMap::new(),
             debuggers: BTreeMap::new(),
             vc4: HashMap::new(),
+            ip_table_programs: HashMap::new(),
             discovery_events,
             discovery_sender,
             discovery_spawner: discovery::spawn,
@@ -2956,11 +2959,27 @@ impl LoadRunnerApp {
                     crate::resources::show(ui, &details.disk_free, &details.ram_free);
                     let processor = self.devices[index].kind == DeviceKind::Processor;
                     if processor {
-                        program_info_section(ui, &id, &details.programs);
-                    } else if self.devices[index].kind == DeviceKind::Touchpanel {
-                        project_info_section(ui, &id, &details.project_info);
+                        program_info_section(ui, &id, &details.programs, &details.unreadable_programs);
+                        let tables: Vec<_> = details
+                            .programs
+                            .iter()
+                            .map(|program| crate::ip_table::ProgramTable {
+                                slot: program.slot,
+                                label: program_label(program),
+                                contents: &program.ip_table,
+                            })
+                            .collect();
+                        let mut selected = self.ip_table_programs.get(&id).copied();
+                        crate::ip_table::show_programs(ui, &id, &tables, &mut selected);
+                        if let Some(slot) = selected {
+                            self.ip_table_programs.insert(id.clone(), slot);
+                        }
+                    } else {
+                        if self.devices[index].kind == DeviceKind::Touchpanel {
+                            project_info_section(ui, &id, &details.project_info);
+                        }
+                        crate::ip_table::show(ui, &id, &details.ip_table);
                     }
-                    crate::ip_table::show(ui, &id, &details.ip_table);
                     if let Some(cresnet) = details.cresnet
                         && processor
                     {
@@ -3893,40 +3912,66 @@ fn parse_program_info(contents: &str) -> [Option<&str>; 4] {
     values
 }
 
-fn program_info_section(ui: &mut egui::Ui, device_id: &str, contents: &str) {
+/// How a running program is named in the IP table's picker: its slot, and
+/// the program file when the processor reported one.
+fn program_label(program: &crate::model::RunningProgram) -> String {
+    match parse_program_info(&program.comments)[1] {
+        Some(file) if !file.is_empty() => format!("Program {} · {file}", program.slot),
+        _ => format!("Program {}", program.slot),
+    }
+}
+
+fn program_info_section(
+    ui: &mut egui::Ui,
+    device_id: &str,
+    programs: &[crate::model::RunningProgram],
+    unreadable: &[(u8, String)],
+) {
     ui.push_id(("program_info", device_id), |ui| {
         egui::CollapsingHeader::new("Running programs")
             .default_open(true)
             .show(ui, |ui| {
-                let values = parse_program_info(contents);
-                if values.iter().any(Option::is_some) {
-                    egui::Frame::new()
-                        .inner_margin(4)
-                        .fill(ui.visuals().text_edit_bg_color())
-                        .stroke(egui::Stroke::new(1.0, egui::Color32::BLACK))
-                        .show(ui, |ui| {
-                            egui::Grid::new("summary").num_columns(2).show(ui, |ui| {
-                                for (field, value) in PROGRAM_INFO_FIELDS.iter().zip(values) {
-                                    ui.add(
-                                        egui::Label::new(
-                                            egui::RichText::new(format!("{field}:")).strong(),
-                                        )
-                                        .selectable(true),
-                                    );
-                                    ui.add(
-                                        egui::Label::new(value.unwrap_or("Not reported"))
-                                            .selectable(true),
-                                    );
-                                    ui.end_row();
-                                }
-                            });
-                        });
-                } else {
-                    ui.label("No program information fields were reported.");
+                if programs.is_empty() && unreadable.is_empty() {
+                    ui.label("No programs are running.");
                 }
-                detail_section(ui, "Raw response", contents, false);
+                for program in programs {
+                    ui.push_id(program.slot, |ui| {
+                        ui.strong(format!("Program {}", program.slot));
+                        program_summary(ui, &program.comments);
+                    });
+                    ui.add_space(6.0);
+                }
+                for (slot, error) in unreadable {
+                    ui.weak(format!("Program {slot} could not be read: {error}"));
+                }
             });
     });
+}
+
+/// One program's `progcomments` fields, with the whole answer behind them.
+fn program_summary(ui: &mut egui::Ui, contents: &str) {
+    let values = parse_program_info(contents);
+    if values.iter().any(Option::is_some) {
+        egui::Frame::new()
+            .inner_margin(4)
+            .fill(ui.visuals().text_edit_bg_color())
+            .stroke(egui::Stroke::new(1.0, egui::Color32::BLACK))
+            .show(ui, |ui| {
+                egui::Grid::new("summary").num_columns(2).show(ui, |ui| {
+                    for (field, value) in PROGRAM_INFO_FIELDS.iter().zip(values) {
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(format!("{field}:")).strong())
+                                .selectable(true),
+                        );
+                        ui.add(egui::Label::new(value.unwrap_or("Not reported")).selectable(true));
+                        ui.end_row();
+                    }
+                });
+            });
+    } else {
+        ui.label("No program information fields were reported.");
+    }
+    detail_section(ui, "Raw response", contents, false);
 }
 
 /// `projectinfo` reports a bracketed TPS block, followed by other metadata.

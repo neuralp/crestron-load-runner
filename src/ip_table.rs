@@ -65,49 +65,101 @@ pub fn show(ui: &mut egui::Ui, device_id: &str, contents: &str) {
     ui.push_id(("ip_table", device_id), |ui| {
         egui::CollapsingHeader::new("IP table")
             .default_open(true)
+            .show(ui, |ui| tables(ui, contents));
+    });
+}
+
+/// One running program's IP table, as the program picker offers it.
+pub struct ProgramTable<'a> {
+    pub slot: u8,
+    pub label: String,
+    pub contents: &'a str,
+}
+
+/// A processor's IP table, one program at a time. `selected` is the slot
+/// chosen in the picker; until one is, or once it stops running, the first
+/// running program is shown.
+pub fn show_programs(
+    ui: &mut egui::Ui,
+    device_id: &str,
+    programs: &[ProgramTable<'_>],
+    selected: &mut Option<u8>,
+) {
+    ui.push_id(("ip_table", device_id), |ui| {
+        egui::CollapsingHeader::new("IP table")
+            .default_open(true)
             .show(ui, |ui| {
-                if let Some(tables) = parse(contents) {
-                    for (index, table) in tables.iter().enumerate() {
-                        if !table.title.is_empty() {
-                            ui.strong(table.title);
-                        }
-                        egui::ScrollArea::horizontal()
-                            .id_salt(("columns", index))
-                            .show(ui, |ui| {
-                                egui::Grid::new(("table", index))
-                                    .num_columns(table.headings.len())
-                                    .striped(true)
-                                    .spacing([16.0, 6.0])
-                                    .show(ui, |ui| {
-                                        for heading in &table.headings {
-                                            ui.add(
-                                                egui::Label::new(
-                                                    egui::RichText::new(*heading).strong(),
-                                                )
-                                                .extend(),
-                                            );
-                                        }
-                                        ui.end_row();
-                                        for row in &table.rows {
-                                            for cell in row {
-                                                ui.add(egui::Label::new(*cell).extend());
-                                            }
-                                            ui.end_row();
-                                        }
-                                    });
-                            });
-                        if table.rows.is_empty() {
-                            ui.small("No entries.");
-                        }
-                        ui.add_space(8.0);
-                    }
-                    ui.collapsing("Raw response", |ui| raw_response(ui, contents));
-                } else {
-                    // Keep errors and unfamiliar firmware responses visible.
-                    raw_response(ui, contents);
+                let shown = |selected: Option<u8>| {
+                    programs
+                        .iter()
+                        .find(|program| Some(program.slot) == selected)
+                        .or(programs.first())
+                };
+                let Some(current) = shown(*selected) else {
+                    ui.label("No programs are running, so there is no IP table to show.");
+                    return;
+                };
+                ui.horizontal(|ui| {
+                    ui.label("Program");
+                    egui::ComboBox::from_id_salt("program")
+                        .selected_text(&current.label)
+                        .show_ui(ui, |ui| {
+                            for program in programs {
+                                if ui
+                                    .selectable_label(program.slot == current.slot, &program.label)
+                                    .clicked()
+                                {
+                                    *selected = Some(program.slot);
+                                }
+                            }
+                        });
+                });
+                if let Some(current) = shown(*selected) {
+                    tables(ui, current.contents);
                 }
             });
     });
+}
+
+fn tables(ui: &mut egui::Ui, contents: &str) {
+    if let Some(tables) = parse(contents) {
+        for (index, table) in tables.iter().enumerate() {
+            if !table.title.is_empty() {
+                ui.strong(table.title);
+            }
+            egui::ScrollArea::horizontal()
+                .id_salt(("columns", index))
+                .show(ui, |ui| {
+                    egui::Grid::new(("table", index))
+                        .num_columns(table.headings.len())
+                        .striped(true)
+                        .spacing([16.0, 6.0])
+                        .show(ui, |ui| {
+                            for heading in &table.headings {
+                                ui.add(
+                                    egui::Label::new(egui::RichText::new(*heading).strong())
+                                        .extend(),
+                                );
+                            }
+                            ui.end_row();
+                            for row in &table.rows {
+                                for cell in row {
+                                    ui.add(egui::Label::new(*cell).extend());
+                                }
+                                ui.end_row();
+                            }
+                        });
+                });
+            if table.rows.is_empty() {
+                ui.small("No entries.");
+            }
+            ui.add_space(8.0);
+        }
+        ui.collapsing("Raw response", |ui| raw_response(ui, contents));
+    } else {
+        // Keep errors and unfamiliar firmware responses visible.
+        raw_response(ui, contents);
+    }
 }
 
 fn raw_response(ui: &mut egui::Ui, contents: &str) {

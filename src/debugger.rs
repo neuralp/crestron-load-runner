@@ -35,6 +35,17 @@ impl Signal {
             _ => SignalKind::Unknown,
         }
     }
+
+    /// Whether a digital signal's sixth metadata byte allows setting it. On a
+    /// CP3 program, digitals had 0, 1 or 3 there. `biamp_debug`, a latch
+    /// output that cannot be set, had 1; `biamp_debug_on` and `_off`, which
+    /// can, had 3; feedback outputs such as `*_icon_*` and `*_present` had 1.
+    /// Analog and serial signals can always be set, so only digitals are
+    /// held to the 0x02 bit. The processor itself accepts SETSIGNAL on all of
+    /// them, so this is the only warning.
+    pub fn settable(&self) -> bool {
+        self.kind() != SignalKind::Digital || self.metadata[5] & 0x02 != 0
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -350,7 +361,8 @@ impl SignalTree {
 #[derive(Clone)]
 pub(crate) struct Sample {
     pub id: u64,
-    pub signum: u32,
+    /// None for a line of console output rather than a signal's value.
+    pub signum: Option<u32>,
     pub value: String,
     pub at: SystemTime,
 }
@@ -539,6 +551,8 @@ pub(crate) struct Panel {
     selected_sample: Option<u64>,
     detail_signal: Option<u32>,
     editor: control::Editor,
+    /// The controls at the foot of the signal tree.
+    tree_editor: control::Editor,
     write_ready: bool,
     held_signal: Option<u32>,
     disabled_signals: HashSet<u32>,
@@ -548,6 +562,16 @@ pub(crate) struct Panel {
     display_types: HashMap<u32, ValueDisplay>,
     values: HashMap<u32, String>,
     frames: Vec<u8>,
+    /// Skipping the rest of an oversized frame, so it is not taken for
+    /// console output.
+    discarding_frame: bool,
+    /// Console output outside value reports, up to the end of its line.
+    console_line: Vec<u8>,
+    console_at: Option<SystemTime>,
+    /// How much of a program message's `FA E0 01` opening has arrived.
+    program_marker: u8,
+    /// A program message so far, timed from its opening.
+    program_message: Option<(Vec<u8>, SystemTime)>,
     pub running: bool,
     pub stopping: bool,
     pub session_sent: bool,
@@ -561,6 +585,7 @@ impl Panel {
     pub fn reset_signals(&mut self) {
         self.release_held();
         self.editor = Default::default();
+        self.tree_editor = Default::default();
         self.write_ready = false;
         self.suspend_settings();
         self.monitoring = None;
@@ -576,6 +601,11 @@ impl Panel {
         self.disabled_signals.clear();
         self.detail_signal = None;
         self.frames.clear();
+        self.discarding_frame = false;
+        self.console_line.clear();
+        self.console_at = None;
+        self.program_marker = 0;
+        self.program_message = None;
         self.display_types.clear();
         self.tree_selection.clear();
         self.tree_anchor = None;
@@ -617,6 +647,7 @@ impl Panel {
             selected_sample: None,
             detail_signal: None,
             editor: Default::default(),
+            tree_editor: Default::default(),
             write_ready: false,
             held_signal: None,
             disabled_signals: HashSet::new(),
@@ -626,6 +657,11 @@ impl Panel {
             display_types: HashMap::new(),
             values: HashMap::new(),
             frames: Vec::new(),
+            discarding_frame: false,
+            console_line: Vec::new(),
+            console_at: None,
+            program_marker: 0,
+            program_message: None,
             running: false,
             stopping: false,
             session_sent: false,
@@ -684,9 +720,11 @@ impl Panel {
                     if self.session_sent {
                         self.running = false;
                         self.write_ready = false;
-                        if self.held_signal.take().is_some() {
-                            self.editor.status =
-                                "Disconnected: held signal release could not be confirmed".into();
+                        if let Some(signum) = self.held_signal.take() {
+                            self.report(
+                                signum,
+                                "Disconnected: held signal release could not be confirmed".into(),
+                            );
                         }
                         self.stopping = false;
                         self.session_sent = false;
@@ -718,21 +756,20 @@ impl Panel {
                     self.monitoring = Some((global, reporting));
                     self.status = format!("Monitoring — {}", self.monitoring_summary());
                 }
-                DebugEvent::WriteResult { signum, result } => {
-                    if self.editor.signum == Some(signum) {
-                        self.editor.status = result.map_or_else(
-                            |error| format!("Write failed: {error}"),
-                            |_| "Command sent — see received value/history for the result".into(),
-                        );
-                    }
-                }
+                DebugEvent::WriteResult { signum, result } => self.report(
+                    signum,
+                    result.map_or_else(
+                        |error| format!("Write failed: {error}"),
+                        |_| "Command sent — see received value/history for the result".into(),
+                    ),
+                ),
                 DebugEvent::Output { bytes, received_at } => self.ingest(&bytes, received_at),
                 DebugEvent::Closed(error) => {
                     self.running = false;
                     self.write_ready = false;
                     self.held_signal = None;
                     if !error.is_empty() {
-                        self.editor.status = error.clone();
+                        self.report_all(&error);
                     }
                     self.input = None;
                     self.stopping = false;
@@ -819,12 +856,15 @@ impl Panel {
         });
         (0..self.samples.len())
             .rev()
-            .filter(|&index| {
-                let signum = self.samples[index].signum;
-                members
-                    .as_ref()
-                    .is_none_or(|members| members.contains(&signum))
-                    && (self.show_modules || !is_module_signal(self.signal_name(signum)))
+            .filter(|&index| match self.samples[index].signum {
+                // Console output belongs to no watch group.
+                None => members.is_none(),
+                Some(signum) => {
+                    members
+                        .as_ref()
+                        .is_none_or(|members| members.contains(&signum))
+                        && (self.show_modules || !is_module_signal(self.signal_name(signum)))
+                }
             })
             .collect()
     }
@@ -853,19 +893,61 @@ impl Panel {
             self.pending_dropped = 0;
         }
     }
+    /// Add a received value or console line to the timeline, or to the
+    /// buffer while it is paused.
+    fn record(&mut self, signum: Option<u32>, value: String, at: SystemTime) {
+        let destination = if self.paused {
+            &mut self.pending_samples
+        } else {
+            &mut self.samples
+        };
+        destination.push_back(Sample {
+            id: self.next_sample_id,
+            signum,
+            value,
+            at,
+        });
+        self.next_sample_id += 1;
+        if self.pending_samples.len() > MAX_EVENTS {
+            self.pending_samples.pop_front();
+            self.pending_dropped += 1;
+        }
+        while self.samples.len() > MAX_EVENTS {
+            if self
+                .samples
+                .pop_front()
+                .is_some_and(|sample| Some(sample.id) == self.selected_sample)
+            {
+                self.selected_sample = None;
+            }
+        }
+    }
     fn ingest(&mut self, bytes: &[u8], received_at: SystemTime) {
         self.ensure_signal_lookup();
         for &byte in bytes {
+            if self.frames.is_empty()
+                && !self.discarding_frame
+                && self.program_message_byte(byte, received_at)
+            {
+                continue;
+            }
             if byte == 1 {
                 self.frames.clear();
                 self.frames.push(byte);
+                self.discarding_frame = false;
                 continue;
             }
             if self.frames.is_empty() {
+                if self.discarding_frame {
+                    self.discarding_frame = byte != 3;
+                } else {
+                    self.console_byte(byte, received_at);
+                }
                 continue;
             }
             if self.frames.len() >= 64 * 1024 {
                 self.frames.clear();
+                self.discarding_frame = byte != 3;
                 self.status = "Debug frame too large; skipped malformed frame".into();
                 continue;
             }
@@ -876,7 +958,7 @@ impl Panel {
             if byte != 3 && !(byte == b'\n' && self.frames.len() >= 32 * 1024) {
                 continue;
             }
-            let frame = &self.frames;
+            let mut frame = std::mem::take(&mut self.frames);
             let end = if byte == 3 {
                 frame.len() - 1
             } else {
@@ -893,40 +975,16 @@ impl Panel {
                     self.values.insert(signum, value.clone());
                     // Local exclusions suppress timeline events, not the
                     // current-state cache used by the signal tree.
-                    if self.disabled_signals.contains(&signum) {
-                        continue;
-                    }
-                    let destination = if self.paused {
-                        &mut self.pending_samples
-                    } else {
-                        &mut self.samples
-                    };
-                    destination.push_back(Sample {
-                        id: self.next_sample_id,
-                        signum,
-                        value,
-                        at: received_at,
-                    });
-                    self.next_sample_id += 1;
-                    if self.pending_samples.len() > MAX_EVENTS {
-                        self.pending_samples.pop_front();
-                        self.pending_dropped += 1;
-                    }
-                    while self.samples.len() > MAX_EVENTS {
-                        if self
-                            .samples
-                            .pop_front()
-                            .is_some_and(|sample| Some(sample.id) == self.selected_sample)
-                        {
-                            self.selected_sample = None;
-                        }
+                    if !self.disabled_signals.contains(&signum) {
+                        self.record(Some(signum), value, received_at);
                     }
                 }
             }
-            self.frames.clear();
+            frame.clear();
             if byte != 3 {
-                self.frames.push(1);
+                frame.push(1);
             }
+            self.frames = frame;
         }
     }
     pub fn show(&mut self, ctx: &egui::Context) -> bool {
@@ -1236,6 +1294,9 @@ impl Panel {
                 egui::Panel::bottom("debug_signal_selection_footer")
                     .resizable(false)
                     .show(ui, |ui| {
+                        ui.add_space(4.0);
+                        self.show_tree_controls(ui);
+                        ui.separator();
                         ui.horizontal(|ui| {
                             ui.weak(format!("{} selected", self.tree_selection.len()));
                             if ui
@@ -1256,15 +1317,6 @@ impl Panel {
                     self.values.len(),
                     self.signal_lookup.as_ref().map_or(0, HashMap::len)
                 ));
-                ui.horizontal(|ui| {
-                    let dark = ui.visuals().dark_mode;
-                    for kind in [SignalKind::Digital, SignalKind::Analog, SignalKind::Serial] {
-                        let color = kind.color(dark).unwrap_or_else(|| ui.visuals().text_color());
-                        ui.label(egui::RichText::new(kind.label()).small().color(color));
-                    }
-                })
-                .response
-                .on_hover_text("Signal names are coloured by type");
                 self.signal_search(ui);
                 ui.horizontal(|ui| {
                     ui.add_sized([(ui.available_width() - self.value_column_width()).max(40.0), 20.0], egui::Label::new(egui::RichText::new("Signal name").strong()));
@@ -1484,7 +1536,11 @@ impl Panel {
                 .show_rows(ui, row_height, count, |ui, rows| {
                     for row in rows {
                         let sample = &self.samples[visible[row]];
-                        let signum = sample.signum;
+                        let Some(signum) = sample.signum else {
+                            let sample = sample.clone();
+                            self.show_console_row(ui, &sample, width, row_height);
+                            continue;
+                        };
                         let disabled = self.disabled_signals.contains(&signum);
                         let name = self.signal_name(signum).to_owned();
                         let mode = self.display_types.get(&signum).copied().unwrap_or_default();
@@ -1555,6 +1611,9 @@ impl Panel {
 
 #[path = "debugger_details.rs"]
 mod details;
+
+#[path = "debugger_console.rs"]
+mod console;
 
 #[path = "debugger_control.rs"]
 mod control;

@@ -738,7 +738,11 @@ fn program_and_cresnet_reports_are_visible_only_for_processors() {
         ..Default::default()
     });
     device.details = Some(crate::model::DeviceDetails {
-        programs: "Program File: processor-only.smw".into(),
+        programs: vec![crate::model::RunningProgram {
+            slot: 1,
+            comments: "Program File: processor-only.smw".into(),
+            ip_table: String::new(),
+        }],
         project_info:
             "[BEGIN_INFO]\n[TPS]\nVTZ=touchpanel-only.vtz\nDate=June 16, 2026 13:46:13\n[END_INFO]"
                 .into(),
@@ -1013,10 +1017,15 @@ fn project_info_shows_summary_with_other_fields_in_raw_response() {
 #[test]
 fn program_info_shows_summary_with_raw_response_collapsed_and_expandable() {
     let contents = PROGCOMMENTS;
+    let programs = [crate::model::RunningProgram {
+        slot: 1,
+        comments: contents.into(),
+        ip_table: String::new(),
+    }];
     let ctx = egui::Context::default();
     let render = |ui: &mut egui::Ui| {
         ui.style_mut().animation_time = 0.0;
-        program_info_section(ui, "test", contents);
+        program_info_section(ui, "test", &programs, &[]);
     };
     for _ in 0..2 {
         ctx.run_ui(input(), render).drop_without_applying_deltas();
@@ -3621,4 +3630,152 @@ fn choosing_a_default_address_book_does_not_lose_the_recent_list() {
     app.save_preferences();
     assert!(app.notice.is_some());
     assert!(app.preferences_open);
+}
+
+/// A processor's details with these programs running, drawn a few times so
+/// the layout settles, returning the last frame's text and where it sits.
+fn processor_details_text(
+    app: &mut LoadRunnerApp,
+    ctx: &egui::Context,
+    events: Vec<egui::Event>,
+) -> Vec<(String, egui::Pos2)> {
+    let input = || egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1200.0, 1400.0),
+        )),
+        ..Default::default()
+    };
+    let mut raw = input();
+    raw.events = events;
+    ctx.run_ui(raw, |ui| app.details_panel(ui))
+        .drop_without_applying_deltas();
+    for _ in 0..2 {
+        ctx.run_ui(input(), |ui| app.details_panel(ui))
+            .drop_without_applying_deltas();
+    }
+    let output = ctx.run_ui(input(), |ui| app.details_panel(ui));
+    let texts = output
+        .shapes
+        .iter()
+        .filter_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) => Some((
+                text.galley.text().to_owned(),
+                text.pos + text.galley.size() * 0.5,
+            )),
+            _ => None,
+        })
+        .collect();
+    output.drop_without_applying_deltas();
+    texts
+}
+
+fn click_at(pos: egui::Pos2) -> Vec<egui::Event> {
+    vec![
+        egui::Event::PointerMoved(pos),
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        },
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        },
+    ]
+}
+
+fn running(slot: u8, file: &str, device: &str) -> crate::model::RunningProgram {
+    crate::model::RunningProgram {
+        slot,
+        comments: format!("Program File: {file}\r\nProgrammer: Someone\r\n"),
+        ip_table: format!(
+            "TableStart:[ IP Table for program {slot} ]\r\nCIP_ID | Description\r\n------\r\n3 | {device}\r\nTableEnd:\r\n"
+        ),
+    }
+}
+
+#[test]
+fn every_running_program_is_listed_and_the_ip_table_follows_the_chosen_program() {
+    let mut app = app();
+    let mut device = Device::from_address(&AddressEntry {
+        host: "192.0.2.1".into(),
+        kind: DeviceKind::Processor,
+        ..Default::default()
+    });
+    device.details = Some(crate::model::DeviceDetails {
+        programs: vec![
+            running(1, "one.smw", "first-device"),
+            running(3, "three.smw", "third-device"),
+        ],
+        unreadable_programs: vec![(5, "progcomments:5 did not finish".into())],
+        ..Default::default()
+    });
+    let id = device.id.clone();
+    app.selected_id = Some(id.clone());
+    app.devices.push(device);
+    let ctx = egui::Context::default();
+    let has = |texts: &[(String, egui::Pos2)], label: &str| texts.iter().any(|(t, _)| t == label);
+    let at = |texts: &[(String, egui::Pos2)], label: &str| {
+        texts
+            .iter()
+            .rev()
+            .find(|(t, _)| t == label)
+            .unwrap_or_else(|| panic!("{label} drawn"))
+            .1
+    };
+
+    let texts = processor_details_text(&mut app, &ctx, vec![]);
+    for label in [
+        "Program 1",
+        "one.smw",
+        "Program 3",
+        "three.smw",
+        "Program 5 could not be read: progcomments:5 did not finish",
+    ] {
+        assert!(has(&texts, label), "{label}");
+    }
+    // The first running program's table is shown to begin with.
+    assert!(has(&texts, "Program 1 · one.smw"));
+    assert!(has(&texts, "first-device"));
+    assert!(!has(&texts, "third-device"));
+
+    // Choosing another program in the picker shows its table instead.
+    let texts = processor_details_text(&mut app, &ctx, click_at(at(&texts, "Program 1 · one.smw")));
+    let texts = processor_details_text(
+        &mut app,
+        &ctx,
+        click_at(at(&texts, "Program 3 · three.smw")),
+    );
+    assert!(has(&texts, "third-device"));
+    assert!(!has(&texts, "first-device"));
+    assert_eq!(app.ip_table_programs[&id], 3);
+
+    // Once that program stops running, the first is shown again.
+    app.devices[0]
+        .details
+        .as_mut()
+        .unwrap()
+        .programs
+        .truncate(1);
+    let texts = processor_details_text(&mut app, &ctx, vec![]);
+    assert!(has(&texts, "first-device"));
+    assert!(!has(&texts, "Program 3"));
+
+    app.devices[0].details.as_mut().unwrap().programs.clear();
+    app.devices[0]
+        .details
+        .as_mut()
+        .unwrap()
+        .unreadable_programs
+        .clear();
+    let texts = processor_details_text(&mut app, &ctx, vec![]);
+    assert!(has(&texts, "No programs are running."));
+    assert!(has(
+        &texts,
+        "No programs are running, so there is no IP table to show."
+    ));
 }

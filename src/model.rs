@@ -59,10 +59,25 @@ pub struct DeviceDetails {
     pub ram_free: String,
     pub identity: String,
     pub network: String,
-    pub programs: String,
+    /// A processor's running programs, in slot order.
+    pub programs: Vec<RunningProgram>,
+    /// Slots whose `progcomments` could not be asked at all, with why. A slot
+    /// with nothing loaded is simply absent from both lists.
+    pub unreadable_programs: Vec<(u8, String)>,
     pub project_info: String,
+    /// `ipt -t` for devices other than processors, which have one per program.
     pub ip_table: String,
     pub cresnet: Option<String>,
+}
+
+/// A program running in one of a processor's slots.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RunningProgram {
+    pub slot: u8,
+    /// The `progcomments:<slot>` answer.
+    pub comments: String,
+    /// The `ipt -p:<slot> -t` answer.
+    pub ip_table: String,
 }
 
 /// Observed this session, independent of an editable address-book display name.

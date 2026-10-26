@@ -277,12 +277,14 @@ async fn flags_on(
 
 /// SETSIGNAL executes asynchronously in the program. Read back after a short
 /// delay, preserving received reports rather than inventing a local value.
+/// Some(text) is the processor's own error, answered before the fence, so the
+/// console is still in step; Err means the fence itself failed.
 async fn write_signal(
     channel: &mut russh::Channel<client::Msg>,
     slot: u8,
     write: &SignalWrite,
     output: Option<&tokio::sync::mpsc::Sender<DebugEvent>>,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     let text = write.command(slot)?;
     tokio::time::timeout(SSH_TIMEOUT, async {
         send(channel, &text).await?;
@@ -306,7 +308,7 @@ async fn write_signal(
             }
         })
         .await?;
-        error.map_or(Ok(()), Err)
+        Ok(error)
     })
     .await
     .map_err(|_| "Timed out sending signal value; its state is uncertain".to_owned())?
@@ -453,21 +455,27 @@ pub(super) async fn session(
                     // processor received High but before its reply arrived.
                     held.insert(write.signum);
                 }
-                let result = tokio::select! {
+                let outcome = tokio::select! {
                     _ = cancelled.changed() => break,
                     _ = stopped(&mut input, &mut pending) => break,
-                    result = write_signal(&mut channel, slot, &write, Some(&output)) => result,
+                    outcome = write_signal(&mut channel, slot, &write, Some(&output)) => outcome,
+                };
+                // The processor refusing a write leaves the console in step;
+                // only a failed fence ends the session.
+                let fence = outcome.as_ref().err().cloned();
+                let result = match outcome {
+                    Ok(None) => Ok(()),
+                    Ok(Some(error)) | Err(error) => Err(error),
                 };
                 if result.is_ok() && matches!(write.value, SignalValue::Release | SignalValue::Digital(_) | SignalValue::Pulse(_)) {
                     held.remove(&write.signum);
                 }
-                let failure = result.as_ref().err().cloned();
                 tokio::select! {
                     _ = cancelled.changed() => break,
                     _ = stopped(&mut input, &mut pending) => break,
                     sent = output.send(DebugEvent::WriteResult { signum: write.signum, result }) => if sent.is_err() { break; },
                 }
-                if let Some(error) = failure {
+                if let Some(error) = fence {
                     // A failed fence leaves command ordering uncertain. Stop
                     // rather than send more user writes on that console.
                     return Err(format!("Signal write failed: {error}"));
@@ -503,7 +511,8 @@ pub(super) async fn session(
             signum,
             value: SignalValue::Release,
         };
-        if let Err(error) = write_signal(&mut channel, slot, &release, None).await {
+        if let Ok(Some(error)) | Err(error) = write_signal(&mut channel, slot, &release, None).await
+        {
             failure = Some(format!(
                 "{}; held signal 0x{signum:08X} release could not be confirmed: {error}",
                 failure.unwrap_or_else(|| "Debugger stopped".into())
@@ -672,6 +681,8 @@ mod tests {
         /// Flags on after each toggle.
         toggled: Vec<HashSet<u32>>,
         reports: Vec<(bool, usize)>,
+        /// Each write's result, in order.
+        results: Vec<Result<(), String>>,
         closed: String,
         state: State,
     }
@@ -693,6 +704,33 @@ mod tests {
         assert!(outcome.closed.contains("release could not be confirmed"));
         assert!(outcome.closed.contains("release rejected"));
         assert_eq!(outcome.state.values[&3], "1");
+        assert!(outcome.state.flags.is_empty());
+    }
+
+    #[test]
+    fn a_write_the_processor_refuses_is_reported_and_the_session_carries_on() {
+        let outcome = run(Scenario {
+            writes: vec![
+                SignalWrite {
+                    signum: 3,
+                    value: SignalValue::Release,
+                },
+                SignalWrite {
+                    signum: 3,
+                    value: SignalValue::Digital(true),
+                },
+            ],
+            reject_release: true,
+            ..Default::default()
+        });
+        assert!(
+            matches!(&outcome.results[0], Err(error) if error.contains("release rejected")),
+            "{:?}",
+            outcome.results
+        );
+        assert_eq!(outcome.results[1], Ok(()));
+        assert_eq!(outcome.state.values[&3], "1");
+        assert_eq!(outcome.closed, "");
         assert!(outcome.state.flags.is_empty());
     }
 
@@ -728,6 +766,11 @@ mod tests {
                 ..Default::default()
             });
             assert_eq!(outcome.closed, "");
+            assert!(
+                outcome.results.iter().all(Result::is_ok),
+                "{:?}",
+                outcome.results
+            );
             assert_eq!(outcome.state.values[&3], "0");
             assert_eq!(
                 outcome
@@ -1163,16 +1206,17 @@ mod tests {
                     })
                     .await;
                 }
+                let mut results = Vec::new();
                 for write in scenario.writes {
                     sender.send(DebugCommand::Write(write)).unwrap();
-                    let result = until(&mut receiver, &mut frames, &mut reports, |event, _| {
+                    match until(&mut receiver, &mut frames, &mut reports, |event, _| {
                         matches!(event, DebugEvent::WriteResult { .. })
                     })
-                    .await;
-                    assert!(
-                        matches!(result, DebugEvent::WriteResult { result: Ok(()), .. }),
-                        "{result:?}"
-                    );
+                    .await
+                    {
+                        DebugEvent::WriteResult { result, .. } => results.push(result),
+                        _ => unreachable!(),
+                    }
                 }
                 match scenario.shutdown {
                     1 => drop(sender),
@@ -1196,6 +1240,7 @@ mod tests {
                     monitoring,
                     toggled,
                     reports,
+                    results,
                     closed,
                     state,
                 }

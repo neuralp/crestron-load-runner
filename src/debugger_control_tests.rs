@@ -1,9 +1,10 @@
 use super::*;
 
+/// A settable signal: the sixth byte carries 0x02.
 fn signal(number: u8, kind: u8) -> Signal {
     Signal {
         name: format!("Signal {number}"),
-        metadata: [number, 0, 0, 0, kind, 1],
+        metadata: [number, 0, 0, 0, kind, 3],
     }
 }
 
@@ -19,6 +20,11 @@ fn connected() -> (
         signal(3, 2),
         signal(4, 0x80),
         signal(5, 99),
+        // A digital the program does not let be set, like `biamp_debug`.
+        Signal {
+            name: "Signal 6".into(),
+            metadata: [6, 0, 0, 0, 0, 1],
+        },
     ];
     panel.connect();
     let (commands, output) = panel.pending_session.take().unwrap();
@@ -57,6 +63,7 @@ fn writing_requires_ready_session_and_matching_nonconstant_type() {
         panel.samples.is_empty(),
         "sending is not a received transition"
     );
+    panel.editor.signum = Some(3);
     panel.set_signal(3, SignalValue::Serial("x".repeat(1000)));
     assert!(commands.try_recv().is_err());
     assert!(panel.editor.status.contains("too long"));
@@ -69,12 +76,21 @@ fn writing_requires_ready_session_and_matching_nonconstant_type() {
 struct Ui {
     ctx: egui::Context,
     time: f64,
+    /// Draw the whole debugger, for the tree's controls, not only details.
+    tree: bool,
 }
 impl Ui {
     fn new() -> Self {
         Self {
             ctx: Default::default(),
             time: 0.0,
+            tree: false,
+        }
+    }
+    fn tree() -> Self {
+        Self {
+            tree: true,
+            ..Self::new()
         }
     }
     fn frame(
@@ -95,7 +111,13 @@ impl Ui {
                 focused,
                 ..Default::default()
             },
-            |ui| panel.show_signal_details(ui.ctx()),
+            |ui| {
+                if self.tree {
+                    panel.contents(ui)
+                } else {
+                    panel.show_signal_details(ui.ctx())
+                }
+            },
         );
         output.textures_delta.clear();
         output
@@ -131,6 +153,17 @@ impl Ui {
             true,
         )
         .drop_without_applying_deltas();
+    }
+    /// Whether `label` is drawn once the footer has settled on its height.
+    fn shows(&mut self, panel: &mut Panel, label: &str) -> bool {
+        for _ in 0..2 {
+            self.frame(panel, vec![], true)
+                .drop_without_applying_deltas();
+        }
+        self.frame(panel, vec![], true)
+            .shapes
+            .iter()
+            .any(|s| matches!(&s.shape, egui::epaint::Shape::Text(t) if t.galley.text() == label))
     }
     fn click(&mut self, panel: &mut Panel, label: &str) {
         let pos = self.position(panel, label);
@@ -250,4 +283,134 @@ fn worker_result_and_disconnection_are_visible_without_fabricated_values() {
             .status
             .contains("release could not be confirmed")
     );
+}
+
+#[test]
+fn tree_footer_sets_the_one_selected_signal_by_its_type() {
+    let (mut panel, mut commands, _output) = connected();
+    let mut ui = Ui::tree();
+    assert!(ui.shows(&mut panel, "Select a signal to set it"));
+    assert!(!ui.shows(&mut panel, "High"));
+    panel.tree_selection = HashSet::from([1, 2]);
+    assert!(ui.shows(&mut panel, "Select only one signal to set it"));
+    assert!(!ui.shows(&mut panel, "High"));
+
+    panel.tree_selection = HashSet::from([1]);
+    for (label, value) in [
+        ("High", SignalValue::Digital(true)),
+        ("Low", SignalValue::Digital(false)),
+        ("Pulse", SignalValue::Pulse(100)),
+    ] {
+        ui.click(&mut panel, label);
+        assert_eq!(take_write(&mut commands), SignalWrite { signum: 1, value });
+    }
+    let pos = ui.position(&mut panel, "Push and hold");
+    ui.pointer(&mut panel, pos, true);
+    assert_eq!(take_write(&mut commands).value, SignalValue::Hold);
+    assert_eq!(panel.held_signal, Some(1));
+    ui.frame(&mut panel, vec![], true)
+        .drop_without_applying_deltas();
+    assert!(commands.try_recv().is_err(), "the tree keeps its own hold");
+    ui.pointer(&mut panel, pos, false);
+    assert_eq!(take_write(&mut commands).value, SignalValue::Release);
+    assert_eq!(panel.held_signal, None);
+
+    panel.tree_selection = HashSet::from([2]);
+    ui.position(&mut panel, "Set");
+    assert_eq!(panel.tree_editor.pulse_ms, 100);
+    panel.tree_editor.analog = "42".into();
+    ui.click(&mut panel, "Set");
+    assert_eq!(
+        take_write(&mut commands),
+        SignalWrite {
+            signum: 2,
+            value: SignalValue::Analog(42)
+        }
+    );
+
+    panel.tree_selection = HashSet::from([3]);
+    ui.position(&mut panel, "Send");
+    panel.tree_editor.serial = "hello".into();
+    ui.click(&mut panel, "Send");
+    assert_eq!(
+        take_write(&mut commands),
+        SignalWrite {
+            signum: 3,
+            value: SignalValue::Serial("hello".into())
+        }
+    );
+    assert!(panel.tree_editor.status.contains("queued"));
+    assert!(
+        panel.editor.status.is_empty(),
+        "details are not on this signal"
+    );
+
+    // A constant cannot be set.
+    panel.tree_selection = HashSet::from([4]);
+    assert!(ui.shows(&mut panel, "Constant signals cannot be set"));
+    assert!(!ui.shows(&mut panel, "High"));
+}
+
+#[test]
+fn tree_footer_controls_wait_for_a_synchronized_session() {
+    let (mut panel, mut commands, _output) = connected();
+    panel.write_ready = false;
+    panel.tree_selection = HashSet::from([1]);
+    let mut ui = Ui::tree();
+    assert!(ui.shows(
+        &mut panel,
+        "Start the debugger and wait for synchronization to set signals"
+    ));
+    ui.click(&mut panel, "High");
+    assert!(commands.try_recv().is_err());
+}
+
+#[test]
+fn signal_tree_has_no_type_legend() {
+    let (mut panel, _commands, _output) = connected();
+    let mut ui = Ui::tree();
+    for kind in ["Digital", "Analog", "Serial"] {
+        assert!(!ui.shows(&mut panel, kind), "{kind}");
+    }
+}
+
+#[test]
+fn read_only_digitals_offer_no_controls_and_are_never_written() {
+    let (mut panel, mut commands, _output) = connected();
+    let reason = "Read-only: the program does not allow this digital signal to be set";
+    assert_eq!(panel.read_only_reason(6), Some(reason));
+    assert_eq!(panel.read_only_reason(1), None);
+    assert_eq!(panel.writable_kind(6), SignalKind::Unknown);
+    panel.set_signal(6, SignalValue::Digital(true));
+    assert!(commands.try_recv().is_err());
+
+    let mut ui = Ui::tree();
+    panel.tree_selection = HashSet::from([6]);
+    assert!(ui.shows(&mut panel, reason));
+    assert!(!ui.shows(&mut panel, "High"));
+
+    let mut ui = Ui::new();
+    panel.detail_signal = Some(6);
+    assert!(ui.shows(&mut panel, reason));
+    assert!(ui.shows(&mut panel, "Digital (read-only)"));
+    assert!(!ui.shows(&mut panel, "High"));
+}
+
+#[test]
+fn a_refused_write_is_shown_without_ending_the_session() {
+    let (mut panel, mut commands, output) = connected();
+    panel.tree_editor.signum = Some(1);
+    panel.set_signal(1, SignalValue::Digital(true));
+    take_write(&mut commands);
+    output
+        .try_send(DebugEvent::WriteResult {
+            signum: 1,
+            result: Err("ERROR: release rejected".into()),
+        })
+        .unwrap();
+    panel.poll();
+    assert!(panel.tree_editor.status.contains("release rejected"));
+    assert!(panel.running && panel.write_ready);
+    panel.set_signal(1, SignalValue::Digital(false));
+    assert_eq!(take_write(&mut commands).value, SignalValue::Digital(false));
 }

@@ -313,7 +313,7 @@ impl Terminal {
 /// Text as a log can hold it: the escape sequences a terminal would act on
 /// removed, line endings made uniform, and nothing else left that would move
 /// the cursor about.
-fn readable(data: &[u8]) -> String {
+pub(crate) fn readable(data: &[u8]) -> String {
     let text = String::from_utf8_lossy(data);
     let mut out = String::with_capacity(text.len());
     let mut characters = text.chars().peekable();

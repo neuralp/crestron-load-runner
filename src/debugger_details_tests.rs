@@ -193,7 +193,8 @@ fn long_history_scrolls_with_the_whole_details_body() {
     let mut panel = Panel::new("processor".into(), "Processor");
     panel.signals = vec![Signal {
         name: "Busy".into(),
-        metadata: [1, 0, 0, 0, 0, 1],
+        // A settable digital, so its controls take room in the header.
+        metadata: [1, 0, 0, 0, 0, 3],
     }];
     let mut frame = b"\x01".to_vec();
     for n in 0..500 {
